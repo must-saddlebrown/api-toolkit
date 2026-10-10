@@ -104,7 +104,7 @@ pub fn validate(cfg: &Config, sel: Selection) -> Result<RequestBudget, ConfigErr
         _ => {
             return Err(invalid(
                 "limits.suite_deadline_ms",
-                "fixed waits ((attempts-1)*interval_ms + settle_ms) exceed the suite deadline",
+                "fixed waits of the selected checks exceed the suite deadline",
             ));
         }
     };

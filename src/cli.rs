@@ -1,4 +1,5 @@
-//! Command line interface: `validate` (P0) and `check` (stub until P4).
+//! Command line interface: `validate` (P0) and `check` (`--only` argument layer; the run
+//! itself is wired in S4, the full suite in P4).
 //!
 //! `run` is a plain function over injected args, env lookup and output streams so it
 //! can be tested in-process. It returns the exit code; `main` only converts it.
@@ -11,7 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
-use crate::config;
+use crate::config::{self, Selection};
+use crate::report::CheckName;
 
 /// Exit code for invalid config, usage errors and the `check` stub (PLAN §10).
 const EXIT_INVALID: u8 = 2;
@@ -33,13 +35,22 @@ enum Command {
     Validate {
         #[arg(long)]
         config: PathBuf,
+        /// Validate only this check's section (available: brute_force). Without it the
+        /// full suite config is validated.
+        #[arg(long)]
+        only: Option<String>,
     },
-    /// Run the checks (not implemented until P4).
+    /// Run checks. Until P4 exactly one check must be selected with --only. A partial run
+    /// never exits 0: exit 1 = FAIL, 2 = PASS or any other result, 130 = cancelled; read
+    /// the verdict in the console line or the report.
     Check {
         #[arg(long)]
         config: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        /// Check to run (required until P4). Available: brute_force.
+        #[arg(long)]
+        only: Option<String>,
     },
 }
 
@@ -70,22 +81,93 @@ where
     };
 
     match cli.command {
-        Command::Validate { config } => match validate_file(&config, env_lookup, out) {
-            Ok(()) => 0,
+        Command::Validate { config, only } => {
+            let result = match only.as_deref().map(parse_only).transpose() {
+                Ok(only) => validate_file(&config, only, env_lookup, out),
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok(()) => 0,
+                Err(e) => {
+                    let _ = writeln!(err, "error: {e:#}");
+                    EXIT_INVALID
+                }
+            }
+        }
+        Command::Check {
+            config,
+            out: out_path,
+            only,
+        } => match check_args(&config, &out_path, only.as_deref(), env_lookup) {
+            Ok(()) => {
+                // ponytail: argument layer only; S4 replaces this with the real run.
+                let _ = writeln!(
+                    err,
+                    "error: `check --only` is not wired yet (the run itself comes in S4); no request was sent and no report was written"
+                );
+                EXIT_INVALID
+            }
             Err(e) => {
                 let _ = writeln!(err, "error: {e:#}");
                 EXIT_INVALID
             }
         },
-        Command::Check { .. } => {
-            // ponytail: stub, loads nothing and writes no --out file; implement in P4.
-            let _ = writeln!(
-                err,
-                "error: `check` is not implemented until P4; no request was sent and no report was written"
-            );
-            EXIT_INVALID
-        }
     }
+}
+
+/// Map the `--only` value to a check. Only `brute_force` exists so far (K6).
+fn parse_only(name: &str) -> anyhow::Result<CheckName> {
+    match name {
+        "brute_force" => Ok(CheckName::BruteForce),
+        "race" => anyhow::bail!("check `race` is not available yet (planned for P2)"),
+        "load" => anyhow::bail!("check `load` is not available yet (planned for P3)"),
+        _ => anyhow::bail!("unknown check `{name}`; available: brute_force"),
+    }
+}
+
+/// Everything `check` can know before sending a request. Order matters (K7): `--only`
+/// first, so a missing or bad value never reads the config or touches `--out`.
+fn check_args(
+    config: &Path,
+    out: &Path,
+    only: Option<&str>,
+    env_lookup: &impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<()> {
+    let Some(only) = only else {
+        anyhow::bail!(
+            "the full suite is not implemented until P4 (full suite available in P4); run one check with --only brute_force. The config was not read, no request was sent and no report was written."
+        );
+    };
+    let sel = Selection::Only(parse_only(only)?);
+    let text = read_config(config)?;
+    let cfg = config::parse(&text)?;
+    config::validate(&cfg, sel)?; // validate before resolve
+    config::resolve(&cfg, sel, env_lookup)?;
+    precheck_out(config, out)
+}
+
+/// Reject an unusable `--out` before any request is sent (K19): the check may change
+/// account state, so a report that cannot be saved must fail early.
+fn precheck_out(config: &Path, out: &Path) -> anyhow::Result<()> {
+    let parent = match out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if !parent.is_dir() {
+        anyhow::bail!(
+            "cannot write report `{}`: parent directory does not exist or is not a directory",
+            out.display()
+        );
+    }
+    if out.is_dir() {
+        anyhow::bail!("report path `{}` is a directory", out.display());
+    }
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(out), std::fs::canonicalize(config))
+        && a == b
+    {
+        anyhow::bail!("report path `{}` is the config file", out.display());
+    }
+    Ok(())
 }
 
 /// Largest config file we read; a bigger file is rejected, never read to the end.
@@ -116,13 +198,15 @@ fn read_config(path: &Path) -> anyhow::Result<String> {
 /// Load, parse, validate and resolve the config, then print a summary (names only).
 fn validate_file(
     path: &Path,
+    only: Option<CheckName>,
     env_lookup: &impl Fn(&str) -> Option<String>,
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
+    let sel = only.map_or(Selection::All, Selection::Only);
     let text = read_config(path)?;
     let cfg = config::parse(&text)?;
-    let budget = config::validate(&cfg, config::Selection::All)?; // validate before resolve
-    let resolved = config::resolve(&cfg, config::Selection::All, env_lookup)?;
+    let budget = config::validate(&cfg, sel)?; // validate before resolve
+    let resolved = config::resolve(&cfg, sel, env_lookup)?;
 
     writeln!(out, "config OK")?;
     writeln!(out, "planned requests: {}", budget.requests)?;
@@ -383,6 +467,212 @@ mod tests {
         );
         assert_eq!(code, 2);
         assert_eq!(std::fs::read_to_string(&report).unwrap(), "KEEP-ME");
+    }
+
+    const PARTIAL: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/brute-force-only.json"
+    );
+
+    fn check_only(args: &[&str]) -> (u8, String, String) {
+        let mut a = vec!["api-toolkit", "check"];
+        a.extend_from_slice(args);
+        run_args(&a, &full_env)
+    }
+
+    #[test]
+    fn check_without_only_gives_p4_message_and_reads_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("r.json");
+        std::fs::write(&report, "KEEP-ME").unwrap();
+        let (code, out, err) = check_only(&[
+            "--config",
+            "/nonexistent/c.json",
+            "--out",
+            report.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 2);
+        assert!(err.contains("full suite available in P4"), "{err}");
+        assert!(err.contains("--only"), "{err}");
+        assert!(!err.contains("/nonexistent"), "config was read: {err}");
+        assert_eq!(std::fs::read_to_string(&report).unwrap(), "KEEP-ME");
+        assert_no_sentinel(&out, &err);
+    }
+
+    #[test]
+    fn only_rejects_unknown_and_unavailable_names_in_check_and_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("r.json");
+        let rep = report.to_str().unwrap();
+        let cases = [
+            ("bogus", "unknown check"),
+            ("Brute_Force", "unknown check"),
+            ("", "unknown check"),
+            ("race", "not available yet"),
+            ("load", "not available yet"),
+        ];
+        for (name, want) in cases {
+            // The config path does not exist: a name error must come first.
+            let (code, out, err) = check_only(&[
+                "--config",
+                "/nonexistent/c.json",
+                "--out",
+                rep,
+                "--only",
+                name,
+            ]);
+            assert_eq!(code, 2, "check {name}");
+            assert!(err.contains(want), "check {name}: {err}");
+            assert!(!err.contains("/nonexistent"), "{err}");
+            assert!(!report.exists());
+            assert_no_sentinel(&out, &err);
+
+            let (code, out, err) = run_args(
+                &[
+                    "api-toolkit",
+                    "validate",
+                    "--config",
+                    PARTIAL,
+                    "--only",
+                    name,
+                ],
+                &full_env,
+            );
+            assert_eq!(code, 2, "validate {name}");
+            assert!(err.contains(want), "validate {name}: {err}");
+            assert!(out.is_empty(), "{out}");
+        }
+        let (_, _, err) = check_only(&["--config", "x", "--out", rep, "--only", "bogus"]);
+        assert!(err.contains("available: brute_force"), "{err}");
+        let (_, _, err) = check_only(&["--config", "x", "--out", rep, "--only", "race"]);
+        assert!(err.contains("P2"), "{err}");
+        let (_, _, err) = check_only(&["--config", "x", "--out", rep, "--only", "load"]);
+        assert!(err.contains("P3"), "{err}");
+    }
+
+    #[test]
+    fn validate_only_brute_force_on_partial_example() {
+        let env = |n: &str| n.starts_with("LOGIN_").then(|| SENTINEL.to_string());
+        let (code, out, err) = run_args(
+            &[
+                "api-toolkit",
+                "validate",
+                "--config",
+                PARTIAL,
+                "--only",
+                "brute_force",
+            ],
+            &env,
+        );
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("planned requests: 9"), "{out}");
+        assert!(out.contains("fixed waits: 700 ms"), "{out}");
+        assert!(
+            out.contains("environment variables present: LOGIN_INVALID_PASSWORD, LOGIN_USER, LOGIN_VALID_PASSWORD"),
+            "{out}"
+        );
+        assert_no_sentinel(&out, &err);
+    }
+
+    #[test]
+    fn validate_without_only_on_partial_example_names_race() {
+        let (code, out, err) = validate(PARTIAL, &full_env);
+        assert_eq!(code, 2);
+        assert!(err.contains("race"), "{err}");
+        assert!(out.is_empty(), "{out}");
+    }
+
+    #[test]
+    fn check_only_brute_force_valid_stops_not_wired_without_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("r.json");
+        let (code, out, err) = check_only(&[
+            "--config",
+            PARTIAL,
+            "--out",
+            report.to_str().unwrap(),
+            "--only",
+            "brute_force",
+        ]);
+        assert_eq!(code, 2);
+        assert!(err.contains("not wired yet"), "{err}");
+        assert!(!report.exists());
+        assert_no_sentinel(&out, &err);
+    }
+
+    #[test]
+    fn check_only_config_errors_are_2_without_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("r.json");
+        let rep = report.to_str().unwrap();
+        let no_env = |_: &str| None;
+        let (code, _, err) = run_args(
+            &[
+                "api-toolkit",
+                "check",
+                "--config",
+                PARTIAL,
+                "--out",
+                rep,
+                "--only",
+                "brute_force",
+            ],
+            &no_env,
+        );
+        assert_eq!(code, 2);
+        assert!(err.contains("LOGIN_USER"), "{err}");
+        assert!(!report.exists());
+    }
+
+    #[test]
+    fn precheck_out_rejects_missing_parent_directory_and_config_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cd, cfg) = temp_config(&std::fs::read_to_string(PARTIAL).unwrap());
+        let missing = dir.path().join("nope").join("r.json");
+        let as_dir = dir.path().to_str().unwrap().to_string();
+        let cases = [
+            (missing.to_str().unwrap().to_string(), "parent directory"),
+            (as_dir, "is a directory"),
+            (cfg.clone(), "is the config file"),
+        ];
+        let before = std::fs::read_to_string(&cfg).unwrap();
+        for (out_path, want) in cases {
+            let (code, out, err) = check_only(&[
+                "--config",
+                &cfg,
+                "--out",
+                &out_path,
+                "--only",
+                "brute_force",
+            ]);
+            assert_eq!(code, 2, "{out_path}");
+            assert!(err.contains(want), "{out_path}: {err}");
+            assert!(!err.contains("not wired"), "{err}");
+            assert_no_sentinel(&out, &err);
+        }
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before);
+        assert!(!dir.path().join("nope").exists());
+    }
+
+    #[test]
+    fn check_help_has_required_phrases() {
+        let (code, out, _) = run_args(&["api-toolkit", "check", "--help"], &full_env);
+        assert_eq!(code, 0);
+        let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+        for want in [
+            "--only",
+            "required until P4",
+            "Available: brute_force",
+            "never exits 0",
+            "exit 1 = FAIL",
+            "2 = PASS or any other result",
+            "130 = cancelled",
+        ] {
+            assert!(flat.contains(want), "missing `{want}` in {flat}");
+        }
+        let (code, out, _) = run_args(&["api-toolkit", "validate", "--help"], &full_env);
+        assert_eq!(code, 0);
+        assert!(out.contains("--only"), "{out}");
     }
 
     #[test]
