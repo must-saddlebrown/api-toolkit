@@ -1,4 +1,4 @@
-//! Local healthy fixture server. Usage: `cargo run --example fixture [-- --port <n>]`.
+//! Local fixture server (healthy and intentionally broken variants). Usage: `cargo run --example fixture [-- --port <n>]`.
 //! See docs/fixture.md.
 
 #[path = "../tests/support/fixture.rs"]
