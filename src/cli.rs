@@ -1121,7 +1121,14 @@ mod tests {
     #[tokio::test]
     async fn run_check_cancel_while_request_hangs_is_130() {
         let (addr, count) = hang().await;
-        let cancel = tokio::time::sleep(Duration::from_millis(150));
+        // Cancel only once the server has accepted the first connection: an observed
+        // condition, not a guessed delay, so the request is certainly in flight.
+        let seen = count.clone();
+        let cancel = async move {
+            while seen.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
         let r = run_it(&format!("http://{addr}"), |_| {}, cancel).await;
         assert_eq!(r.code, 130, "{}", r.err);
         assert_eq!(r.bf()["verdict"], "not_run");
