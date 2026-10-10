@@ -1,0 +1,27 @@
+{
+  "config_version": 1,
+  "base_url": "http://127.0.0.1:8080",
+  "limits": {
+    "request_timeout_ms": 5000,
+    "suite_deadline_ms": 120000,
+    "response_body_limit_bytes": 1048576
+  },
+  "load": {
+    "request": {
+      "method": "GET",
+      "path": "/critical",
+      "headers": {
+        "Authorization": "${ENV:TEST_AUTHORIZATION}"
+      }
+    },
+    "response_match": {
+      "status_in": [
+        200
+      ]
+    },
+    "requests": 100,
+    "concurrency": 10,
+    "max_error_rate": 0.01,
+    "max_p95_ms": 500
+  }
+}

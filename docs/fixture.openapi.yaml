@@ -19,7 +19,7 @@ info:
     | --- | --- | --- |
     | Login | `/login` (sehat), `/broken/login/*` (sengaja rusak) | brute force |
     | Aksi write-once | `/actions/{id}/apply` (sehat), `/broken/actions/{id}/apply-racy` (sengaja rusak), `/idempotent/actions/{id}/apply` (sehat, idempotent), `/actions/{id}` (verifier) | race (P2) |
-    | Beban | `/critical` | load (P3) |
+    | Beban | `/critical` (sehat), `/broken/critical/{slow,flaky,hang}` (sengaja rusak) | load (P3) |
     | Alat dev | `/__admin/reset`, `/__admin/stats` | dipakai test dan pengguna, tidak oleh check |
 
     Nilai tetap yang dipakai fixture (konstanta dev publik, bukan secret):
@@ -259,13 +259,90 @@ paths:
       summary: Endpoint beban
       description: |
         Selalu cepat dan selalu `200 {"ok": true}` bila `Authorization` benar; setiap request terotorisasi
-        menaikkan `load_requests` (terbaca di `/__admin/stats`). Tanpa otorisasi: `401`, tidak dihitung.
-        Varian lambat atau error ditambahkan di P3.
+        menaikkan `load_requests` (terbaca di `/__admin/stats`), termasuk yang `401`.
       security:
         - fixtureBearer: []
       responses:
         '200':
           description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: {type: boolean, const: true}
+              example: {ok: true}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /broken/critical/slow:
+    get:
+      tags: [load]
+      operationId: criticalSlow
+      summary: Beban lambat (sengaja rusak)
+      description: |
+        Auth seperti `/critical`. Tidur 300 ms (`SLOW_DELAY`) lalu `200 {"ok": true}`. Dihitung di `load_requests`, termasuk `401`.
+      security:
+        - fixtureBearer: []
+      responses:
+        '200':
+          description: OK setelah 300 ms.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: {type: boolean, const: true}
+              example: {ok: true}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /broken/critical/flaky:
+    get:
+      tags: [load]
+      operationId: criticalFlaky
+      summary: Beban dengan error berkala (sengaja rusak)
+      description: |
+        Auth seperti `/critical`. Bila nomor `load_requests` (setelah increment) kelipatan 10 (`FLAKY_EVERY`): `500 {"error": "flaky"}`;
+        selain itu `200 {"ok": true}`. Berbasis counter, bukan timing. Dihitung di `load_requests`, termasuk `401`.
+      security:
+        - fixtureBearer: []
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: {type: boolean, const: true}
+              example: {ok: true}
+        '500':
+          description: Kegagalan terkontrol (setiap request load ke-10).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error: {type: string, const: flaky}
+              example: {error: flaky}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /broken/critical/hang:
+    get:
+      tags: [load]
+      operationId: criticalHang
+      summary: Beban dengan request menggantung (sengaja rusak)
+      description: |
+        Auth seperti `/critical`. Bila nomor `load_requests` kelipatan 10: tidur 3 detik (`HANG_DELAY`) lalu `200 {"ok": true}`
+        (client dengan timeout lebih pendek mencatat timeout); selain itu `200` cepat. Dihitung di `load_requests`, termasuk `401`.
+      security:
+        - fixtureBearer: []
+      responses:
+        '200':
+          description: OK (cepat, atau setelah 3 detik).
           content:
             application/json:
               schema:
@@ -308,7 +385,7 @@ paths:
         - `login_requests` menghitung setiap `POST` yang sampai ke handler salah satu dari tiga rute login,
           termasuk body rusak (400). Method selain POST (405) dan body di atas batas default axum (2 MB)
           ditolak sebelum handler dan **tidak** dihitung.
-        - `load_requests` menghitung `GET /critical` yang terotorisasi.
+        - `load_requests` menghitung setiap `GET` ke empat rute load (`/critical`, `/broken/critical/*`), termasuk `401`.
         - `action_requests` menghitung setiap `POST` ke tiga rute apply (sehat, racy, idempotent), termasuk `401`.
         - `verify_requests` menghitung setiap `GET /actions/{id}`, termasuk `401`. Race sehat N=5: `action_requests` 5, `verify_requests` 2.
         - Request ke stats sendiri tidak dihitung.

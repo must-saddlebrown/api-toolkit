@@ -509,7 +509,7 @@ fn rejected_cases(base: &str) -> Vec<Case> {
     vec![
         plain("no --only", None, "available in P4"),
         plain("bogus", Some("bogus"), "unknown check"),
-        plain("load", Some("load"), "not available yet"),
+        plain("loadx", Some("loadx"), "unknown check"),
         Case {
             name: "selected section missing",
             only: Some("brute_force"),
@@ -962,11 +962,11 @@ async fn race_rejected_inputs_exit_2_with_zero_connections_and_out_untouched() {
             "TEST_ACTION_ID",
         ),
         (
-            "--only load",
-            Some("load"),
+            "--only loadx",
+            Some("loadx"),
             race_cfg(&base, |_| {}),
             ok_env(),
-            "not available yet",
+            "unknown check",
         ),
     ];
     for existing in [false, true] {
