@@ -65,6 +65,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures-util",
  "percent-encoding",
  "reqwest",
  "serde",
