@@ -121,8 +121,8 @@ fn validate_file(
 ) -> anyhow::Result<()> {
     let text = read_config(path)?;
     let cfg = config::parse(&text)?;
-    let budget = config::validate(&cfg)?; // validate before resolve
-    let resolved = config::resolve(&cfg, env_lookup)?;
+    let budget = config::validate(&cfg, config::Selection::All)?; // validate before resolve
+    let resolved = config::resolve(&cfg, config::Selection::All, env_lookup)?;
 
     writeln!(out, "config OK")?;
     writeln!(out, "planned requests: {}", budget.requests)?;

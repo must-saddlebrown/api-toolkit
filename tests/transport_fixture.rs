@@ -18,7 +18,7 @@ struct Env {
 
 fn setup(base_url: &str) -> Env {
     let cfg = config::parse(&with_base_url(&example_text(), base_url)).unwrap();
-    config::validate(&cfg).unwrap();
+    config::validate(&cfg, config::Selection::All).unwrap();
     let lookup = |name: &str| -> Option<String> {
         match name {
             "LOGIN_USER" => Some(LOGIN_USER),
@@ -30,7 +30,7 @@ fn setup(base_url: &str) -> Env {
         }
         .map(String::from)
     };
-    let reqs = Arc::new(config::resolve(&cfg, &lookup).unwrap());
+    let reqs = Arc::new(config::resolve(&cfg, config::Selection::All, &lookup).unwrap());
     let transport = Arc::new(Transport::new(&cfg.limits).unwrap());
     Env {
         cfg,
@@ -68,10 +68,12 @@ async fn pipeline_against_healthy_fixture() {
     assert!(fx.addr.ip().is_loopback()); // P0-AC17
     let base = fx.base_url();
     let env = setup(&base);
-    let bf = &env.cfg.brute_force;
+    let bf = env.cfg.brute_force.as_ref().unwrap();
+    let bfr = env.reqs.brute_force.as_ref().unwrap();
+    let racer = env.reqs.race.as_ref().unwrap();
 
     // Login valid: 200 + /access_token, body parsed as JSON, elapsed set.
-    let r = go(&env, &env.reqs.baseline).await;
+    let r = go(&env, &bfr.baseline).await;
     assert_eq!(r.status, 200);
     assert!(bf.success_match.matches(r.status, r.body.as_ref()));
     assert!(r.body.is_some());
@@ -79,49 +81,51 @@ async fn pipeline_against_healthy_fixture() {
 
     // Five invalid logins: 401 and rejection match; the sixth: 429 and protection match.
     for _ in 0..5 {
-        let r = go(&env, &env.reqs.probe).await;
+        let r = go(&env, &bfr.probe).await;
         assert_eq!(r.status, 401);
         assert!(bf.rejection_match.matches(r.status, r.body.as_ref()));
         assert!(!bf.success_match.matches(r.status, r.body.as_ref()));
     }
-    let r = go(&env, &env.reqs.probe).await;
+    let r = go(&env, &bfr.probe).await;
     assert_eq!(r.status, 429);
     assert!(bf.protection_match.matches(r.status, r.body.as_ref()));
 
     // Verify before: 0, with matcher.
-    let race = &env.cfg.race;
-    let r = go(&env, &env.reqs.verify).await;
+    let race = env.cfg.race.as_ref().unwrap();
+    let r = go(&env, &racer.verify).await;
     assert!(race.verify_match.matches(r.status, r.body.as_ref()));
     assert_eq!(counter(&r), 0);
 
     // Apply: 200 then 409, both in expected_action_statuses.
-    let a1 = go(&env, &env.reqs.action).await;
-    let a2 = go(&env, &env.reqs.action).await;
+    let a1 = go(&env, &racer.action).await;
+    let a2 = go(&env, &racer.action).await;
     assert_eq!((a1.status, a2.status), (200, 409));
     assert!(race.expected_action_statuses.contains(&a1.status));
     assert!(race.expected_action_statuses.contains(&a2.status));
-    let r = go(&env, &env.reqs.verify).await;
+    let r = go(&env, &racer.verify).await;
     assert!(race.verify_match.matches(r.status, r.body.as_ref()));
     assert_eq!(counter(&r), 1);
 
     // Load endpoint.
-    let r = go(&env, &env.reqs.load).await;
+    let r = go(&env, env.reqs.load.as_ref().unwrap()).await;
     assert_eq!(r.status, 200);
     assert!(
         env.cfg
             .load
+            .as_ref()
+            .unwrap()
             .response_match
             .matches(r.status, r.body.as_ref())
     );
 
     // Reset restores state (P0-AC19): counter 0, failed login count 0.
     assert_eq!(go(&env, &reset_request(&base)).await.status, 200);
-    assert_eq!(counter(&go(&env, &env.reqs.verify).await), 0);
-    assert_eq!(go(&env, &env.reqs.baseline).await.status, 200);
-    assert_eq!(go(&env, &env.reqs.probe).await.status, 401); // first failure again
+    assert_eq!(counter(&go(&env, &racer.verify).await), 0);
+    assert_eq!(go(&env, &bfr.baseline).await.status, 200);
+    assert_eq!(go(&env, &bfr.probe).await.status, 401); // first failure again
 
     // Debug of a response never shows body text.
-    let dbg = format!("{:?}", go(&env, &env.reqs.baseline).await);
+    let dbg = format!("{:?}", go(&env, &bfr.baseline).await);
     assert!(!dbg.contains(ACCESS_TOKEN), "{dbg}");
     assert!(!dbg.contains("access_token"), "{dbg}");
 
@@ -137,7 +141,10 @@ async fn thirty_two_concurrent_applies_yield_one_success() {
     for _ in 0..32 {
         let (t, reqs) = (env.transport.clone(), env.reqs.clone());
         tasks.push(tokio::spawn(async move {
-            send(&t, &reqs.action).await.unwrap().status
+            send(&t, &reqs.race.as_ref().unwrap().action)
+                .await
+                .unwrap()
+                .status
         }));
     }
     let mut statuses = Vec::new();
@@ -154,7 +161,10 @@ async fn thirty_two_concurrent_applies_yield_one_success() {
         31,
         "{statuses:?}"
     );
-    assert_eq!(counter(&go(&env, &env.reqs.verify).await), 1);
+    assert_eq!(
+        counter(&go(&env, &env.reqs.race.as_ref().unwrap().verify).await),
+        1
+    );
 
     fx.shutdown().await;
 }
@@ -168,7 +178,12 @@ async fn closed_port_is_connect_failed_without_url() {
         .unwrap()
         .port();
     let env = setup(&format!("http://127.0.0.1:{port}"));
-    let err = send(&env.transport, &env.reqs.baseline).await.unwrap_err();
+    let err = send(
+        &env.transport,
+        &env.reqs.brute_force.as_ref().unwrap().baseline,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.code, TransportErrorCode::ConnectFailed);
     for text in [format!("{err}"), format!("{err:?}")] {
         assert!(!text.contains("127.0.0.1"), "{text}");

@@ -1,0 +1,49 @@
+{
+  "config_version": 1,
+  "base_url": "http://127.0.0.1:8080",
+  "limits": {
+    "request_timeout_ms": 5000,
+    "suite_deadline_ms": 120000,
+    "response_body_limit_bytes": 1048576
+  },
+  "brute_force": {
+    "baseline_request": {
+      "method": "POST",
+      "path": "/login",
+      "json": {
+        "username": "${ENV:LOGIN_USER}",
+        "password": "${ENV:LOGIN_VALID_PASSWORD}"
+      }
+    },
+    "probe_request": {
+      "method": "POST",
+      "path": "/login",
+      "json": {
+        "username": "${ENV:LOGIN_USER}",
+        "password": "${ENV:LOGIN_INVALID_PASSWORD}"
+      }
+    },
+    "success_match": {
+      "status_in": [
+        200
+      ],
+      "json_exists": [
+        "/access_token"
+      ]
+    },
+    "rejection_match": {
+      "status_in": [
+        401
+      ]
+    },
+    "protection_match": {
+      "status_in": [
+        429
+      ]
+    },
+    "attempts": 8,
+    "interval_ms": 100,
+    "protect_by_attempt": 6,
+    "protected_tail_count": 2
+  }
+}

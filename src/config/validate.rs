@@ -8,7 +8,10 @@ use std::collections::BTreeSet;
 
 use reqwest::Url;
 
-use super::{BruteForce, Config, ConfigError, Limits, Load, MatcherSpec, Race, RequestSpec};
+use super::{
+    BruteForce, Config, ConfigError, Limits, Load, MatcherSpec, Race, RequestSpec, Selection,
+};
+use crate::report::CheckName;
 
 /// Max probe count, race concurrency, load count and load concurrency (PLAN §8).
 const MAX_PROBES: u32 = 100;
@@ -52,19 +55,50 @@ fn check_positive(path: &str, value: u64) -> Result<(), ConfigError> {
     }
 }
 
-pub fn validate(cfg: &Config) -> Result<RequestBudget, ConfigError> {
+/// A selected section must exist. The message names the section.
+fn required<'a, T>(
+    section: &'a Option<T>,
+    name: &str,
+    sel: Selection,
+) -> Result<&'a T, ConfigError> {
+    section.as_ref().ok_or_else(|| match sel {
+        Selection::All => invalid(name, "is required (all three checks must be configured)"),
+        Selection::Only(_) => invalid(name, "is required for the selected check"),
+    })
+}
+
+/// Validates the base URL, limits and the sections `sel` includes. Sections that are
+/// not selected are not looked at (their shape was already checked by `parse`).
+pub fn validate(cfg: &Config, sel: Selection) -> Result<RequestBudget, ConfigError> {
     check_base_url(&cfg.base_url)?;
     check_limits(&cfg.limits)?;
-    check_brute_force(&cfg.brute_force)?;
-    check_race(&cfg.race)?;
-    check_load(&cfg.load)?;
 
-    let bf = &cfg.brute_force;
     // u128 cannot overflow here (max about 2^32 * 2^64 + 2^64), so a huge interval can
     // never wrap into a false accept. Anything above the deadline (a u64) is rejected,
     // which also guarantees the value fits `RequestBudget::fixed_wait_ms`.
-    let fixed_wait =
-        u128::from(bf.attempts - 1) * u128::from(bf.interval_ms) + u128::from(cfg.race.settle_ms);
+    let mut requests: u64 = 0;
+    let mut fixed_wait: u128 = 0;
+    // Brute force: baseline + attempts.
+    if sel.includes(CheckName::BruteForce) {
+        let bf = required(&cfg.brute_force, "brute_force", sel)?;
+        check_brute_force(bf)?;
+        requests += 1 + u64::from(bf.attempts);
+        fixed_wait += u128::from(bf.attempts - 1) * u128::from(bf.interval_ms);
+    }
+    // Race: verify before + verify after + N actions.
+    if sel.includes(CheckName::Race) {
+        let race = required(&cfg.race, "race", sel)?;
+        check_race(race)?;
+        requests += 2 + u64::from(race.concurrency);
+        fixed_wait += u128::from(race.settle_ms);
+    }
+    // Load: preflight + requests.
+    if sel.includes(CheckName::Load) {
+        let load = required(&cfg.load, "load", sel)?;
+        check_load(load)?;
+        requests += 1 + u64::from(load.requests);
+    }
+
     let fixed_wait_ms = match u64::try_from(fixed_wait) {
         Ok(ms) if ms <= cfg.limits.suite_deadline_ms => ms,
         _ => {
@@ -74,14 +108,6 @@ pub fn validate(cfg: &Config) -> Result<RequestBudget, ConfigError> {
             ));
         }
     };
-    // Brute force: baseline + attempts. Race: verify before + verify after + N actions.
-    // Load: preflight + requests.
-    let requests = 1
-        + u64::from(bf.attempts)
-        + 2
-        + u64::from(cfg.race.concurrency)
-        + 1
-        + u64::from(cfg.load.requests);
     Ok(RequestBudget {
         requests,
         fixed_wait_ms,
@@ -385,18 +411,30 @@ mod tests {
         )
     }
 
+    fn load(c: &mut Config) -> &mut Load {
+        c.load.as_mut().expect("load")
+    }
+
+    fn race(c: &mut Config) -> &mut Race {
+        c.race.as_mut().expect("race")
+    }
+
+    fn bf(c: &mut Config) -> &mut BruteForce {
+        c.brute_force.as_mut().expect("bf")
+    }
+
     type Mutate = fn(&mut Config);
 
     /// Apply `f` to the example config, then validate.
     fn run(f: Mutate) -> Result<RequestBudget, ConfigError> {
         let mut cfg = base();
         f(&mut cfg);
-        validate(&cfg)
+        validate(&cfg, Selection::All)
     }
 
     #[test]
     fn example_is_valid_and_budget_is_computed() {
-        let budget = validate(&base()).expect("example valid");
+        let budget = validate(&base(), Selection::All).expect("example valid");
         // 1+8 brute force, 2+5 race, 1+100 load; 7*100 + 250 ms waits.
         assert_eq!(
             budget,
@@ -413,45 +451,41 @@ mod tests {
         let cases: Vec<(&str, Mutate, &str)> = vec![
             (
                 "probe 101",
-                |c| c.brute_force.attempts = 101,
+                |c| bf(c).attempts = 101,
                 "brute_force.attempts",
             ),
-            (
-                "probe 0",
-                |c| c.brute_force.attempts = 0,
-                "brute_force.attempts",
-            ),
-            ("race 33", |c| c.race.concurrency = 33, "race.concurrency"),
-            ("race 0", |c| c.race.concurrency = 0, "race.concurrency"),
-            ("race 1", |c| c.race.concurrency = 1, "race.concurrency"),
-            ("load 1001", |c| c.load.requests = 1001, "load.requests"),
-            ("load 0", |c| c.load.requests = 0, "load.requests"),
+            ("probe 0", |c| bf(c).attempts = 0, "brute_force.attempts"),
+            ("race 33", |c| race(c).concurrency = 33, "race.concurrency"),
+            ("race 0", |c| race(c).concurrency = 0, "race.concurrency"),
+            ("race 1", |c| race(c).concurrency = 1, "race.concurrency"),
+            ("load 1001", |c| load(c).requests = 1001, "load.requests"),
+            ("load 0", |c| load(c).requests = 0, "load.requests"),
             (
                 "load conc 33",
-                |c| c.load.concurrency = 33,
+                |c| load(c).concurrency = 33,
                 "load.concurrency",
             ),
             (
                 "load conc 0",
-                |c| c.load.concurrency = 0,
+                |c| load(c).concurrency = 0,
                 "load.concurrency",
             ),
             (
                 "error rate 1.01",
-                |c| c.load.max_error_rate = 1.01,
+                |c| load(c).max_error_rate = 1.01,
                 "load.max_error_rate",
             ),
             (
                 "error rate -0.1",
-                |c| c.load.max_error_rate = -0.1,
+                |c| load(c).max_error_rate = -0.1,
                 "load.max_error_rate",
             ),
             (
                 "error rate nan",
-                |c| c.load.max_error_rate = f64::NAN,
+                |c| load(c).max_error_rate = f64::NAN,
                 "load.max_error_rate",
             ),
-            ("p95 0", |c| c.load.max_p95_ms = 0, "load.max_p95_ms"),
+            ("p95 0", |c| load(c).max_p95_ms = 0, "load.max_p95_ms"),
             (
                 "request timeout 0",
                 |c| c.limits.request_timeout_ms = 0,
@@ -474,54 +508,54 @@ mod tests {
             ),
             (
                 "interval 0",
-                |c| c.brute_force.interval_ms = 0,
+                |c| bf(c).interval_ms = 0,
                 "brute_force.interval_ms",
             ),
-            ("settle 0", |c| c.race.settle_ms = 0, "race.settle_ms"),
+            ("settle 0", |c| race(c).settle_ms = 0, "race.settle_ms"),
             (
                 "skew 0",
-                |c| c.race.max_dispatch_skew_ms = 0,
+                |c| race(c).max_dispatch_skew_ms = 0,
                 "race.max_dispatch_skew_ms",
             ),
             (
                 "protect_by 1",
-                |c| c.brute_force.protect_by_attempt = 1,
+                |c| bf(c).protect_by_attempt = 1,
                 "brute_force.protect_by_attempt",
             ),
             (
                 "protect_by > attempts",
-                |c| c.brute_force.protect_by_attempt = 9,
+                |c| bf(c).protect_by_attempt = 9,
                 "brute_force.protect_by_attempt",
             ),
             (
                 "tail 0",
-                |c| c.brute_force.protected_tail_count = 0,
+                |c| bf(c).protected_tail_count = 0,
                 "brute_force.protected_tail_count",
             ),
             (
                 "tail > attempts",
-                |c| c.brute_force.protected_tail_count = 9,
+                |c| bf(c).protected_tail_count = 9,
                 "brute_force.protected_tail_count",
             ),
             (
                 "tail == attempts",
-                |c| c.brute_force.protected_tail_count = 8,
+                |c| bf(c).protected_tail_count = 8,
                 "brute_force.protected_tail_count",
             ),
             (
                 "attempts 1",
                 |c| {
-                    c.brute_force.attempts = 1;
-                    c.brute_force.protect_by_attempt = 1;
-                    c.brute_force.protected_tail_count = 1;
+                    bf(c).attempts = 1;
+                    bf(c).protect_by_attempt = 1;
+                    bf(c).protected_tail_count = 1;
                 },
                 "brute_force.protect_by_attempt",
             ),
             (
                 "fixed waits overflow",
                 |c| {
-                    c.brute_force.interval_ms = u64::MAX;
-                    c.race.settle_ms = u64::MAX;
+                    bf(c).interval_ms = u64::MAX;
+                    race(c).settle_ms = u64::MAX;
                     c.limits.suite_deadline_ms = u64::MAX;
                 },
                 "limits.suite_deadline_ms",
@@ -529,33 +563,33 @@ mod tests {
             (
                 "fixed waits just over u64",
                 |c| {
-                    c.brute_force.attempts = 2;
-                    c.brute_force.protect_by_attempt = 2;
-                    c.brute_force.protected_tail_count = 1;
-                    c.brute_force.interval_ms = u64::MAX;
-                    c.race.settle_ms = 1;
+                    bf(c).attempts = 2;
+                    bf(c).protect_by_attempt = 2;
+                    bf(c).protected_tail_count = 1;
+                    bf(c).interval_ms = u64::MAX;
+                    race(c).settle_ms = 1;
                     c.limits.suite_deadline_ms = u64::MAX;
                 },
                 "limits.suite_deadline_ms",
             ),
             (
                 "path backslash",
-                |c| c.load.request.path = "/\\evil.test".into(),
+                |c| load(c).request.path = "/\\evil.test".into(),
                 "load.request.path",
             ),
             (
                 "path newline",
-                |c| c.load.request.path = "/a\n".into(),
+                |c| load(c).request.path = "/a\n".into(),
                 "load.request.path",
             ),
             (
                 "path nul",
-                |c| c.load.request.path = "/a\0b".into(),
+                |c| load(c).request.path = "/a\0b".into(),
                 "load.request.path",
             ),
             (
                 "path del",
-                |c| c.load.request.path = "/a\x7f".into(),
+                |c| load(c).request.path = "/a\x7f".into(),
                 "load.request.path",
             ),
             (
@@ -580,22 +614,22 @@ mod tests {
             ),
             (
                 "initial_counter 1",
-                |c| c.race.initial_counter = 1,
+                |c| race(c).initial_counter = 1,
                 "race.initial_counter",
             ),
             (
                 "initial_counter -1",
-                |c| c.race.initial_counter = -1,
+                |c| race(c).initial_counter = -1,
                 "race.initial_counter",
             ),
             (
                 "expected_delta 2",
-                |c| c.race.expected_delta = 2,
+                |c| race(c).expected_delta = 2,
                 "race.expected_delta",
             ),
             (
                 "expected_delta 0",
-                |c| c.race.expected_delta = 0,
+                |c| race(c).expected_delta = 0,
                 "race.expected_delta",
             ),
             (
@@ -605,77 +639,77 @@ mod tests {
             ),
             (
                 "empty status_in",
-                |c| c.brute_force.success_match.status_in.clear(),
+                |c| bf(c).success_match.status_in.clear(),
                 "success_match.status_in",
             ),
             (
                 "status 99",
-                |c| c.load.response_match.status_in = vec![99],
+                |c| load(c).response_match.status_in = vec![99],
                 "load.response_match.status_in",
             ),
             (
                 "status 600",
-                |c| c.race.expected_action_statuses = vec![600],
+                |c| race(c).expected_action_statuses = vec![600],
                 "race.expected_action_statuses",
             ),
             (
                 "empty expected_action_statuses",
-                |c| c.race.expected_action_statuses.clear(),
+                |c| race(c).expected_action_statuses.clear(),
                 "race.expected_action_statuses",
             ),
             (
                 "overlap success/rejection",
-                |c| c.brute_force.rejection_match.status_in = vec![200, 401],
+                |c| bf(c).rejection_match.status_in = vec![200, 401],
                 "brute_force",
             ),
             (
                 "overlap rejection/protection",
-                |c| c.brute_force.protection_match.status_in = vec![401, 429],
+                |c| bf(c).protection_match.status_in = vec![401, 429],
                 "brute_force",
             ),
             (
                 "overlap success/protection",
-                |c| c.brute_force.protection_match.status_in = vec![429, 200],
+                |c| bf(c).protection_match.status_in = vec![429, 200],
                 "brute_force",
             ),
             (
                 "pointer without slash",
-                |c| c.race.counter_pointer = "execution_count".into(),
+                |c| race(c).counter_pointer = "execution_count".into(),
                 "race.counter_pointer",
             ),
             (
                 "pointer empty",
-                |c| c.race.counter_pointer = String::new(),
+                |c| race(c).counter_pointer = String::new(),
                 "race.counter_pointer",
             ),
             (
                 "pointer bad escape",
-                |c| c.race.counter_pointer = "/a~2".into(),
+                |c| race(c).counter_pointer = "/a~2".into(),
                 "race.counter_pointer",
             ),
             (
                 "pointer dangling tilde",
-                |c| c.race.counter_pointer = "/a~".into(),
+                |c| race(c).counter_pointer = "/a~".into(),
                 "race.counter_pointer",
             ),
             (
                 "json_exists bad pointer",
-                |c| c.brute_force.success_match.json_exists = Some(vec!["token".into()]),
+                |c| bf(c).success_match.json_exists = Some(vec!["token".into()]),
                 "success_match.json_exists",
             ),
             (
                 "json_exists empty",
-                |c| c.brute_force.success_match.json_exists = Some(vec![]),
+                |c| bf(c).success_match.json_exists = Some(vec![]),
                 "success_match.json_exists",
             ),
             (
                 "json_equals bad pointer",
-                |c| c.load.response_match.json_equals = Some([("x".to_string(), 1.into())].into()),
+                |c| load(c).response_match.json_equals = Some([("x".to_string(), 1.into())].into()),
                 "load.response_match.json_equals",
             ),
             (
                 "json_equals empty",
-                |c| c.load.response_match.json_equals = Some(BTreeMap::new()),
+                |c| load(c).response_match.json_equals = Some(BTreeMap::new()),
                 "load.response_match.json_equals",
             ),
             (
@@ -715,107 +749,109 @@ mod tests {
             ),
             (
                 "path absolute url",
-                |c| c.load.request.path = "http://evil.test/x".into(),
+                |c| load(c).request.path = "http://evil.test/x".into(),
                 "load.request.path",
             ),
             (
                 "path no slash",
-                |c| c.load.request.path = "critical".into(),
+                |c| load(c).request.path = "critical".into(),
                 "load.request.path",
             ),
             (
                 "path double slash",
-                |c| c.load.request.path = "//evil.test/x".into(),
+                |c| load(c).request.path = "//evil.test/x".into(),
                 "load.request.path",
             ),
             (
                 "path with query",
-                |c| c.load.request.path = "/critical?a=1".into(),
+                |c| load(c).request.path = "/critical?a=1".into(),
                 "load.request.path",
             ),
             (
                 "placeholder without param",
-                |c| c.load.request.path = "/a/{id}".into(),
+                |c| load(c).request.path = "/a/{id}".into(),
                 "load.request.path_params",
             ),
             (
                 "param without placeholder",
-                |c| c.load.request.path_params = map(&[("id", "x")]),
+                |c| load(c).request.path_params = map(&[("id", "x")]),
                 "load.request.path_params",
             ),
             (
                 "param name mismatch",
-                |c| c.race.action_request.path_params = map(&[("other", "x")]),
+                |c| race(c).action_request.path_params = map(&[("other", "x")]),
                 "race.action_request.path_params",
             ),
             (
                 "unclosed brace",
-                |c| c.load.request.path = "/a/{id".into(),
+                |c| load(c).request.path = "/a/{id".into(),
                 "load.request.path",
             ),
             (
                 "unmatched close brace",
-                |c| c.load.request.path = "/a/id}".into(),
+                |c| load(c).request.path = "/a/id}".into(),
                 "load.request.path",
             ),
             (
                 "empty placeholder",
-                |c| c.load.request.path = "/a/{}".into(),
+                |c| load(c).request.path = "/a/{}".into(),
                 "load.request.path",
             ),
             (
                 "nested brace",
-                |c| c.load.request.path = "/a/{a{b}}".into(),
+                |c| load(c).request.path = "/a/{a{b}}".into(),
                 "load.request.path",
             ),
             (
                 "bad method",
-                |c| c.load.request.method = "GE T".into(),
+                |c| load(c).request.method = "GE T".into(),
                 "load.request.method",
             ),
             (
                 "header case duplicate",
-                |c| c.load.request.headers = map(&[("Authorization", "a"), ("authorization", "b")]),
+                |c| {
+                    load(c).request.headers = map(&[("Authorization", "a"), ("authorization", "b")])
+                },
                 "load.request.headers",
             ),
             (
                 "bad header name",
-                |c| c.load.request.headers = map(&[("Bad Name", "a")]),
+                |c| load(c).request.headers = map(&[("Bad Name", "a")]),
                 "load.request.headers",
             ),
             (
                 "json null",
-                |c| c.load.request.json = Some(serde_json::Value::Null),
+                |c| load(c).request.json = Some(serde_json::Value::Null),
                 "load.request.json",
             ),
             (
                 "lowercase method",
-                |c| c.load.request.method = "get".into(),
+                |c| load(c).request.method = "get".into(),
                 "load.request.method",
             ),
             (
                 "mixed-case method",
-                |c| c.load.request.method = "Post".into(),
+                |c| load(c).request.method = "Post".into(),
                 "load.request.method",
             ),
             (
                 "header Host",
-                |c| c.load.request.headers = map(&[("hOsT", "a")]),
+                |c| load(c).request.headers = map(&[("hOsT", "a")]),
                 "load.request.headers",
             ),
             (
                 "header Content-Length",
-                |c| c.load.request.headers = map(&[("Content-length", "a")]),
+                |c| load(c).request.headers = map(&[("Content-length", "a")]),
                 "load.request.headers",
             ),
             (
                 "header Transfer-Encoding",
-                |c| c.load.request.headers = map(&[("TRANSFER-encoding", "a")]),
+                |c| load(c).request.headers = map(&[("TRANSFER-encoding", "a")]),
                 "load.request.headers",
             ),
             (
                 "header Connection",
-                |c| c.load.request.headers = map(&[("connectION", "a")]),
+                |c| load(c).request.headers = map(&[("connectION", "a")]),
                 "load.request.headers",
             ),
         ];
@@ -833,59 +869,55 @@ mod tests {
     fn accepted_boundary_cases() {
         let cases: Vec<(&str, Mutate)> = vec![
             ("probe 100", |c| {
-                c.brute_force.attempts = 100;
-                c.brute_force.protect_by_attempt = 100;
+                bf(c).attempts = 100;
+                bf(c).protect_by_attempt = 100;
                 c.limits.suite_deadline_ms = 1_000_000;
             }),
             ("probe 2 minimal", |c| {
-                c.brute_force.attempts = 2;
-                c.brute_force.protect_by_attempt = 2;
-                c.brute_force.protected_tail_count = 1;
+                bf(c).attempts = 2;
+                bf(c).protect_by_attempt = 2;
+                bf(c).protected_tail_count = 1;
             }),
-            ("race 32", |c| c.race.concurrency = 32),
-            ("race 2", |c| c.race.concurrency = 2),
-            ("load 1000", |c| c.load.requests = 1000),
-            ("load 1", |c| c.load.requests = 1),
-            ("load conc 32", |c| c.load.concurrency = 32),
-            ("load conc 1", |c| c.load.concurrency = 1),
-            ("error rate 0", |c| c.load.max_error_rate = 0.0),
-            ("error rate 1", |c| c.load.max_error_rate = 1.0),
-            ("p95 1", |c| c.load.max_p95_ms = 1),
-            ("interval 1", |c| c.brute_force.interval_ms = 1),
-            ("settle 1", |c| c.race.settle_ms = 1),
-            ("skew 1", |c| c.race.max_dispatch_skew_ms = 1),
-            ("protect_by 2", |c| c.brute_force.protect_by_attempt = 2),
-            ("protect_by == attempts", |c| {
-                c.brute_force.protect_by_attempt = 8
-            }),
-            ("tail 1", |c| c.brute_force.protected_tail_count = 1),
-            ("tail == attempts-1", |c| {
-                c.brute_force.protected_tail_count = 7
-            }),
+            ("race 32", |c| race(c).concurrency = 32),
+            ("race 2", |c| race(c).concurrency = 2),
+            ("load 1000", |c| load(c).requests = 1000),
+            ("load 1", |c| load(c).requests = 1),
+            ("load conc 32", |c| load(c).concurrency = 32),
+            ("load conc 1", |c| load(c).concurrency = 1),
+            ("error rate 0", |c| load(c).max_error_rate = 0.0),
+            ("error rate 1", |c| load(c).max_error_rate = 1.0),
+            ("p95 1", |c| load(c).max_p95_ms = 1),
+            ("interval 1", |c| bf(c).interval_ms = 1),
+            ("settle 1", |c| race(c).settle_ms = 1),
+            ("skew 1", |c| race(c).max_dispatch_skew_ms = 1),
+            ("protect_by 2", |c| bf(c).protect_by_attempt = 2),
+            ("protect_by == attempts", |c| bf(c).protect_by_attempt = 8),
+            ("tail 1", |c| bf(c).protected_tail_count = 1),
+            ("tail == attempts-1", |c| bf(c).protected_tail_count = 7),
             ("fixed waits u64 fit", |c| {
-                c.brute_force.attempts = 2;
-                c.brute_force.protect_by_attempt = 2;
-                c.brute_force.protected_tail_count = 1;
-                c.brute_force.interval_ms = u64::MAX - 1;
-                c.race.settle_ms = 1;
+                bf(c).attempts = 2;
+                bf(c).protect_by_attempt = 2;
+                bf(c).protected_tail_count = 1;
+                bf(c).interval_ms = u64::MAX - 1;
+                race(c).settle_ms = 1;
                 c.limits.suite_deadline_ms = u64::MAX;
             }),
             ("fixed waits == deadline", |c| {
                 c.limits.suite_deadline_ms = 950
             }),
             ("status 100 and 599", |c| {
-                c.load.response_match.status_in = vec![100, 599]
+                load(c).response_match.status_in = vec![100, 599]
             }),
             ("status_in alone", |c| {
-                c.brute_force.success_match.json_exists = None;
-                c.brute_force.success_match.json_equals = None;
+                bf(c).success_match.json_exists = None;
+                bf(c).success_match.json_equals = None;
             }),
             ("json_equals ok", |c| {
-                c.load.response_match.json_equals =
+                load(c).response_match.json_equals =
                     Some([("/a~1b/0".to_string(), serde_json::json!(null))].into());
             }),
             ("pointer escapes", |c| {
-                c.race.counter_pointer = "/a~0b~1c".into()
+                race(c).counter_pointer = "/a~0b~1c".into()
             }),
             ("base_url https with base path", |c| {
                 c.base_url = "https://example.com:8443/api".into()
@@ -894,21 +926,21 @@ mod tests {
                 c.base_url = "http://127.0.0.1:8080/".into()
             }),
             ("path with two params", |c| {
-                c.load.request.path = "/a/{x}/b/{y}".into();
-                c.load.request.path_params = map(&[("x", "1"), ("y", "2")]);
+                load(c).request.path = "/a/{x}/b/{y}".into();
+                load(c).request.path_params = map(&[("x", "1"), ("y", "2")]);
             }),
             ("same placeholder twice", |c| {
-                c.load.request.path = "/a/{x}/{x}".into();
-                c.load.request.path_params = map(&[("x", "1")]);
+                load(c).request.path = "/a/{x}/{x}".into();
+                load(c).request.path_params = map(&[("x", "1")]);
             }),
             ("different headers", |c| {
-                c.load.request.headers = map(&[("Authorization", "a"), ("X-Other", "b")])
+                load(c).request.headers = map(&[("Authorization", "a"), ("X-Other", "b")])
             }),
             ("user content-type", |c| {
-                c.load.request.headers = map(&[("content-TYPE", "application/vnd.x+json")])
+                load(c).request.headers = map(&[("content-TYPE", "application/vnd.x+json")])
             }),
             ("json object body", |c| {
-                c.load.request.json = Some(serde_json::json!({}))
+                load(c).request.json = Some(serde_json::json!({}))
             }),
         ];
         for (name, mutate) in cases {
@@ -922,24 +954,130 @@ mod tests {
     fn errors_name_no_values() {
         let sentinel = "SENTINEL-SECRET-VALUE";
         let mut cfg = base();
-        cfg.load.request.path = format!("/{sentinel}?a=1");
-        let msg = validate(&cfg).unwrap_err().to_string();
+        load(&mut cfg).request.path = format!("/{sentinel}?a=1");
+        let msg = validate(&cfg, Selection::All).unwrap_err().to_string();
         assert!(!msg.contains(sentinel), "{msg}");
 
         let mut cfg = base();
         cfg.base_url = format!("http://u:{sentinel}@example.com");
-        let msg = validate(&cfg).unwrap_err().to_string();
+        let msg = validate(&cfg, Selection::All).unwrap_err().to_string();
         assert!(!msg.contains(sentinel), "{msg}");
 
         let mut cfg = base();
-        cfg.load.request.path = format!("/{{{sentinel}");
-        let msg = validate(&cfg).unwrap_err().to_string();
+        load(&mut cfg).request.path = format!("/{{{sentinel}");
+        let msg = validate(&cfg, Selection::All).unwrap_err().to_string();
         assert!(!msg.contains(sentinel), "{msg}");
 
         // A forbidden header: the name may appear, the value must not.
         let mut cfg = base();
-        cfg.load.request.headers = map(&[("Host", sentinel)]);
-        let msg = validate(&cfg).unwrap_err().to_string();
+        load(&mut cfg).request.headers = map(&[("Host", sentinel)]);
+        let msg = validate(&cfg, Selection::All).unwrap_err().to_string();
         assert!(!msg.contains(sentinel), "{msg}");
+    }
+
+    // ---- partial config / Selection (only.S2) ----
+
+    const BF_ONLY: &str = include_str!("../../examples/brute-force-only.json");
+    const BF: Selection = Selection::Only(CheckName::BruteForce);
+
+    /// The full example as JSON with the given top-level keys removed.
+    fn without(keys: &[&str]) -> Config {
+        let mut v: serde_json::Value = serde_json::from_str(EXAMPLE).unwrap();
+        for k in keys {
+            v.as_object_mut().unwrap().remove(*k);
+        }
+        crate::config::parse(&v.to_string()).expect("partial config parses")
+    }
+
+    fn invalid_path(r: Result<RequestBudget, ConfigError>) -> String {
+        match r {
+            Err(ConfigError::Invalid { path, .. }) => path,
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_with_missing_section_names_the_section() {
+        for name in ["brute_force", "race", "load"] {
+            let cfg = without(&[name]);
+            let err = validate(&cfg, Selection::All).unwrap_err();
+            assert!(err.to_string().contains(name), "{err}");
+            assert_eq!(invalid_path(validate(&cfg, Selection::All)), name);
+        }
+    }
+
+    #[test]
+    fn only_with_selected_section_missing_is_invalid() {
+        let cfg = without(&["brute_force"]);
+        assert_eq!(invalid_path(validate(&cfg, BF)), "brute_force");
+    }
+
+    #[test]
+    fn only_ignores_semantics_of_unselected_sections() {
+        let mut cfg = base();
+        race(&mut cfg).concurrency = 1;
+        load(&mut cfg).requests = 0;
+        race(&mut cfg).settle_ms = 10_000_000; // would break the deadline under All
+        let budget = validate(&cfg, BF).expect("only brute_force is checked");
+        assert_eq!(
+            budget,
+            RequestBudget {
+                requests: 9,
+                fixed_wait_ms: 700
+            }
+        );
+        // The same config is rejected in All mode.
+        assert!(validate(&cfg, Selection::All).is_err());
+    }
+
+    #[test]
+    fn only_still_checks_selected_section_and_shared_parts() {
+        let mut cfg = base();
+        bf(&mut cfg).attempts = 101;
+        assert_eq!(invalid_path(validate(&cfg, BF)), "brute_force.attempts");
+        let mut cfg = base();
+        cfg.limits.request_timeout_ms = 0;
+        assert_eq!(
+            invalid_path(validate(&cfg, BF)),
+            "limits.request_timeout_ms"
+        );
+    }
+
+    #[test]
+    fn unknown_field_in_unselected_section_is_a_parse_error() {
+        let mut v: serde_json::Value = serde_json::from_str(EXAMPLE).unwrap();
+        v["race"]["typo_field"] = serde_json::json!(1);
+        let err = crate::config::parse(&v.to_string()).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+        // Wrong type in an unselected section is also rejected at parse.
+        let mut v: serde_json::Value = serde_json::from_str(EXAMPLE).unwrap();
+        v["load"]["requests"] = serde_json::json!("many");
+        assert!(crate::config::parse(&v.to_string()).is_err());
+    }
+
+    #[test]
+    fn only_bf_deadline_boundary_699_rejected_700_accepted() {
+        let mut cfg = base();
+        cfg.limits.suite_deadline_ms = 699;
+        assert_eq!(invalid_path(validate(&cfg, BF)), "limits.suite_deadline_ms");
+        cfg.limits.suite_deadline_ms = 700;
+        let budget = validate(&cfg, BF).expect("700 is enough");
+        assert_eq!(budget.fixed_wait_ms, 700);
+    }
+
+    #[test]
+    fn brute_force_only_example_is_valid() {
+        let cfg = crate::config::parse(BF_ONLY).expect("parses");
+        assert!(cfg.race.is_none() && cfg.load.is_none());
+        let budget = validate(&cfg, BF).expect("valid");
+        assert_eq!(
+            budget,
+            RequestBudget {
+                requests: 9,
+                fixed_wait_ms: 700
+            }
+        );
+        // As a full suite it must still be refused.
+        assert_eq!(invalid_path(validate(&cfg, Selection::All)), "race");
     }
 }

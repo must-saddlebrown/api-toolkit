@@ -9,8 +9,9 @@ use std::fmt;
 
 use serde_json::Value;
 
-use super::{Config, ConfigError, MatcherSpec, RequestSpec};
+use super::{BruteForce, Config, ConfigError, Load, MatcherSpec, Race, RequestSpec, Selection};
 use crate::http::request::{ResolvedRequest, build_url};
+use crate::report::CheckName;
 
 /// A string that must never be printed. `Debug` is redacted on purpose; there is no
 /// `Display`, no `Serialize` and no `Clone`. Use `expose` only where the value is
@@ -36,13 +37,24 @@ impl fmt::Debug for Secret {
 /// All requests of a config with env resolved and URLs built.
 #[derive(Debug)]
 pub struct ResolvedRequests {
-    pub baseline: ResolvedRequest,
-    pub probe: ResolvedRequest,
-    pub action: ResolvedRequest,
-    pub verify: ResolvedRequest,
-    pub load: ResolvedRequest,
+    pub brute_force: Option<BruteForceRequests>,
+    pub race: Option<RaceRequests>,
+    pub load: Option<ResolvedRequest>,
     /// Sorted, de-duplicated NAMES of every env var `resolve` looked up (never values).
     pub env_names: Vec<String>,
+}
+
+/// `None` in `ResolvedRequests` means the section was not selected.
+#[derive(Debug)]
+pub struct BruteForceRequests {
+    pub baseline: ResolvedRequest,
+    pub probe: ResolvedRequest,
+}
+
+#[derive(Debug)]
+pub struct RaceRequests {
+    pub action: ResolvedRequest,
+    pub verify: ResolvedRequest,
 }
 
 /// Whole-string placeholder shape, same rule as `parse_placeholder`.
@@ -89,25 +101,36 @@ fn reject_in_matcher(path: &str, m: &MatcherSpec) -> Result<(), ConfigError> {
 }
 
 /// Reject whole-string placeholders where `resolve` never substitutes: a silent literal
-/// would let a check pass or fail against the wrong expectation.
-fn reject_unresolved_placeholders(cfg: &Config) -> Result<(), ConfigError> {
+/// would let a check pass or fail against the wrong expectation. Selected sections only.
+fn reject_unresolved_placeholders(
+    cfg: &Config,
+    bf: Option<&BruteForce>,
+    race: Option<&Race>,
+    load: Option<&Load>,
+) -> Result<(), ConfigError> {
     reject_placeholder("base_url", &cfg.base_url)?;
-    let bf = &cfg.brute_force;
-    for (f, r) in [
-        ("brute_force.baseline_request", &bf.baseline_request),
-        ("brute_force.probe_request", &bf.probe_request),
-        ("race.action_request", &cfg.race.action_request),
-        ("race.verify_request", &cfg.race.verify_request),
-        ("load.request", &cfg.load.request),
-    ] {
-        reject_placeholder(&format!("{f}.path"), &r.path)?;
+    if let Some(bf) = bf {
+        for (f, r) in [
+            ("brute_force.baseline_request", &bf.baseline_request),
+            ("brute_force.probe_request", &bf.probe_request),
+        ] {
+            reject_placeholder(&format!("{f}.path"), &r.path)?;
+        }
+        reject_in_matcher("brute_force.success_match", &bf.success_match)?;
+        reject_in_matcher("brute_force.rejection_match", &bf.rejection_match)?;
+        reject_in_matcher("brute_force.protection_match", &bf.protection_match)?;
     }
-    reject_in_matcher("brute_force.success_match", &bf.success_match)?;
-    reject_in_matcher("brute_force.rejection_match", &bf.rejection_match)?;
-    reject_in_matcher("brute_force.protection_match", &bf.protection_match)?;
-    reject_in_matcher("race.verify_match", &cfg.race.verify_match)?;
-    reject_placeholder("race.counter_pointer", &cfg.race.counter_pointer)?;
-    reject_in_matcher("load.response_match", &cfg.load.response_match)
+    if let Some(race) = race {
+        reject_placeholder("race.action_request.path", &race.action_request.path)?;
+        reject_placeholder("race.verify_request.path", &race.verify_request.path)?;
+        reject_in_matcher("race.verify_match", &race.verify_match)?;
+        reject_placeholder("race.counter_pointer", &race.counter_pointer)?;
+    }
+    if let Some(load) = load {
+        reject_placeholder("load.request.path", &load.request.path)?;
+        reject_in_matcher("load.response_match", &load.response_match)?;
+    }
+    Ok(())
 }
 
 /// `Ok(Some(name))` for a whole-string `${ENV:name}`, `Ok(None)` for a plain literal,
@@ -240,13 +263,37 @@ impl<F: Fn(&str) -> Option<String>> Resolver<'_, F> {
     }
 }
 
-/// Resolve every request in `cfg`. `lookup` is injected (`std::env::var(..).ok()` in
-/// the CLI, a fake in tests). Run `validate` first.
+/// A selected section must exist (`validate` normally guarantees it; this never panics).
+fn selected<'a, T>(
+    section: &'a Option<T>,
+    name: &str,
+    sel: Selection,
+    check: CheckName,
+) -> Result<Option<&'a T>, ConfigError> {
+    if !sel.includes(check) {
+        return Ok(None);
+    }
+    match section {
+        Some(s) => Ok(Some(s)),
+        None => Err(ConfigError::Invalid {
+            path: name.to_string(),
+            rule: "is required for the selected check".to_string(),
+        }),
+    }
+}
+
+/// Resolve the requests of the selected sections. `lookup` is injected
+/// (`std::env::var(..).ok()` in the CLI, a fake in tests). Run `validate` first.
+/// Sections that are not selected are not resolved, so their env vars are not needed.
 pub fn resolve<F: Fn(&str) -> Option<String>>(
     cfg: &Config,
+    sel: Selection,
     lookup: &F,
 ) -> Result<ResolvedRequests, ConfigError> {
-    reject_unresolved_placeholders(cfg)?;
+    let bf = selected(&cfg.brute_force, "brute_force", sel, CheckName::BruteForce)?;
+    let race = selected(&cfg.race, "race", sel, CheckName::Race)?;
+    let load = selected(&cfg.load, "load", sel, CheckName::Load)?;
+    reject_unresolved_placeholders(cfg, bf, race, load)?;
     let mut r = Resolver {
         lookup,
         missing: BTreeSet::new(),
@@ -254,12 +301,19 @@ pub fn resolve<F: Fn(&str) -> Option<String>>(
         malformed: Vec::new(),
     };
     let base = cfg.base_url.as_str();
-    let bf = &cfg.brute_force;
-    let baseline = r.request("brute_force.baseline_request", base, &bf.baseline_request);
-    let probe = r.request("brute_force.probe_request", base, &bf.probe_request);
-    let action = r.request("race.action_request", base, &cfg.race.action_request);
-    let verify = r.request("race.verify_request", base, &cfg.race.verify_request);
-    let load = r.request("load.request", base, &cfg.load.request);
+    let bf_reqs = bf.map(|bf| {
+        (
+            r.request("brute_force.baseline_request", base, &bf.baseline_request),
+            r.request("brute_force.probe_request", base, &bf.probe_request),
+        )
+    });
+    let race_reqs = race.map(|race| {
+        (
+            r.request("race.action_request", base, &race.action_request),
+            r.request("race.verify_request", base, &race.verify_request),
+        )
+    });
+    let load_req = load.map(|load| r.request("load.request", base, &load.request));
 
     if !r.malformed.is_empty() {
         return Err(ConfigError::BadPlaceholder { paths: r.malformed });
@@ -269,12 +323,25 @@ pub fn resolve<F: Fn(&str) -> Option<String>>(
             names: r.missing.into_iter().collect(),
         });
     }
+    let brute_force = match bf_reqs {
+        Some((baseline, probe)) => Some(BruteForceRequests {
+            baseline: baseline?,
+            probe: probe?,
+        }),
+        None => None,
+    };
+    let race = match race_reqs {
+        Some((action, verify)) => Some(RaceRequests {
+            action: action?,
+            verify: verify?,
+        }),
+        None => None,
+    };
+    let load = load_req.transpose()?;
     Ok(ResolvedRequests {
-        baseline: baseline?,
-        probe: probe?,
-        action: action?,
-        verify: verify?,
-        load: load?,
+        brute_force,
+        race,
+        load,
         env_names: r.used.into_iter().collect(),
     })
 }
@@ -286,6 +353,18 @@ mod tests {
 
     const EXAMPLE: &str = include_str!("../../examples/core-checks.json");
     const SENTINEL: &str = "SENTINEL-SECRET-VALUE";
+
+    fn load(c: &mut Config) -> &mut Load {
+        c.load.as_mut().expect("load")
+    }
+
+    fn race(c: &mut Config) -> &mut Race {
+        c.race.as_mut().expect("race")
+    }
+
+    fn bf(c: &mut Config) -> &mut BruteForce {
+        c.brute_force.as_mut().expect("bf")
+    }
 
     fn base() -> Config {
         parse(EXAMPLE).expect("example must parse")
@@ -314,12 +393,20 @@ mod tests {
 
     #[test]
     fn example_resolves_and_debug_is_redacted() {
-        let reqs = resolve(&base(), &full_env).expect("resolves");
+        let reqs = resolve(&base(), Selection::All, &full_env).expect("resolves");
         assert_eq!(
-            reqs.action.url.expose(),
+            reqs.race.as_ref().unwrap().action.url.expose(),
             "http://127.0.0.1:8080/actions/act-1/apply"
         );
-        let body = reqs.baseline.body.as_ref().expect("body").expose();
+        let body = reqs
+            .brute_force
+            .as_ref()
+            .unwrap()
+            .baseline
+            .body
+            .as_ref()
+            .expect("body")
+            .expose();
         assert!(
             body.contains("valid-SENTINEL"),
             "body is really substituted"
@@ -342,7 +429,7 @@ mod tests {
     #[test]
     fn all_missing_envs_are_reported_together_without_values() {
         let partial = |n: &str| (n == "LOGIN_USER").then(|| SENTINEL.to_string());
-        let err = resolve(&base(), &partial).unwrap_err();
+        let err = resolve(&base(), Selection::All, &partial).unwrap_err();
         let ConfigError::MissingEnv { names } = &err else {
             panic!("expected MissingEnv, got {err:?}");
         };
@@ -369,7 +456,7 @@ mod tests {
                 full_env(n)
             }
         };
-        match resolve(&base(), &empty) {
+        match resolve(&base(), Selection::All, &empty) {
             Err(ConfigError::MissingEnv { names }) => assert_eq!(names, ["TEST_ACTION_ID"]),
             other => panic!("expected MissingEnv, got {other:?}"),
         }
@@ -378,35 +465,52 @@ mod tests {
     #[test]
     fn placeholder_only_counts_as_whole_string() {
         let mut cfg = base();
-        cfg.load.request.headers = map(&[
+        load(&mut cfg).request.headers = map(&[
             ("X-A", "prefix-${ENV:TEST_ACTION_ID}"),
             ("X-B", "${ENV:TEST_ACTION_ID}-s"),
         ]);
         // `UNSET` is not in the env: if it were interpolated, resolve would fail.
-        cfg.load.request.query = map(&[("q", "a${ENV:UNSET}")]);
-        let reqs = resolve(&cfg, &full_env).expect("literals do not need env");
+        load(&mut cfg).request.query = map(&[("q", "a${ENV:UNSET}")]);
+        let reqs = resolve(&cfg, Selection::All, &full_env).expect("literals do not need env");
         let h: BTreeMap<_, _> = reqs
             .load
+            .as_ref()
+            .unwrap()
             .headers
             .iter()
             .map(|(k, v)| (k.as_str(), v.expose()))
             .collect();
         assert_eq!(h["X-A"], "prefix-${ENV:TEST_ACTION_ID}");
         assert_eq!(h["X-B"], "${ENV:TEST_ACTION_ID}-s");
-        assert!(reqs.load.url.expose().ends_with("?q=a%24%7BENV%3AUNSET%7D"));
+        assert!(
+            reqs.load
+                .as_ref()
+                .unwrap()
+                .url
+                .expose()
+                .ends_with("?q=a%24%7BENV%3AUNSET%7D")
+        );
     }
 
     #[test]
     fn numbers_bools_null_and_nested_leaves() {
         let mut cfg = base();
-        cfg.load.request.json = Some(serde_json::json!({
+        load(&mut cfg).request.json = Some(serde_json::json!({
             "n": 5, "b": true, "z": null, "f": 1.5,
             "nested": {"list": ["${ENV:LOGIN_USER}", 7, "lit"]},
             "${ENV:LOGIN_USER}": "key-stays"
         }));
-        let reqs = resolve(&cfg, &full_env).expect("resolves");
-        let body: Value =
-            serde_json::from_str(reqs.load.body.as_ref().expect("body").expose()).expect("json");
+        let reqs = resolve(&cfg, Selection::All, &full_env).expect("resolves");
+        let body: Value = serde_json::from_str(
+            reqs.load
+                .as_ref()
+                .unwrap()
+                .body
+                .as_ref()
+                .expect("body")
+                .expose(),
+        )
+        .expect("json");
         assert_eq!(
             body,
             serde_json::json!({
@@ -420,8 +524,8 @@ mod tests {
     #[test]
     fn json_leaf_missing_env_is_reported() {
         let mut cfg = base();
-        cfg.load.request.json = Some(serde_json::json!({"a": ["${ENV:NOPE_1}"]}));
-        match resolve(&cfg, &full_env) {
+        load(&mut cfg).request.json = Some(serde_json::json!({"a": ["${ENV:NOPE_1}"]}));
+        match resolve(&cfg, Selection::All, &full_env) {
             Err(ConfigError::MissingEnv { names }) => assert_eq!(names, ["NOPE_1"]),
             other => panic!("expected MissingEnv, got {other:?}"),
         }
@@ -437,8 +541,8 @@ mod tests {
             "${ENV:a-b}",
         ] {
             let mut cfg = base();
-            cfg.load.request.headers = map(&[("X-Bad", bad)]);
-            let err = resolve(&cfg, &full_env).unwrap_err();
+            load(&mut cfg).request.headers = map(&[("X-Bad", bad)]);
+            let err = resolve(&cfg, Selection::All, &full_env).unwrap_err();
             let ConfigError::BadPlaceholder { paths } = &err else {
                 panic!("{bad}: expected BadPlaceholder, got {err:?}");
             };
@@ -447,18 +551,18 @@ mod tests {
         }
         // Valid names: underscore start, digits after.
         let mut cfg = base();
-        cfg.load.request.headers = map(&[("X-Ok", "${ENV:_A1}")]);
+        load(&mut cfg).request.headers = map(&[("X-Ok", "${ENV:_A1}")]);
         let env = |n: &str| (n == "_A1").then(|| "v".to_string());
         // other requests still need their env, so only check this one is not malformed
         assert!(!matches!(
-            resolve(&cfg, &env),
+            resolve(&cfg, Selection::All, &env),
             Err(ConfigError::BadPlaceholder { .. })
         ));
     }
 
     #[test]
     fn env_names_are_exactly_the_looked_up_names() {
-        let reqs = resolve(&base(), &full_env).expect("resolves");
+        let reqs = resolve(&base(), Selection::All, &full_env).expect("resolves");
         assert_eq!(
             reqs.env_names,
             [
@@ -476,23 +580,23 @@ mod tests {
         let ph = "${ENV:ZED}";
         let mut cases: Vec<(Config, &str)> = Vec::new();
         let mut c = base();
-        c.brute_force.success_match.json_equals =
+        bf(&mut c).success_match.json_equals =
             Some([("/a".to_string(), serde_json::json!({"x": [ph]}))].into());
         cases.push((c, "brute_force.success_match.json_equals./a.x[0]"));
         let mut c = base();
-        c.load.response_match.json_exists = Some(vec![ph.to_string()]);
+        load(&mut c).response_match.json_exists = Some(vec![ph.to_string()]);
         cases.push((c, "load.response_match.json_exists[0]"));
         let mut c = base();
-        c.race.counter_pointer = ph.to_string();
+        race(&mut c).counter_pointer = ph.to_string();
         cases.push((c, "race.counter_pointer"));
         let mut c = base();
         c.base_url = ph.to_string();
         cases.push((c, "base_url"));
         let mut c = base();
-        c.load.request.path = ph.to_string();
+        load(&mut c).request.path = ph.to_string();
         cases.push((c, "load.request.path"));
         for (cfg, want) in cases {
-            let err = resolve(&cfg, &full_env).unwrap_err();
+            let err = resolve(&cfg, Selection::All, &full_env).unwrap_err();
             let ConfigError::Invalid { path, .. } = &err else {
                 panic!("{want}: expected Invalid, got {err:?}");
             };
@@ -504,9 +608,11 @@ mod tests {
     #[test]
     fn raw_config_stays_unresolved() {
         let cfg = base();
-        let _ = resolve(&cfg, &full_env).expect("resolves");
+        let _ = resolve(&cfg, Selection::All, &full_env).expect("resolves");
         assert_eq!(
             cfg.race
+                .as_ref()
+                .expect("race")
                 .action_request
                 .path_params
                 .as_ref()
@@ -515,6 +621,8 @@ mod tests {
         );
         let json = cfg
             .brute_force
+            .as_ref()
+            .expect("bf")
             .baseline_request
             .json
             .as_ref()
@@ -528,9 +636,9 @@ mod tests {
             "TEST_ACTION_ID" => Some("a/b c?d#e%2F..".to_string()),
             other => full_env(other),
         };
-        let reqs = resolve(&base(), &env).expect("resolves");
+        let reqs = resolve(&base(), Selection::All, &env).expect("resolves");
         assert_eq!(
-            reqs.action.url.expose(),
+            reqs.race.as_ref().unwrap().action.url.expose(),
             "http://127.0.0.1:8080/actions/a%2Fb%20c%3Fd%23e%252F../apply"
         );
     }
@@ -541,7 +649,7 @@ mod tests {
             let tainted = format!("{SENTINEL}{bad}");
             // via env
             let mut cfg = base();
-            cfg.load.request.headers = map(&[("X-Env", "${ENV:TAINTED}")]);
+            load(&mut cfg).request.headers = map(&[("X-Env", "${ENV:TAINTED}")]);
             let t = tainted.clone();
             let env = move |n: &str| {
                 if n == "TAINTED" {
@@ -552,12 +660,12 @@ mod tests {
             };
             // via literal
             let mut lit = base();
-            lit.load.request.headers = map(&[("X-Lit", &tainted)]);
+            load(&mut lit).request.headers = map(&[("X-Lit", &tainted)]);
             for (cfg, env_fn, name) in [
                 (&cfg, &env as &dyn Fn(&str) -> Option<String>, "X-Env"),
                 (&lit, &full_env, "X-Lit"),
             ] {
-                let err = resolve(cfg, &env_fn).unwrap_err();
+                let err = resolve(cfg, Selection::All, &env_fn).unwrap_err();
                 let ConfigError::Invalid { path, .. } = &err else {
                     panic!("expected Invalid, got {err:?}");
                 };
@@ -568,15 +676,15 @@ mod tests {
         }
         // Tab and non-ASCII are not part of the rule.
         let mut ok = base();
-        ok.load.request.headers = map(&[("X-Ok", "a\tb é")]);
-        resolve(&ok, &full_env).expect("tab and non-ASCII accepted");
+        load(&mut ok).request.headers = map(&[("X-Ok", "a\tb é")]);
+        resolve(&ok, Selection::All, &full_env).expect("tab and non-ASCII accepted");
     }
 
     #[test]
     fn empty_literal_path_param_is_rejected() {
         let mut cfg = base();
-        cfg.race.action_request.path_params = map(&[("id", "")]);
-        let err = resolve(&cfg, &full_env).unwrap_err();
+        race(&mut cfg).action_request.path_params = map(&[("id", "")]);
+        let err = resolve(&cfg, Selection::All, &full_env).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }), "{err:?}");
     }
 
@@ -586,7 +694,56 @@ mod tests {
             "TEST_ACTION_ID" => Some("..".to_string()),
             other => full_env(other),
         };
-        let err = resolve(&base(), &env).unwrap_err();
+        let err = resolve(&base(), Selection::All, &env).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }), "{err:?}");
+    }
+
+    // ---- partial config / Selection (only.S2) ----
+
+    const BF: Selection = Selection::Only(CheckName::BruteForce);
+
+    #[test]
+    fn only_bf_does_not_need_test_env_and_lists_only_login_names() {
+        let login_only = |n: &str| match n {
+            "LOGIN_USER" | "LOGIN_VALID_PASSWORD" | "LOGIN_INVALID_PASSWORD" => {
+                Some(format!("v-{SENTINEL}"))
+            }
+            _ => None,
+        };
+        let reqs = resolve(&base(), BF, &login_only).expect("TEST_* not needed");
+        assert!(reqs.brute_force.is_some());
+        assert!(reqs.race.is_none() && reqs.load.is_none());
+        assert_eq!(
+            reqs.env_names,
+            [
+                "LOGIN_INVALID_PASSWORD",
+                "LOGIN_USER",
+                "LOGIN_VALID_PASSWORD"
+            ]
+        );
+        // The same lookup fails in All mode.
+        assert!(matches!(
+            resolve(&base(), Selection::All, &login_only),
+            Err(ConfigError::MissingEnv { .. })
+        ));
+    }
+
+    #[test]
+    fn only_bf_ignores_bad_placeholders_in_unselected_sections() {
+        let mut cfg = base();
+        load(&mut cfg).request.path = "${ENV:ZED}".to_string();
+        race(&mut cfg).counter_pointer = "${ENV:ZED}".to_string();
+        resolve(&cfg, BF, &full_env).expect("unselected sections are not resolved");
+        assert!(resolve(&cfg, Selection::All, &full_env).is_err());
+    }
+
+    #[test]
+    fn resolve_rejects_missing_selected_section_without_panic() {
+        let mut cfg = base();
+        cfg.brute_force = None;
+        match resolve(&cfg, BF, &full_env) {
+            Err(ConfigError::Invalid { path, .. }) => assert_eq!(path, "brute_force"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 }

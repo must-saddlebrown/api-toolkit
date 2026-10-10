@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use api_toolkit::checks::brute_force::{console_line, run};
-use api_toolkit::config::{self, resolve, validate};
+use api_toolkit::config::{self, Selection, resolve, validate};
 use api_toolkit::http::Transport;
 use api_toolkit::report::*;
 use serde_json::{Value, json};
@@ -76,16 +76,17 @@ fn lookup(name: &str) -> Option<String> {
 async fn run_cfg(cfg: &Value) -> CheckResult {
     let text = cfg.to_string();
     let parsed = config::parse(&text).unwrap();
-    validate(&parsed).unwrap();
-    let resolved = resolve(&parsed, &lookup).unwrap();
+    validate(&parsed, Selection::All).unwrap();
+    let resolved = resolve(&parsed, Selection::All, &lookup).unwrap();
+    let bf_reqs = resolved.brute_force.as_ref().unwrap();
     assert!(!format!("{resolved:?}").contains(SENTINEL));
     let transport = Transport::new(&parsed.limits).unwrap();
     let (_tx, rx) = watch::channel(None);
     run(
         &transport,
-        &parsed.brute_force,
-        &resolved.baseline,
-        &resolved.probe,
+        parsed.brute_force.as_ref().unwrap(),
+        &bf_reqs.baseline,
+        &bf_reqs.probe,
         rx,
     )
     .await

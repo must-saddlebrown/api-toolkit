@@ -12,10 +12,12 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
+use crate::report::CheckName;
+
 mod resolve;
 mod validate;
 
-pub use resolve::{ResolvedRequests, Secret, resolve};
+pub use resolve::{BruteForceRequests, RaceRequests, ResolvedRequests, Secret, resolve};
 pub use validate::{RequestBudget, validate};
 
 /// The only config version this build understands.
@@ -55,9 +57,27 @@ pub struct Config {
     pub base_url: String,
     #[serde(default)]
     pub limits: Limits,
-    pub brute_force: BruteForce,
-    pub race: Race,
-    pub load: Load,
+    // Each check section is optional at parse time; `validate` decides which are required.
+    pub brute_force: Option<BruteForce>,
+    pub race: Option<Race>,
+    pub load: Option<Load>,
+}
+
+/// Which check sections a run uses. `All` requires all three; `Only` uses one and
+/// leaves the other sections shape-checked by `parse` but otherwise ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    All,
+    Only(CheckName),
+}
+
+impl Selection {
+    pub fn includes(self, check: CheckName) -> bool {
+        match self {
+            Selection::All => true,
+            Selection::Only(only) => only == check,
+        }
+    }
 }
 
 /// Execution limits (PLAN §8). Every field has a default, and the whole
@@ -267,11 +287,19 @@ mod tests {
         let cfg = parse(EXAMPLE).expect("example must parse");
         assert_eq!(cfg.config_version, 1);
         assert_eq!(cfg.base_url, "http://127.0.0.1:8080");
-        assert_eq!(cfg.brute_force.attempts, 8);
-        assert_eq!(cfg.race.expected_action_statuses, vec![200, 409]);
-        assert_eq!(cfg.load.requests, 100);
+        assert_eq!(cfg.brute_force.as_ref().unwrap().attempts, 8);
+        assert_eq!(
+            cfg.race.as_ref().unwrap().expected_action_statuses,
+            vec![200, 409]
+        );
+        assert_eq!(cfg.load.as_ref().unwrap().requests, 100);
         // Placeholders are kept raw until S4.
-        let json = cfg.brute_force.baseline_request.json.expect("json body");
+        let json = cfg
+            .brute_force
+            .unwrap()
+            .baseline_request
+            .json
+            .expect("json body");
         assert_eq!(json["username"], "${ENV:LOGIN_USER}");
         // Limits given in the example are used; connect timeout falls back to default.
         assert_eq!(cfg.limits.request_timeout_ms, 5000);
@@ -364,7 +392,7 @@ mod tests {
             "\"method\": \"GET\", \"path\": \"/critical\", \"json\": null,",
         );
         let cfg = parse(&text).expect("null parses");
-        assert_eq!(cfg.load.request.json, Some(Value::Null));
+        assert_eq!(cfg.load.unwrap().request.json, Some(Value::Null));
     }
 
     #[test]
