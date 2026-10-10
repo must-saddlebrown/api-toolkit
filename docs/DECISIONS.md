@@ -43,3 +43,14 @@ Detail: `.claude/work/P0-plan.md`. Terdampak: PLAN §5, §8, §9. Reviewer PASS.
 - `base_url` harus literal `scheme://host` (http/https), tanpa userinfo/query/fragment/spasi/karakter kontrol; base path boleh. `path` request diawali satu `/`, tanpa `//` di awal, `://`, `?`, `#`, `\`, karakter kontrol. Nama placeholder harus sama persis dengan key `path_params` dua arah.
 - `validate` berhenti di masalah pertama.
 - Diteruskan ke S4: URL dibangun dari bagian yang sudah divalidasi dengan encoding segmen path; S4 wajib punya test untuk path/base_url aneh. Saran reviewer yang belum diambil: `race.concurrency = 1` masih diterima; method huruf kecil dan header `Host`/`Content-Length` masih diterima.
+
+## 2026-10-10 — Resolusi env dan pembangunan URL (P0 S4)
+
+Detail: `.claude/work/P0-plan.md`. Terdampak: PLAN §8, §9. Reviewer PASS.
+
+- Env var yang ada tetapi kosong dianggap hilang (konservatif: kredensial/id kosong hampir pasti salah konfigurasi).
+- Placeholder = string utuh berawalan `${ENV:` dan berakhiran `}`; nama `[A-Za-z_][A-Za-z0-9_]*`. Bentuk lain yang mengandung `${ENV:` (`${ENV:}`, `${ENV:A B}`, `${ENV:A}${ENV:B}`) = `BadPlaceholder` (path field saja). `prefix-${ENV:X}`, `${env:x}` tetap literal sesuai PLAN §9 (tidak ada interpolasi); nilai env yang berisi `${ENV:Y}` tidak di-resolve ulang.
+- `Secret`: manual `Debug` teredaksi, tanpa `Clone`/`Display`/`Serialize`; satu-satunya akses lewat `expose()`. `ResolvedRequest` menyimpan URL, nilai header, dan body sebagai `Secret`.
+- Nilai header hasil resolve yang memuat CR, LF, atau NUL ditolak di `resolve` (nama field saja). Aturan persis itu, tidak lebih lebar.
+- URL: `percent-encoding 2.3` jadi dependency langsung (sudah ada di tree via reqwest); parsing lewat `reqwest::Url`. Semua karakter selain `A-Za-z0-9-._~` di-encode. Segmen `.`/`..` ditolak (`DotSegment`); `%` di nilai di-encode (`%2e%2e` jadi `%252e%252e`). Hasil dicek ulang: scheme, host, port, jumlah segmen sama dengan base. Nilai path param kosong dan key query kosong ditolak.
+- `resolve` tidak memanggil `validate`; S9 wajib memanggil `validate` dulu. Saran yang belum diambil: `BadPlaceholder` dan `MissingEnv` dilaporkan terpisah (dua run); `validate` bisa memberi peringatan untuk placeholder yang tampak typo (`${env:x}`).

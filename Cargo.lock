@@ -65,6 +65,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",

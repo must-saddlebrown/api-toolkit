@@ -12,8 +12,10 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::Value;
 
+mod resolve;
 mod validate;
 
+pub use resolve::{ResolvedRequests, Secret, resolve};
 pub use validate::{RequestBudget, validate};
 
 /// The only config version this build understands.
@@ -38,6 +40,12 @@ pub enum ConfigError {
     /// (only numbers and field/header names), because values may be secret placeholders.
     #[error("invalid config at `{path}`: {rule}")]
     Invalid { path: String, rule: String },
+    /// `${ENV:NAME}` references whose env var is unset or empty (names only, all at once).
+    #[error("missing or empty environment variables: {}", names.join(", "))]
+    MissingEnv { names: Vec<String> },
+    /// Strings that start with `${ENV:` but are not a valid whole-string placeholder.
+    #[error("malformed ${{ENV:NAME}} placeholder at: {}", paths.join(", "))]
+    BadPlaceholder { paths: Vec<String> },
 }
 
 #[derive(Debug, Deserialize)]
