@@ -12,8 +12,8 @@ use crate::config::{BruteForce, MatcherSpec};
 use crate::http::request::ResolvedRequest;
 use crate::http::{Transport, TransportError, TransportResponse, send};
 use crate::report::{
-    AttemptEvidence, BruteForceEvidence, CheckName, CheckResult, Completion, Outcome, ReasonCode,
-    TransportErrorCode, Verdict,
+    AttemptEvidence, BruteForceEvidence, CheckName, CheckResult, Completion, Evidence, Outcome,
+    ReasonCode, TransportErrorCode, Verdict,
 };
 
 /// Result of classifying one attempt.
@@ -356,7 +356,7 @@ where
         verdict: evaluation.verdict,
         reasons: evaluation.reasons,
         completion: evaluation.completion,
-        evidence: Some(BruteForceEvidence {
+        evidence: Some(Evidence::BruteForce(BruteForceEvidence {
             attempts_planned: cfg.attempts,
             attempts_dispatched: dispatched,
             interval_ms: cfg.interval_ms,
@@ -366,7 +366,7 @@ where
             protected_tail_observed: evaluation.protected_tail_observed,
             baseline: baseline.map(|(_, e)| e),
             attempts: probes.into_iter().map(|(_, e)| e).collect(),
-        }),
+        })),
     }
 }
 
@@ -404,7 +404,7 @@ pub fn console_line(result: &CheckResult) -> String {
         result.verdict.as_str().to_uppercase()
     );
     match &result.evidence {
-        Some(e) => {
+        Some(Evidence::BruteForce(e)) => {
             let first = match e.first_protected_attempt {
                 Some(n) => n.to_string(),
                 None => "none".to_string(),
@@ -416,7 +416,8 @@ pub fn console_line(result: &CheckResult) -> String {
                 e.protected_tail_observed, e.protected_tail_count, e.attempts_planned
             )
         }
-        None => format!("{head} reasons={reasons}"),
+        // Race evidence has its own console line (race::console_line, P2.S4).
+        Some(Evidence::Race(_)) | None => format!("{head} reasons={reasons}"),
     }
 }
 
@@ -969,9 +970,10 @@ mod tests {
     }
 
     fn ev(r: &CheckResult) -> &BruteForceEvidence {
-        r.evidence
-            .as_ref()
-            .expect("brute force always has evidence")
+        match r.evidence.as_ref() {
+            Some(Evidence::BruteForce(e)) => e,
+            _ => panic!("brute force always has brute force evidence"),
+        }
     }
 
     /// Invariants that must hold for every result: baseline is attempt 0, probes are

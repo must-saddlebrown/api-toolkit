@@ -128,7 +128,10 @@ fn assert_verdict(r: &CheckResult, v: Verdict, reasons: &[ReasonCode]) {
 }
 
 fn evidence(r: &CheckResult) -> &BruteForceEvidence {
-    r.evidence.as_ref().unwrap()
+    match r.evidence.as_ref() {
+        Some(Evidence::BruteForce(e)) => e,
+        _ => panic!("expected brute force evidence"),
+    }
 }
 
 /// M1, AC1, AC7, AC9, AC12: healthy -> PASS, exactly 1 + 8 requests on the wire.

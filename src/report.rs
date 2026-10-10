@@ -318,8 +318,53 @@ pub struct BruteForceEvidence {
     pub attempts: Vec<AttemptEvidence>,
 }
 
+/// Verifier read (before/after). Numbers, enums and nulls only: no body or header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifyEvidence {
+    pub status: Option<u16>,
+    pub error: Option<TransportErrorCode>,
+    pub offset_ms: u64,
+    pub elapsed_ms: u64,
+}
+
+/// One race action. `action` is 1..=concurrency. Numbers, enums and bools only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActionEvidence {
+    pub action: u32,
+    pub status: Option<u16>,
+    pub error: Option<TransportErrorCode>,
+    pub allowed: bool,
+    pub offset_ms: u64,
+    pub elapsed_ms: u64,
+}
+
+/// Evidence of the race check (PLAN §10), including the configured thresholds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RaceEvidence {
+    pub concurrency: u32,
+    pub expected_action_statuses: Vec<u16>,
+    pub max_dispatch_skew_ms: u64,
+    pub settle_ms: u64,
+    pub actions_dispatched: u32,
+    pub dispatch_skew_ms: Option<u64>,
+    pub counter_before: Option<u64>,
+    pub counter_after: Option<u64>,
+    pub delta: Option<u64>,
+    pub verify_before: Option<VerifyEvidence>,
+    pub verify_after: Option<VerifyEvidence>,
+    pub actions: Vec<ActionEvidence>,
+}
+
+/// Per-check evidence. `untagged`: no variant name in the JSON, so brute_force stays as before.
+// ponytail: load evidence (P3) is a third variant here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum Evidence {
+    BruteForce(BruteForceEvidence),
+    Race(RaceEvidence),
+}
+
 /// Result of one check inside the report.
-// ponytail: P2 turns `evidence` into an `#[serde(untagged)]` enum (race/load); JSON stays the same.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CheckResult {
     pub check: CheckName,
@@ -327,7 +372,7 @@ pub struct CheckResult {
     pub reasons: Vec<ReasonCode>,
     pub completion: Completion,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<BruteForceEvidence>,
+    pub evidence: Option<Evidence>,
 }
 
 /// Report v1. Field order here is the field order in the JSON file.
@@ -795,7 +840,7 @@ mod tests {
             verdict: Verdict::Error,
             reasons: vec![ReasonCode::ProbeUnclassifiable, ReasonCode::TransportError],
             completion: Completion::Complete,
-            evidence: Some(BruteForceEvidence {
+            evidence: Some(Evidence::BruteForce(BruteForceEvidence {
                 attempts_planned: 8,
                 attempts_dispatched: 3,
                 interval_ms: 100,
@@ -815,7 +860,7 @@ mod tests {
                         5000,
                     ),
                 ],
-            }),
+            })),
         }
     }
 
@@ -869,6 +914,113 @@ mod tests {
             serde_json::to_string_pretty(&evidence_check()).unwrap(),
             golden
         );
+    }
+
+    #[test]
+    fn race_evidence_json_matches_golden() {
+        let check = CheckResult {
+            check: CheckName::Race,
+            verdict: Verdict::Inconclusive,
+            reasons: vec![
+                ReasonCode::ActionOutcomeAmbiguous,
+                ReasonCode::TransportError,
+            ],
+            completion: Completion::Incomplete,
+            evidence: Some(Evidence::Race(RaceEvidence {
+                concurrency: 2,
+                expected_action_statuses: vec![200, 409],
+                max_dispatch_skew_ms: 100,
+                settle_ms: 250,
+                actions_dispatched: 2,
+                dispatch_skew_ms: Some(1),
+                counter_before: Some(0),
+                counter_after: None,
+                delta: None,
+                verify_before: Some(VerifyEvidence {
+                    status: Some(200),
+                    error: None,
+                    offset_ms: 0,
+                    elapsed_ms: 4,
+                }),
+                verify_after: None,
+                actions: vec![
+                    ActionEvidence {
+                        action: 1,
+                        status: Some(409),
+                        error: None,
+                        allowed: true,
+                        offset_ms: 4,
+                        elapsed_ms: 9,
+                    },
+                    ActionEvidence {
+                        action: 2,
+                        status: None,
+                        error: Some(TransportErrorCode::Timeout),
+                        allowed: false,
+                        offset_ms: 4,
+                        elapsed_ms: 5000,
+                    },
+                ],
+            })),
+        };
+        let golden = r#"{
+  "check": "race",
+  "verdict": "inconclusive",
+  "reasons": [
+    "action_outcome_ambiguous",
+    "transport_error"
+  ],
+  "completion": "incomplete",
+  "evidence": {
+    "concurrency": 2,
+    "expected_action_statuses": [
+      200,
+      409
+    ],
+    "max_dispatch_skew_ms": 100,
+    "settle_ms": 250,
+    "actions_dispatched": 2,
+    "dispatch_skew_ms": 1,
+    "counter_before": 0,
+    "counter_after": null,
+    "delta": null,
+    "verify_before": {
+      "status": 200,
+      "error": null,
+      "offset_ms": 0,
+      "elapsed_ms": 4
+    },
+    "verify_after": null,
+    "actions": [
+      {
+        "action": 1,
+        "status": 409,
+        "error": null,
+        "allowed": true,
+        "offset_ms": 4,
+        "elapsed_ms": 9
+      },
+      {
+        "action": 2,
+        "status": null,
+        "error": "timeout",
+        "allowed": false,
+        "offset_ms": 4,
+        "elapsed_ms": 5000
+      }
+    ]
+  }
+}"#;
+        assert_eq!(serde_json::to_string_pretty(&check).unwrap(), golden);
+        // evidence never changes the exit code
+        let mut with = sample_report();
+        let mut without = sample_report();
+        with.checks[1] = check.clone();
+        without.checks[1] = CheckResult {
+            evidence: None,
+            ..check
+        };
+        assert_eq!(exit_code(&with), exit_code(&without));
     }
 
     #[test]
