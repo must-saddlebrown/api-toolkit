@@ -2,6 +2,7 @@
 
 Alat pengembangan, bukan fitur produk dan bukan mock server produk. Varian healthy plus dua varian broken login (P1). Varian broken race/load ditambahkan di P2-P3.
 Kode: `tests/support/fixture.rs`, dijalankan lewat `examples/fixture.rs`.
+Spesifikasi OpenAPI semua rute: [fixture.openapi.yaml](fixture.openapi.yaml) (bisa dibuka di Swagger Editor atau `npx @redocly/cli preview-docs docs/fixture.openapi.yaml`).
 
 ## Start
 

@@ -1,0 +1,340 @@
+openapi: 3.1.0
+info:
+  title: api-toolkit fixture
+  version: 0.1.0
+  description: |
+    Server uji lokal untuk api-toolkit. Alat pengembangan, bukan produk. Kode: `tests/support/fixture.rs`.
+
+    Cara menjalankan: `cargo run --example fixture` (port 8080; `-- --port <n>` untuk port lain).
+    Hanya bind ke 127.0.0.1. Server tidak mencatat request dan tidak pernah memantulkan data request di respons.
+    Method yang salah pada rute yang ada (mis. `GET /login`) dijawab `405` tanpa body oleh axum; rute yang tidak ada `404 {"error":"not_found"}`. Keduanya tidak ditulis ulang per path di bawah.
+
+    **Semua state ada di memori dan global untuk satu proses fixture** (bukan per pengguna, bukan per sesi):
+    hitungan login gagal, counter tiap action id, counter load, dan counter request login.
+    Satu-satunya cara mengosongkannya selain restart adalah `POST /__admin/reset`.
+
+    Tiga kelompok endpoint:
+
+    | Kelompok | Endpoint | Dipakai check |
+    | --- | --- | --- |
+    | Login | `/login` (sehat), `/broken/login/*` (sengaja rusak) | brute force |
+    | Aksi write-once | `/actions/{id}/apply`, `/actions/{id}` | race (P2) |
+    | Beban | `/critical` | load (P3) |
+    | Alat dev | `/__admin/reset`, `/__admin/stats` | dipakai test dan pengguna, tidak oleh check |
+
+    Nilai tetap yang dipakai fixture (konstanta dev publik, bukan secret):
+    username `demo`, password benar `demo-pass`, password salah `wrong-pass`,
+    header `Authorization: Bearer fixture-token`, token login `fixture-access-token`.
+servers:
+  - url: http://127.0.0.1:8080
+    description: Default. Ganti port bila fixture dijalankan dengan `--port`.
+tags:
+  - name: login
+    description: Check brute-force protection.
+  - name: broken-login
+    description: Varian login yang sengaja rusak, untuk membuktikan check bisa mengatakan FAIL.
+  - name: action
+    description: Aksi write-once, untuk check race.
+  - name: load
+    description: Endpoint beban, untuk check load.
+  - name: admin
+    description: Alat dev. Tanpa autentikasi.
+paths:
+  /login:
+    post:
+      tags: [login]
+      operationId: login
+      summary: Login sehat dengan proteksi brute force
+      description: |
+        Hitungan **login gagal** disimpan global (bukan per username).
+
+        | Kondisi | Respons |
+        | --- | --- |
+        | Kredensial salah, kegagalan ke-1 sampai ke-5 | `401 invalid_credentials` |
+        | Kredensial salah, kegagalan ke-6 dan seterusnya | `429 too_many_attempts` |
+        | Kredensial benar, hitungan gagal < 6 | `200` dengan `access_token` |
+        | Kredensial benar, hitungan gagal >= 6 | `429 too_many_attempts` |
+
+        Hal yang perlu dipahami:
+
+        - **Login benar tidak mereset hitungan.** Hanya `POST /__admin/reset` (atau restart) yang mereset.
+        - Akibatnya, menjalankan check brute force dua kali tanpa reset membuat baseline kedua menerima 429,
+          dan check melaporkan `inconclusive` / `account_already_locked`. Ini disengaja (PLAN §5).
+        - Dengan konfigurasi contoh (`protect_by_attempt: 6`), probe 1 sampai 5 menerima 401 dan probe 6 sampai 8 menerima 429.
+        - "Kredensial benar" berarti username `demo` **dan** password `demo-pass`. Selain itu dihitung salah.
+        - Body yang bukan JSON, atau JSON tanpa string `username`/`password`, dijawab `400 bad_request`.
+          Request seperti ini tetap dihitung di `login_requests` tetapi **tidak** menambah hitungan gagal.
+        - `Content-Type` tidak diperiksa; body dibaca sebagai bytes lalu di-parse. Field ekstra di JSON diabaikan;
+          `username` atau `password` yang bukan string menghasilkan `400`.
+      requestBody:
+        $ref: '#/components/requestBodies/Login'
+      responses:
+        '200':
+          $ref: '#/components/responses/Token'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/InvalidCredentials'
+        '429':
+          $ref: '#/components/responses/TooManyAttempts'
+  /broken/login/unprotected:
+    post:
+      tags: [broken-login]
+      operationId: loginUnprotected
+      summary: Login rusak, tanpa proteksi
+      description: |
+        Tanpa state dan tanpa batas percobaan: kredensial benar `200`, selain itu selalu `401`, **tidak pernah 429**.
+        Check brute force harus menghasilkan `fail` / `protection_policy_not_met`.
+      requestBody:
+        $ref: '#/components/requestBodies/Login'
+      responses:
+        '200':
+          $ref: '#/components/responses/Token'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/InvalidCredentials'
+  /broken/login/accepts-invalid:
+    post:
+      tags: [broken-login]
+      operationId: loginAcceptsInvalid
+      summary: Login rusak, menerima password salah
+      description: |
+        Username `demo` dengan **password apa pun** dijawab `200` dengan token. Username lain `401`.
+        Check brute force harus menghasilkan `fail` / `invalid_credentials_accepted`.
+      requestBody:
+        $ref: '#/components/requestBodies/Login'
+      responses:
+        '200':
+          $ref: '#/components/responses/Token'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/InvalidCredentials'
+  /actions/{id}/apply:
+    post:
+      tags: [action]
+      operationId: applyAction
+      summary: Terapkan aksi write-once
+      description: |
+        Aksi yang hanya boleh berhasil **sekali** per `id`.
+
+        - Apply pertama untuk `id` itu: `200 {"applied": true}` dan `execution_count` menjadi 1.
+        - Apply berikutnya: `409 already_applied`, counter **tidak** bertambah.
+        - Keputusan atomik: lock dipegang selama cek dan increment, jadi permintaan paralel pun
+          menghasilkan tepat satu 200 dan sisanya 409. Ini varian **sehat**. (Varian rusak yang bisa dobel
+          ditambahkan di P2.)
+        - Tanpa header `Authorization` yang benar: `401`, dan state tidak berubah.
+        - Body request diabaikan.
+        - `id` apa pun dibuat otomatis (lihat `GET /actions/{id}`).
+      security:
+        - fixtureBearer: []
+      parameters:
+        - $ref: '#/components/parameters/ActionId'
+      responses:
+        '200':
+          description: Apply pertama untuk id ini.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [applied]
+                properties:
+                  applied: {type: boolean, const: true}
+              example: {applied: true}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Sudah pernah diterapkan. Counter tidak berubah.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: {error: already_applied}
+  /actions/{id}:
+    get:
+      tags: [action]
+      operationId: readAction
+      summary: Baca counter eksekusi (verifier)
+      description: |
+        Dipakai check race untuk membaca counter sebelum dan sesudah beban paralel.
+
+        - Awal selalu `execution_count: 0`.
+        - **Efek samping:** membaca `id` yang belum ada membuatnya dengan count 0
+          (jadi `GET` pertama tidak mengubah hasil `apply` berikutnya, tetapi entri tercipta).
+        - Tanpa header `Authorization` yang benar: `401`.
+      security:
+        - fixtureBearer: []
+      parameters:
+        - $ref: '#/components/parameters/ActionId'
+      responses:
+        '200':
+          description: Counter saat ini.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, execution_count]
+                properties:
+                  id: {type: string}
+                  execution_count:
+                    type: integer
+                    minimum: 0
+                    description: 0 sebelum apply sukses, 1 sesudahnya (tidak pernah lebih pada varian sehat).
+              example: {id: act-1, execution_count: 1}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /critical:
+    get:
+      tags: [load]
+      operationId: critical
+      summary: Endpoint beban
+      description: |
+        Selalu cepat dan selalu `200 {"ok": true}` bila `Authorization` benar; setiap request terotorisasi
+        menaikkan `load_requests` (terbaca di `/__admin/stats`). Tanpa otorisasi: `401`, tidak dihitung.
+        Varian lambat atau error ditambahkan di P3.
+      security:
+        - fixtureBearer: []
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: {type: boolean, const: true}
+              example: {ok: true}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /__admin/reset:
+    post:
+      tags: [admin]
+      operationId: adminReset
+      summary: Reset seluruh state
+      description: |
+        Mengosongkan hitungan login gagal, semua counter action, `load_requests`, dan `login_requests`.
+        Alat pengembangan: `api-toolkit` tidak pernah memanggilnya. Jalankan sebelum mengulang check
+        (baseline login butuh hitungan gagal 0; race butuh counter awal 0).
+      responses:
+        '200':
+          description: State kosong.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [reset]
+                properties:
+                  reset: {type: boolean, const: true}
+              example: {reset: true}
+  /__admin/stats:
+    get:
+      tags: [admin]
+      operationId: adminStats
+      summary: Hitungan request, untuk membuktikan jumlah request tool
+      description: |
+        Test memakainya untuk membuktikan check mengirim tepat sekian request tanpa retry
+        (brute force sehat: 9 = 1 baseline + 8 probe).
+
+        - `login_requests` menghitung setiap `POST` yang sampai ke handler salah satu dari tiga rute login,
+          termasuk body rusak (400). Method selain POST (405) dan body di atas batas default axum (2 MB)
+          ditolak sebelum handler dan **tidak** dihitung.
+        - `load_requests` menghitung `GET /critical` yang terotorisasi.
+        - Request ke stats sendiri tidak dihitung.
+      responses:
+        '200':
+          description: Counter saat ini.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [login_requests, load_requests]
+                properties:
+                  login_requests: {type: integer, minimum: 0}
+                  load_requests: {type: integer, minimum: 0}
+              example: {login_requests: 9, load_requests: 0}
+components:
+  securitySchemes:
+    fixtureBearer:
+      type: http
+      scheme: bearer
+      description: |
+        Bukan token sungguhan. Fixture membandingkan header `Authorization` **persis** dengan
+        `Bearer fixture-token`; nilai lain (termasuk huruf besar/kecil berbeda) dijawab `401`.
+        Di Swagger UI isi token dengan `fixture-token`.
+  parameters:
+    ActionId:
+      name: id
+      in: path
+      required: true
+      description: Id bebas. Config contoh memakai `act-1`. Dibuat otomatis dengan count 0 saat pertama diakses.
+      schema: {type: string}
+      example: act-1
+  requestBodies:
+    Login:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LoginRequest'
+          examples:
+            valid:
+              summary: Kredensial benar
+              value: {username: demo, password: demo-pass}
+            invalid:
+              summary: Password salah
+              value: {username: demo, password: wrong-pass}
+  responses:
+    Token:
+      description: Login berhasil.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [access_token]
+            properties:
+              access_token: {type: string}
+          example: {access_token: fixture-access-token}
+    BadRequest:
+      description: Body bukan JSON, atau tidak punya string `username` dan `password`. Respons tetap, tidak memantulkan input.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: {error: bad_request}
+    InvalidCredentials:
+      description: Kredensial salah.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: {error: invalid_credentials}
+    TooManyAttempts:
+      description: Proteksi aktif (hitungan login gagal >= 6).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: {error: too_many_attempts}
+    Unauthorized:
+      description: Header `Authorization` hilang atau bukan `Bearer fixture-token`. State tidak berubah.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: {error: unauthorized}
+  schemas:
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: {type: string}
+        password: {type: string}
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Kode tetap, bukan pesan bebas.
