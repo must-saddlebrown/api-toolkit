@@ -65,7 +65,9 @@ impl Transport {
             // Do not let HTTP(S)_PROXY from the environment redirect traffic.
             .no_proxy()
             // ponytail: no idle connection reuse, so a stale pooled connection can never
-            // trigger a hidden second attempt. Allow pooling in P3 if load needs it.
+            // trigger a hidden second attempt. P3 keeps pooling off (each load request opens a
+            // new connection, so its time includes connect); enable only with proof that no
+            // hidden retry on a stale connection can happen.
             .pool_max_idle_per_host(0)
             .build()
             .map_err(|_| TransportError::from(TransportErrorCode::Other))?;

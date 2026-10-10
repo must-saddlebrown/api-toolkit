@@ -1,15 +1,24 @@
-//! load check (PLAN §7). This file holds the pure parts: `classify` (one response -> outcome),
-//! `ceil_ms`, `nearest_rank_ms`, `throughput_rps` and `evaluate` (all facts -> verdict).
-//! The async runner (`run_with`, `run`, `console_line`) is added in P3.S4.
-// ponytail: nothing calls these until S4 wires the runner; remove the allow then.
-#![allow(dead_code)]
+//! load check (PLAN §7). Pure parts: `classify` (one response -> outcome), `ceil_ms`,
+//! `nearest_rank_ms`, `throughput_rps` and `evaluate` (all facts -> verdict). Async parts:
+//! `run_with` (stop check -> preflight -> worker pool, with a closure as sender so tests need no
+//! network), `run` (real transport) and `console_line`.
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use crate::checks::Stop;
-use crate::config::MatcherSpec;
-use crate::http::{TransportError, TransportResponse};
-use crate::report::{Completion, ReasonCode, TransportErrorCode, Verdict};
+use futures_util::future::join_all;
+use tokio::sync::watch;
+use tokio::time::Instant;
+
+use crate::checks::{Stop, current_stop, wait_stop};
+use crate::config::{Load, MatcherSpec};
+use crate::http::request::ResolvedRequest;
+use crate::http::{Transport, TransportError, TransportResponse, send};
+use crate::report::{
+    CheckName, CheckResult, Completion, Evidence, LoadEvidence, ReasonCode, TransportErrorCode,
+    Verdict, VerifyEvidence,
+};
 
 /// What one load response (or the preflight) turned out to be. The body is dropped after this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +222,247 @@ pub fn evaluate(f: &Facts) -> Evaluation {
     } else {
         make(Verdict::Fail, reasons, Completion::Complete)
     }
+}
+
+/// Which request the sender closure must send. `Load(n)` is request number n, 1..=requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Preflight,
+    Load(u32),
+}
+
+/// State shared by all workers of one run. Atomics let several futures update it through `&`.
+struct Shared<'a> {
+    requests: u32,
+    matcher: &'a MatcherSpec,
+    /// Last request number handed out.
+    next: AtomicU32,
+    in_flight: AtomicU32,
+    max_in_flight: AtomicU32,
+}
+
+/// One closed-loop worker: take the next request number, send, record, repeat. Stops when the
+/// numbers run out or a stop is signalled. Returns (numbers taken, recorded samples). A request
+/// dropped by a stop counts as taken but is not recorded.
+async fn worker<F, Fut>(
+    send_one: &F,
+    shared: &Shared<'_>,
+    mut stop_rx: watch::Receiver<Option<Stop>>,
+) -> (u32, Vec<Sample>)
+where
+    F: Fn(Kind) -> Fut,
+    Fut: Future<Output = Result<TransportResponse, TransportError>>,
+{
+    let mut taken = 0;
+    let mut samples = Vec::new();
+    loop {
+        if current_stop(&stop_rx).is_some() {
+            break;
+        }
+        let number = shared.next.fetch_add(1, Ordering::Relaxed) + 1;
+        if number > shared.requests {
+            break;
+        }
+        taken += 1;
+        let now = shared.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        shared.max_in_flight.fetch_max(now, Ordering::Relaxed);
+        let started = Instant::now();
+        let result = tokio::select! {
+            biased;
+            _ = wait_stop(&mut stop_rx) => None,
+            r = send_one(Kind::Load(number)) => Some(r),
+        };
+        shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let Some(result) = result else { break };
+        samples.push(Sample {
+            outcome: classify(&result, shared.matcher),
+            duration: started.elapsed(),
+        });
+        // `result` (and its body) is dropped here.
+    }
+    (taken, samples)
+}
+
+/// PLAN §7: preflight once, then `min(concurrency, requests)` workers share `requests` numbers.
+/// No retry, no ramp. A stop drops what is in flight. Precondition: `cfg` passed `validate`.
+pub async fn run_with<F, Fut>(
+    send_one: F,
+    cfg: &Load,
+    mut stop_rx: watch::Receiver<Option<Stop>>,
+) -> CheckResult
+where
+    F: Fn(Kind) -> Fut,
+    Fut: Future<Output = Result<TransportResponse, TransportError>>,
+{
+    let start = Instant::now();
+    let shared = Shared {
+        requests: cfg.requests,
+        matcher: &cfg.response_match,
+        next: AtomicU32::new(0),
+        in_flight: AtomicU32::new(0),
+        max_in_flight: AtomicU32::new(0),
+    };
+    let mut preflight: Option<(SampleOutcome, VerifyEvidence)> = None;
+    let mut samples: Vec<Sample> = Vec::new();
+    let mut dispatched = 0;
+    let mut load_elapsed = Duration::ZERO;
+
+    'run: {
+        // Never dispatch once a stop is signalled (also covers "stop before start").
+        if current_stop(&stop_rx).is_some() {
+            break 'run;
+        }
+        let offset = start.elapsed();
+        let sent_at = Instant::now();
+        let result = tokio::select! {
+            biased;
+            _ = wait_stop(&mut stop_rx) => break 'run,
+            r = send_one(Kind::Preflight) => r,
+        };
+        let outcome = classify(&result, &cfg.response_match);
+        let evidence = VerifyEvidence {
+            status: result.as_ref().ok().map(|r| r.status),
+            error: result.as_ref().err().map(|e| e.code),
+            offset_ms: offset.as_millis() as u64,
+            elapsed_ms: sent_at.elapsed().as_millis() as u64,
+        };
+        preflight = Some((outcome, evidence));
+        if !matches!(outcome, SampleOutcome::Success(_)) {
+            break 'run;
+        }
+
+        // Futures are lazy: `join_all` polls every worker once, so all of them start together.
+        let load_start = Instant::now();
+        let workers = cfg.concurrency.min(cfg.requests);
+        let done =
+            join_all((0..workers).map(|_| worker(&send_one, &shared, stop_rx.clone()))).await;
+        load_elapsed = load_start.elapsed();
+        for (taken, recorded) in done {
+            dispatched += taken;
+            samples.extend(recorded);
+        }
+    }
+
+    // A stop that arrives after all N samples are recorded does not change the verdict
+    // (`evaluate` ignores it then).
+    let stopped = current_stop(&stop_rx);
+    let max_in_flight = shared.max_in_flight.load(Ordering::Relaxed);
+    let evaluation = evaluate(&Facts {
+        requests: cfg.requests,
+        concurrency: cfg.concurrency,
+        max_error_rate: cfg.max_error_rate,
+        max_p95_ms: cfg.max_p95_ms,
+        preflight: preflight.as_ref().map(|(o, _)| *o),
+        dispatched,
+        max_in_flight,
+        samples: &samples,
+        stop: stopped,
+    });
+
+    let mut status_counts: BTreeMap<u16, u32> = BTreeMap::new();
+    let mut error_counts: BTreeMap<TransportErrorCode, u32> = BTreeMap::new();
+    for sample in &samples {
+        match sample.outcome {
+            SampleOutcome::Success(s) | SampleOutcome::Mismatch(s) => {
+                *status_counts.entry(s).or_insert(0) += 1;
+            }
+            SampleOutcome::Transport(code) => *error_counts.entry(code).or_insert(0) += 1,
+        }
+    }
+    let load_elapsed_ms = load_elapsed.as_millis() as u64;
+    let attempted = samples.len() as u32;
+
+    CheckResult {
+        check: CheckName::Load,
+        verdict: evaluation.verdict,
+        reasons: evaluation.reasons,
+        completion: evaluation.completion,
+        evidence: Some(Evidence::Load(LoadEvidence {
+            requests: cfg.requests,
+            concurrency: cfg.concurrency,
+            max_error_rate: cfg.max_error_rate,
+            max_p95_ms: cfg.max_p95_ms,
+            preflight: preflight.map(|(_, e)| e),
+            dispatched,
+            attempted,
+            succeeded: evaluation.succeeded,
+            failed: evaluation.failed,
+            timed_out: evaluation.timed_out,
+            error_rate: evaluation.error_rate,
+            p50_ms: evaluation.p50_ms,
+            p95_ms: evaluation.p95_ms,
+            max_ms: evaluation.max_ms,
+            max_in_flight,
+            load_elapsed_ms,
+            throughput_rps: throughput_rps(attempted, load_elapsed_ms),
+            status_counts,
+            error_counts,
+        })),
+    }
+}
+
+/// The real check: `run_with` sending the same request (preflight and load) through the transport.
+pub async fn run(
+    transport: &Transport,
+    cfg: &Load,
+    request: &ResolvedRequest,
+    stop: watch::Receiver<Option<Stop>>,
+) -> CheckResult {
+    run_with(|_kind: Kind| send(transport, request), cfg, stop).await
+}
+
+/// One console line (PLAN §10), e.g.
+/// `load PASS error_rate=0/0.01 p95=3/500ms attempted=100/100 samples=100 max_in_flight=10/10
+/// timeouts=0 status=200:100 errors=none reasons=thresholds_met` (one line). Numbers and enums
+/// only; `none` for a null or empty value.
+pub fn console_line(result: &CheckResult) -> String {
+    let reasons = if result.reasons.is_empty() {
+        "none".to_string()
+    } else {
+        let names: Vec<&str> = result.reasons.iter().map(|r| r.as_str()).collect();
+        names.join(",")
+    };
+    let head = format!(
+        "{} {}",
+        result.check.as_str(),
+        result.verdict.as_str().to_uppercase()
+    );
+    let Some(Evidence::Load(e)) = &result.evidence else {
+        return format!("{head} reasons={reasons}");
+    };
+    let or_none = |v: Option<String>| v.unwrap_or_else(|| "none".to_string());
+    let join = |parts: Vec<String>| {
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(",")
+        }
+    };
+    let status = join(
+        e.status_counts
+            .iter()
+            .map(|(s, n)| format!("{s}:{n}"))
+            .collect(),
+    );
+    let errors = join(
+        e.error_counts
+            .iter()
+            .map(|(c, n)| format!("{}:{n}", c.as_str()))
+            .collect(),
+    );
+    format!(
+        "{head} error_rate={}/{} p95={}/{}ms attempted={}/{} samples={} max_in_flight={}/{} timeouts={} status={status} errors={errors} reasons={reasons}",
+        or_none(e.error_rate.map(|r| r.to_string())),
+        e.max_error_rate,
+        or_none(e.p95_ms.map(|p| p.to_string())),
+        e.max_p95_ms,
+        e.attempted,
+        e.requests,
+        e.attempted,
+        e.max_in_flight,
+        e.concurrency,
+        e.timed_out,
+    )
 }
 
 #[cfg(test)]
@@ -799,5 +1049,525 @@ mod tests {
             let rate = evaluate(&f).error_rate;
             assert!(rate.is_some_and(f64::is_finite));
         }
+    }
+    // ---- run_with (paused clock, scripted sender, no network) ----
+
+    use crate::report::Evidence;
+    use std::cell::{Cell, RefCell};
+    use std::pin::Pin;
+    use tokio::time::sleep;
+
+    const SENTINEL: &str = "SENTINEL-LOAD-BODY-5d2f";
+
+    /// What the fake sender does on one call.
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// Answer with this status after `ms` of (virtual) time.
+        Slow(u64, u16),
+        Fail(TransportErrorCode),
+        /// Never answer.
+        Hang,
+    }
+
+    struct Script {
+        pre: Step,
+        /// What load request number n does.
+        load: Box<dyn Fn(u32) -> Step>,
+        /// Signal this stop when the load request with this number answers.
+        stop_on_load: Option<(u32, watch::Sender<Option<Stop>>, Stop)>,
+        calls: RefCell<Vec<Kind>>,
+        in_flight: Cell<u32>,
+        max_in_flight: Cell<u32>,
+    }
+
+    impl Script {
+        fn new(pre: Step, load: impl Fn(u32) -> Step + 'static) -> Script {
+            Script {
+                pre,
+                load: Box::new(load),
+                stop_on_load: None,
+                calls: RefCell::new(Vec::new()),
+                in_flight: Cell::new(0),
+                max_in_flight: Cell::new(0),
+            }
+        }
+
+        /// Everything answers 200 after `ms`; the preflight is instant.
+        fn healthy(ms: u64) -> Script {
+            Script::new(Step::Slow(0, 200), move |_| Step::Slow(ms, 200))
+        }
+
+        fn kinds(&self) -> Vec<Kind> {
+            self.calls.borrow().clone()
+        }
+
+        fn load_numbers(&self) -> Vec<u32> {
+            self.kinds()
+                .iter()
+                .filter_map(|k| match k {
+                    Kind::Load(n) => Some(*n),
+                    Kind::Preflight => None,
+                })
+                .collect()
+        }
+    }
+
+    // The named lifetime is needed: `'_` is not allowed inside the `Fn(..) -> ..` sugar.
+    #[allow(clippy::needless_lifetimes)]
+    fn sender<'a>(
+        s: &'a Script,
+    ) -> impl Fn(Kind) -> Pin<Box<dyn Future<Output = Result<TransportResponse, TransportError>> + 'a>>
+    {
+        move |kind| {
+            s.calls.borrow_mut().push(kind);
+            let step = match kind {
+                Kind::Preflight => s.pre,
+                Kind::Load(n) => (s.load)(n),
+            };
+            Box::pin(async move {
+                // Count load requests only (the preflight runs alone). A future dropped by a
+                // stop never reaches the decrement below, so `in_flight` stays up then.
+                let is_load = matches!(kind, Kind::Load(_));
+                if is_load {
+                    s.in_flight.set(s.in_flight.get() + 1);
+                    s.max_in_flight
+                        .set(s.max_in_flight.get().max(s.in_flight.get()));
+                }
+                let result = match step {
+                    Step::Slow(ms, status) => {
+                        sleep(ms_dur(ms)).await;
+                        // The body reflects the sentinel; it must never reach the result.
+                        resp(status, Some(json!({ "id": SENTINEL })))
+                    }
+                    Step::Fail(code) => Err(TransportError::from(code)),
+                    Step::Hang => std::future::pending().await,
+                };
+                if let (Kind::Load(n), Some((at, tx, stop))) = (kind, &s.stop_on_load)
+                    && n == *at
+                {
+                    let _ = tx.send(Some(*stop));
+                }
+                if is_load {
+                    s.in_flight.set(s.in_flight.get() - 1);
+                }
+                result
+            })
+        }
+    }
+
+    fn ms_dur(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn cfg(requests: u32, concurrency: u32) -> Load {
+        serde_json::from_value(json!({
+            "request": {"method": "GET", "path": "/critical"},
+            "response_match": {"status_in": [200]},
+            "requests": requests,
+            "concurrency": concurrency,
+            "max_error_rate": 0.01,
+            "max_p95_ms": 500
+        }))
+        .expect("test config must parse")
+    }
+
+    fn no_stop() -> (watch::Sender<Option<Stop>>, watch::Receiver<Option<Stop>>) {
+        watch::channel(None)
+    }
+
+    /// Run the script; optionally signal `stop` after `ms` of virtual time.
+    async fn go(script: &Script, cfg: &Load, stop: Option<(u64, Stop)>) -> CheckResult {
+        let (tx, rx) = no_stop();
+        if let Some((ms, s)) = stop {
+            tokio::spawn(async move {
+                sleep(ms_dur(ms)).await;
+                let _ = tx.send(Some(s));
+            });
+        } else {
+            std::mem::forget(tx); // keep the sender alive: "no stop ever"
+        }
+        run_with(sender(script), cfg, rx).await
+    }
+
+    fn lev(r: &CheckResult) -> &LoadEvidence {
+        match r.evidence.as_ref() {
+            Some(Evidence::Load(e)) => e,
+            _ => panic!("load always has load evidence"),
+        }
+    }
+
+    /// attempted <= dispatched <= requests, calls match, in-flight is bounded and agrees.
+    #[track_caller]
+    fn assert_invariants(r: &CheckResult, s: &Script, c: &Load) {
+        let e = lev(r);
+        assert!(e.attempted <= e.dispatched);
+        assert!(e.dispatched <= e.requests);
+        assert_eq!(e.dispatched as usize, s.load_numbers().len());
+        assert!(e.max_in_flight <= c.concurrency.min(c.requests));
+        assert_eq!(e.max_in_flight, s.max_in_flight.get());
+        let mut numbers = s.load_numbers();
+        numbers.sort_unstable();
+        numbers.dedup();
+        assert_eq!(
+            numbers.len(),
+            s.load_numbers().len(),
+            "no number sent twice"
+        );
+        assert_eq!(
+            e.attempted,
+            e.status_counts.values().sum::<u32>() + e.error_counts.values().sum::<u32>()
+        );
+        assert_eq!(e.succeeded + e.failed, e.attempted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l1_healthy_sends_preflight_then_each_number_once() {
+        let s = Script::healthy(10);
+        let c = cfg(100, 10);
+        let r = go(&s, &c, None).await;
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_eq!(r.reasons, [ReasonCode::ThresholdsMet]);
+        assert_eq!(r.completion, Completion::Complete);
+        assert_eq!(s.kinds().len(), 101);
+        assert_eq!(s.kinds()[0], Kind::Preflight);
+        let mut numbers = s.load_numbers();
+        numbers.sort_unstable();
+        assert_eq!(numbers, (1..=100).collect::<Vec<u32>>());
+        let e = lev(&r);
+        assert_eq!(e.max_in_flight, 10);
+        assert_eq!(e.load_elapsed_ms, 100);
+        assert_eq!(e.throughput_rps, Some(1000.0));
+        assert_eq!(
+            (e.dispatched, e.attempted, e.succeeded, e.failed),
+            (100, 100, 100, 0)
+        );
+        assert_eq!(e.status_counts, BTreeMap::from([(200, 100)]));
+        assert!(e.error_counts.is_empty());
+        let pre = e.preflight.as_ref().expect("preflight evidence");
+        assert_eq!((pre.status, pre.error), (Some(200), None));
+        assert_eq!(
+            console_line(&r),
+            "load PASS error_rate=0/0.01 p95=10/500ms attempted=100/100 samples=100 max_in_flight=10/10 timeouts=0 status=200:100 errors=none reasons=thresholds_met"
+        );
+        assert_invariants(&r, &s, &c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn p95_comes_from_the_scripted_durations() {
+        // Request n takes n ms: sorted durations are 1..=100, so p50 50, p95 95, max 100.
+        let s = Script::new(Step::Slow(0, 200), |n| Step::Slow(u64::from(n), 200));
+        let c = cfg(100, 10);
+        let r = go(&s, &c, None).await;
+        let e = lev(&r);
+        assert_eq!(
+            (e.p50_ms, e.p95_ms, e.max_ms),
+            (Some(50), Some(95), Some(100))
+        );
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_invariants(&r, &s, &c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l2_slow_responses_fail_latency() {
+        let s = Script::new(Step::Slow(0, 200), |_| Step::Slow(300, 200));
+        let mut c = cfg(20, 10);
+        c.max_p95_ms = 100;
+        let r = go(&s, &c, None).await;
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(r.reasons, [ReasonCode::LatencyExceeded]);
+        assert_eq!(lev(&r).p95_ms, Some(300));
+        assert_invariants(&r, &s, &c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l3_every_tenth_500_fails_error_rate() {
+        let s = Script::new(Step::Slow(0, 200), |n| {
+            Step::Slow(5, if n % 10 == 0 { 500 } else { 200 })
+        });
+        let c = cfg(100, 10);
+        let r = go(&s, &c, None).await;
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(r.reasons, [ReasonCode::ErrorRateExceeded]);
+        let e = lev(&r);
+        assert_eq!(e.failed, 10);
+        assert_eq!(e.status_counts, BTreeMap::from([(200, 90), (500, 10)]));
+        assert_eq!(
+            console_line(&r),
+            "load FAIL error_rate=0.1/0.01 p95=5/500ms attempted=100/100 samples=100 max_in_flight=10/10 timeouts=0 status=200:90,500:10 errors=none reasons=error_rate_exceeded"
+        );
+        assert_invariants(&r, &s, &c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l4_timeouts_are_not_retried_and_are_sampled() {
+        // Load 7 and 13 time out after 500 ms; all others answer in 3 ms.
+        let s = Script::new(Step::Slow(0, 200), |n| {
+            if n == 7 || n == 13 {
+                Step::Fail(TransportErrorCode::Timeout)
+            } else {
+                Step::Slow(3, 200)
+            }
+        });
+        let c = cfg(20, 10);
+        let r = go(&s, &c, None).await;
+        assert_eq!(s.kinds().len(), 21, "a timeout is never repeated");
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(r.reasons, [ReasonCode::ErrorRateExceeded]);
+        let e = lev(&r);
+        assert_eq!((e.attempted, e.failed, e.timed_out), (20, 2, 2));
+        assert_eq!(
+            e.error_counts,
+            BTreeMap::from([(TransportErrorCode::Timeout, 2)])
+        );
+        assert_eq!(e.status_counts, BTreeMap::from([(200, 18)]));
+        assert!(console_line(&r).contains("timeouts=2 status=200:18 errors=timeout:2 "));
+        assert_invariants(&r, &s, &c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l12_connect_failed_during_load_is_failed_and_not_retried() {
+        let s = Script::new(Step::Slow(0, 200), |n| {
+            if n <= 2 {
+                Step::Fail(TransportErrorCode::ConnectFailed)
+            } else {
+                Step::Slow(3, 200)
+            }
+        });
+        let c = cfg(20, 5);
+        let r = go(&s, &c, None).await;
+        assert_eq!(s.kinds().len(), 21);
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(r.reasons, [ReasonCode::ErrorRateExceeded]);
+        let e = lev(&r);
+        assert_eq!((e.failed, e.timed_out), (2, 0));
+        assert_eq!(
+            e.error_counts,
+            BTreeMap::from([(TransportErrorCode::ConnectFailed, 2)])
+        );
+        assert_invariants(&r, &s, &c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l23_concurrency_above_requests_uses_requests_workers() {
+        let s = Script::healthy(10);
+        let c = cfg(5, 10);
+        let r = go(&s, &c, None).await;
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_eq!(s.kinds().len(), 6);
+        assert_eq!(lev(&r).max_in_flight, 5);
+        assert_eq!(s.max_in_flight.get(), 5);
+        assert_invariants(&r, &s, &c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l24_concurrency_one_is_sequential() {
+        let s = Script::healthy(10);
+        let c = cfg(10, 1);
+        let r = go(&s, &c, None).await;
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_eq!(lev(&r).max_in_flight, 1);
+        assert_eq!(lev(&r).load_elapsed_ms, 100);
+        // One worker takes the numbers in order.
+        assert_eq!(s.load_numbers(), (1..=10).collect::<Vec<u32>>());
+        assert_invariants(&r, &s, &c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l13_l15_failing_preflight_sends_exactly_one_call() {
+        let cases = [
+            (
+                Step::Slow(0, 401),
+                Verdict::Inconclusive,
+                vec![ReasonCode::TargetNotReady],
+                (Some(401), None),
+            ),
+            (
+                Step::Fail(TransportErrorCode::Timeout),
+                Verdict::Error,
+                vec![ReasonCode::PreflightFailed, ReasonCode::TransportError],
+                (None, Some(TransportErrorCode::Timeout)),
+            ),
+            (
+                Step::Fail(TransportErrorCode::ConnectFailed),
+                Verdict::Error,
+                vec![ReasonCode::PreflightFailed, ReasonCode::TransportError],
+                (None, Some(TransportErrorCode::ConnectFailed)),
+            ),
+        ];
+        for (pre, verdict, reasons, (status, error)) in cases {
+            let s = Script::new(pre, |_| Step::Slow(1, 200));
+            let c = cfg(100, 10);
+            let r = go(&s, &c, None).await;
+            assert_eq!(s.kinds(), [Kind::Preflight]);
+            assert_eq!(r.verdict, verdict);
+            assert_eq!(r.reasons, reasons);
+            assert_eq!(r.completion, Completion::Complete);
+            let e = lev(&r);
+            assert_eq!((e.dispatched, e.attempted), (0, 0));
+            let p = e.preflight.as_ref().expect("preflight evidence");
+            assert_eq!((p.status, p.error), (status, error));
+            assert_eq!(e.p95_ms, None);
+            assert_invariants(&r, &s, &c);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l16_stop_before_start_sends_nothing() {
+        for (stop, reason) in [
+            (Stop::Cancelled, ReasonCode::Cancelled),
+            (Stop::DeadlineExceeded, ReasonCode::DeadlineExceeded),
+        ] {
+            let s = Script::healthy(10);
+            let c = cfg(100, 10);
+            let (tx, rx) = no_stop();
+            tx.send(Some(stop)).expect("receiver alive");
+            let r = run_with(sender(&s), &c, rx).await;
+            assert_eq!(r.verdict, Verdict::NotRun);
+            assert_eq!(r.reasons, [reason]);
+            assert_eq!(r.completion, Completion::Incomplete);
+            assert!(s.kinds().is_empty());
+            let e = lev(&r);
+            assert!(e.preflight.is_none());
+            assert_eq!((e.dispatched, e.attempted), (0, 0));
+            assert_invariants(&r, &s, &c);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l17_cancel_while_preflight_is_in_flight() {
+        let s = Script::new(Step::Hang, |_| Step::Slow(1, 200));
+        let c = cfg(100, 10);
+        let r = go(&s, &c, Some((10, Stop::Cancelled))).await;
+        assert_eq!(s.kinds(), [Kind::Preflight]);
+        assert_eq!(r.verdict, Verdict::NotRun);
+        assert_eq!(r.reasons, [ReasonCode::Cancelled]);
+        assert_eq!(r.completion, Completion::Incomplete);
+        assert!(lev(&r).preflight.is_none());
+        assert_invariants(&r, &s, &c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l18_cancel_during_load_stops_new_dispatch() {
+        // 10 workers, 10 ms per request: batches finish at 10, 20, 30 ms (30 recorded);
+        // cancel at 35 ms drops load 31..=40 in flight.
+        let s = Script::healthy(10);
+        let c = cfg(100, 10);
+        let r = go(&s, &c, Some((35, Stop::Cancelled))).await;
+        assert_eq!(r.verdict, Verdict::NotRun);
+        assert_eq!(
+            r.reasons,
+            [ReasonCode::Cancelled, ReasonCode::WorkloadIncomplete]
+        );
+        assert_eq!(r.completion, Completion::Incomplete);
+        let e = lev(&r);
+        assert_eq!((e.attempted, e.dispatched), (30, 40));
+        assert_eq!(s.kinds().len(), 41, "no Load(n) after the stop");
+        assert_eq!(*s.load_numbers().iter().max().expect("sent"), 40);
+        assert!(e.preflight.is_some());
+        assert_invariants(&r, &s, &c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l18b_stop_after_preflight_before_workers_start_sends_no_load() {
+        let (tx, rx) = no_stop(); // `tx` lives until the end of the test
+        let calls = RefCell::new(Vec::new());
+        let send = |kind: Kind| {
+            calls.borrow_mut().push(kind);
+            let tx = &tx;
+            async move {
+                if kind == Kind::Preflight {
+                    tx.send(Some(Stop::Cancelled)).expect("receiver alive");
+                }
+                resp(200, None)
+            }
+        };
+        let c = cfg(100, 10);
+        let r = run_with(send, &c, rx).await;
+        assert_eq!(*calls.borrow(), [Kind::Preflight]);
+        assert_eq!(r.verdict, Verdict::NotRun);
+        assert_eq!(
+            r.reasons,
+            [ReasonCode::Cancelled, ReasonCode::WorkloadIncomplete]
+        );
+        assert_eq!(r.completion, Completion::Incomplete);
+        let e = lev(&r);
+        assert_eq!((e.dispatched, e.attempted), (0, 0));
+        assert!(e.preflight.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn load_elapsed_excludes_the_preflight() {
+        let s = Script::new(Step::Slow(7, 200), |_| Step::Slow(10, 200));
+        let r = go(&s, &cfg(100, 10), None).await;
+        let e = lev(&r);
+        assert_eq!(e.load_elapsed_ms, 100);
+        assert_eq!(e.preflight.as_ref().expect("preflight").elapsed_ms, 7);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l19_deadline_during_load_with_all_successes_is_not_run() {
+        let s = Script::healthy(10);
+        let c = cfg(100, 10);
+        let r = go(&s, &c, Some((55, Stop::DeadlineExceeded))).await;
+        assert_eq!(r.verdict, Verdict::NotRun);
+        assert_eq!(
+            r.reasons,
+            [ReasonCode::DeadlineExceeded, ReasonCode::WorkloadIncomplete]
+        );
+        assert_eq!(r.completion, Completion::Incomplete);
+        let e = lev(&r);
+        assert_eq!((e.attempted, e.failed), (50, 0));
+        assert_invariants(&r, &s, &c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l20_stop_after_the_last_sample_keeps_the_verdict() {
+        let (tx, rx) = no_stop();
+        let mut s = Script::healthy(10);
+        s.stop_on_load = Some((5, tx, Stop::Cancelled));
+        let c = cfg(5, 1);
+        let r = run_with(sender(&s), &c, rx).await;
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_eq!(r.reasons, [ReasonCode::ThresholdsMet]);
+        assert_eq!(r.completion, Completion::Complete);
+        assert_eq!(lev(&r).attempted, 5);
+        assert_invariants(&r, &s, &c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn l26_sentinel_in_response_bodies_is_absent_from_debug_and_console() {
+        // PASS path and FAIL path (every other request is a 500).
+        for bad in [false, true] {
+            let s = Script::new(Step::Slow(0, 200), move |n| {
+                Step::Slow(2, if bad && n % 2 == 0 { 500 } else { 200 })
+            });
+            let c = cfg(20, 4);
+            let r = go(&s, &c, None).await;
+            assert_eq!(r.verdict, if bad { Verdict::Fail } else { Verdict::Pass });
+            assert!(!format!("{r:?}").contains(SENTINEL));
+            assert!(!console_line(&r).contains(SENTINEL));
+        }
+    }
+
+    #[test]
+    fn console_line_without_evidence_and_with_none_values() {
+        let r = CheckResult {
+            check: CheckName::Load,
+            verdict: Verdict::NotRun,
+            reasons: vec![],
+            completion: Completion::Incomplete,
+            evidence: None,
+        };
+        assert_eq!(console_line(&r), "load NOT_RUN reasons=none");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn console_line_shows_none_for_missing_values() {
+        let s = Script::new(Step::Slow(0, 401), |_| Step::Slow(1, 200));
+        let r = go(&s, &cfg(100, 10), None).await;
+        assert_eq!(
+            console_line(&r),
+            "load INCONCLUSIVE error_rate=none/0.01 p95=none/500ms attempted=0/100 samples=0 max_in_flight=0/10 timeouts=0 status=none errors=none reasons=target_not_ready"
+        );
     }
 }
