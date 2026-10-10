@@ -45,7 +45,9 @@ api-toolkit validate --config ./core-checks.json
 api-toolkit check --config ./core-checks.json --out ./result.json
 ```
 
-`validate` memeriksa konfigurasi dan keberadaan env references tanpa mengirim request. `check` menjalankan semua tiga check dan menulis report. Tidak ada wizard, interactive prompt, export bundle, atau command editor pada v0.1.
+`validate` memeriksa konfigurasi dan keberadaan env references tanpa mengirim request. `check` menjalankan ketiga check (mulai P4; sebelumnya hanya mode `--only`) dan menulis report. Tidak ada wizard, interactive prompt, export bundle, atau command editor pada v0.1.
+
+Sampai P4, `check` wajib memakai `--only <check>` dan hanya menjalankan check itu: `api-toolkit check --config ./brute-force-only.json --out ./result.json --only brute_force`. Tanpa `--only`, `check` menolak (exit 2, nol request) dengan pesan bahwa suite lengkap tersedia di P4. `validate --only <check>` memvalidasi bagian check itu saja. Check yang belum diimplementasikan (`race` sampai P2, `load` sampai P3) dan nama yang tidak dikenal ditolak dengan exit 2 dan nol request. Run `--only` adalah run parsial: report ditandai `scope: partial`, check lain dicatat NOT_RUN `excluded_by_only`, dan exit code tidak pernah 0.
 
 Urutan default: race → load → brute-force. Login abuse diletakkan terakhir agar account lockout tidak menghalangi skenario sebelumnya. Auth untuk race/load menggunakan identitas pengujian terpisah dari akun login abuse. Jika shared limiter/state masih mencemari precondition, hasil tidak boleh dipromosikan menjadi PASS.
 
@@ -158,7 +160,7 @@ HTTP requests explicit: method, relative path, optional path params/query/header
 
 Konfigurasi memakai satu target origin. Semua path action/verifier/load/login relatif terhadap origin/base path itu. Redirect tidak diikuti; TLS verification aktif; tidak ada automatic retry. Secret environment references tidak menjadi argumen CLI.
 
-Default: connect timeout 3 detik, total request timeout 5 detik, body limit 1 MiB, suite deadline 120 detik. Semua dapat dikonfigurasi. Hitung jumlah request dan fixed waits sebelum run; konfigurasi yang fixed waits-nya saja melampaui deadline ditolak. Estimasi worst-case berbasis timeout dilaporkan sebagai budget, bukan jaminan API merespons tepat waktu.
+Default: connect timeout 3 detik, total request timeout 5 detik, body limit 1 MiB, suite deadline 120 detik. Semua dapat dikonfigurasi. Hitung jumlah request dan fixed waits check yang dijalankan (ketiganya, atau check terpilih pada `--only`) sebelum run; konfigurasi yang fixed waits-nya saja melampaui deadline ditolak. Estimasi worst-case berbasis timeout dilaporkan sebagai budget, bukan jaminan API merespons tepat waktu.
 
 v0.1 menerima probe count ≤100, race concurrency ≤32, load count ≤1000, load concurrency ≤32, dan seluruh angka harus positif dalam batas tersebut. Ini batas implementasi pertama, bukan kapasitas API. Extension limits dilakukan sengaja melalui revisi versi.
 
@@ -230,13 +232,15 @@ Contoh untuk fixture lokal; semua paths/field names adalah contoh, bukan tebakan
 
 `TEST_AUTHORIZATION` berisi header lengkap, misalnya `Bearer <token>`. Substitusi hanya whole-string `${ENV:NAME}`, tanpa string interpolation/expression. Env values menjadi strings; angka/boolean tetap literal JSON. Missing env, unknown fields, invalid selector/threshold/version memblokir run sebelum dispatch.
 
-v0.1 ketiga check wajib dikonfigurasi. Tidak ada skip flags yang memungkinkan command tampil sukses sementara hanya satu check berjalan. Template fixture dapat diganti method/path/body/matchers untuk target pengguna; resource state dan policy target tetap eksplisit.
+Suite lengkap (`check` tanpa `--only`, `validate` tanpa `--only`) mewajibkan ketiga bagian check. Mode `--only <check>` hanya mewajibkan `config_version`, `base_url`, `limits` (opsional), dan bagian check terpilih. Bagian lain yang ada tetap harus berbentuk benar (field tak dikenal dan tipe salah ditolak) tetapi tidak divalidasi semantik, tidak di-resolve (env-nya tidak wajib), dan tidak dihitung dalam budget. Tidak ada skip flag yang membuat command tampil sukses: run parsial tidak pernah exit 0 dan report-nya ditandai `scope: partial`. Template fixture dapat diganti method/path/body/matchers untuk target pengguna; resource state dan policy target tetap eksplisit.
 
 ## 10. Reporting dan exit code
 
 Console menampilkan satu baris per check: verdict, evidence utama, threshold, dan reason. Contoh healthy fixture: race PASS delta=1; load PASS error_rate=0/p95=120ms; brute_force PASS first_protected=6 tail=3/2 attempts=8/8 (tail = jumlah protected berurutan yang teramati / `protected_tail_count`; attempts = probe yang selesai dan tercatat / direncanakan). Angka latency merupakan ilustrasi.
 
 JSON report memuat report_version=1, run ID, tool version, config hash nonsecret, timestamps UTC, configured workloads/thresholds, counts/timings/status distribution, before/after counter, per-check verdict/reasons, dan completion status. Request body/header values, raw response bodies, token/password, serta resolved secret path/query tidak dipersist.
+
+Report memuat `scope`: `full` untuk suite lengkap, `partial` untuk run `--only`. Pada run parsial, check yang tidak dipilih tercatat `not_run` dengan reason `excluded_by_only` dan completion `incomplete`; urutan entri mengikuti urutan default §3. Console run parsial mencetak satu baris untuk check terpilih.
 
 Per-attempt evidence cukup: attempt number, HTTP status/outcome category, timing, matched rule, sanitized error code. Jangan memuat raw matcher expected values yang sensitif atau error dari library yang mengandung URL credential. Atomic report write; incomplete/cancel bukan complete PASS.
 
@@ -246,6 +250,8 @@ Per-attempt evidence cukup: attempt number, HTTP status/outcome category, timing
 | 1 | Minimal satu FAIL; tidak ada ERROR/INCONCLUSIVE/NOT_RUN |
 | 2 | Config/runtime/report error, INCONCLUSIVE, atau incomplete suite |
 | 130 | Cancel pengguna |
+
+Run parsial (`--only`): FAIL selesai → 1; PASS dan hasil lain → 2; tidak pernah 0 (PASS parsial dibaca dari console dan report). Entri `excluded_by_only` diabaikan dalam presedensi; cancel tetap 130 dan incomplete tetap mendahului fail.
 
 Precedence suite: cancel → error/inconclusive/incomplete → fail → pass. Definite FAIL pada satu check tetap terlihat walaupun suite exit 2 akibat check lain. Report-save failure tidak pernah memberi exit 0.
 
@@ -277,7 +283,7 @@ Acceptance criteria: healthy fixture PASS; controlled slow/error fixture FAIL; t
 
 ### P4 — Single-command proof dan satu API nyata
 
-Pekerjaan: orchestrator menjalankan ketiganya, partial report/cancel, console summary, exit code, README satu command, sample config. Selesaikan fixture proof sebelum integrasi target nyata.
+Pekerjaan: perluas command `check --only` yang sudah ada (DECISIONS 2026-10-10) menjadi suite lengkap sebagai default; jangan membuat ulang parser, report, atau jalur cancel/deadline. Orchestrator menjalankan ketiganya, partial report/cancel, console summary, exit code, README satu command, sample config. Selesaikan fixture proof sebelum integrasi target nyata.
 
 Acceptance criteria:
 
