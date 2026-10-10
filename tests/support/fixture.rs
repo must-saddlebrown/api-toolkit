@@ -1,12 +1,13 @@
 //! Local fixture API (healthy plus broken login variants). A development tool, NOT a product mock server.
 //!
 //! Binds 127.0.0.1 only. Never logs or echoes request headers or bodies.
-//! Behaviour is documented in `docs/fixture.md`. Broken race/load variants arrive in P2-P3.
+//! Behaviour is documented in `docs/fixture.md`. Race variants (racy, idempotent) live here; the broken load variant arrives in P3.
 #![allow(dead_code)] // each user (tests, example) only uses part of this module
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -17,7 +18,12 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::{oneshot, watch},
+    task::JoinHandle,
+    time::timeout,
+};
 
 // Public dev constants (not secrets). Keep in sync with docs/fixture.md.
 pub const LOGIN_USER: &str = "demo";
@@ -28,6 +34,10 @@ pub const TEST_AUTHORIZATION: &str = "Bearer fixture-token";
 pub const ACCESS_TOKEN: &str = "fixture-access-token";
 /// Failed login number at which protection (429) starts.
 pub const PROTECT_BY_ATTEMPT: u32 = 6;
+/// Racy apply: how many requests must have read counter 0 before any of them may increment.
+const RACY_GATE: u32 = 2;
+/// Racy apply: longest wait for the gate. A sequential client times out here and the delta stays 1.
+const RACY_GATE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct FixtureState {
@@ -37,6 +47,13 @@ struct FixtureState {
     load_requests: u64,
     /// Every request to the three login routes (also malformed ones). Read via /__admin/stats.
     login_requests: u64,
+    /// Every request to the three apply routes (also 401). Read via /__admin/stats.
+    action_requests: u64,
+    /// Every GET /actions/{id} (also 401). Read via /__admin/stats.
+    verify_requests: u64,
+    /// action id -> number of racy requests that have read counter 0 (the explicit sync point).
+    /// Reset drops the senders, which opens every gate.
+    racy_seen_zero: HashMap<String, watch::Sender<u32>>,
 }
 
 type Shared = Arc<Mutex<FixtureState>>;
@@ -95,6 +112,8 @@ fn router(state: Shared) -> Router {
         .route("/broken/login/unprotected", post(login_unprotected))
         .route("/broken/login/accepts-invalid", post(login_accepts_invalid))
         .route("/actions/{id}/apply", post(apply))
+        .route("/broken/actions/{id}/apply-racy", post(apply_racy))
+        .route("/idempotent/actions/{id}/apply", post(apply_idempotent))
         .route("/actions/{id}", get(read_action))
         .route("/critical", get(critical))
         .route("/__admin/reset", post(reset))
@@ -199,6 +218,7 @@ async fn login(State(state): State<Shared>, raw: Bytes) -> Reply {
 }
 
 async fn apply(State(state): State<Shared>, Path(id): Path<String>, headers: HeaderMap) -> Reply {
+    lock(&state).action_requests += 1;
     if !is_authorized(&headers) {
         return unauthorized();
     }
@@ -213,11 +233,62 @@ async fn apply(State(state): State<Shared>, Path(id): Path<String>, headers: Hea
     }
 }
 
+/// Broken variant: check-then-act with an explicit synchronisation point instead of lucky timing.
+/// A request that reads counter 0 waits until at least `RACY_GATE` requests have read 0, and only
+/// then increments. Truly concurrent clients therefore always give delta >= 2. A sequential client
+/// never fills the gate: it times out, the delta stays 1, and the duplicate test goes red.
+async fn apply_racy(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Reply {
+    lock(&state).action_requests += 1;
+    if !is_authorized(&headers) {
+        return unauthorized();
+    }
+    let mut gate = {
+        let mut s = lock(&state);
+        if s.actions.get(&id).copied().unwrap_or(0) > 0 {
+            return reply(StatusCode::CONFLICT, json!({"error": "already_applied"}));
+        }
+        // Read 0: register at the gate. The lock is released before waiting.
+        let sender = s
+            .racy_seen_zero
+            .entry(id.clone())
+            .or_insert_with(|| watch::channel(0).0);
+        sender.send_modify(|seen| *seen += 1);
+        sender.subscribe()
+    };
+    wait_for_gate(&mut gate).await;
+    *lock(&state).actions.entry(id).or_insert(0) += 1;
+    reply(StatusCode::OK, json!({"applied": true}))
+}
+
+/// Returns when the gate is open, the sender is gone (reset), or the timeout passed.
+async fn wait_for_gate(gate: &mut watch::Receiver<u32>) {
+    let _ = timeout(RACY_GATE_TIMEOUT, gate.wait_for(|seen| *seen >= RACY_GATE)).await;
+}
+
+/// Healthy idempotent variant: every request gets 200, but the side effect happens once.
+async fn apply_idempotent(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Reply {
+    lock(&state).action_requests += 1;
+    if !is_authorized(&headers) {
+        return unauthorized();
+    }
+    lock(&state).actions.insert(id, 1);
+    reply(StatusCode::OK, json!({"applied": true}))
+}
+
 async fn read_action(
     State(state): State<Shared>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Reply {
+    lock(&state).verify_requests += 1;
     if !is_authorized(&headers) {
         return unauthorized();
     }
@@ -246,7 +317,12 @@ async fn stats(State(state): State<Shared>) -> Reply {
     let s = lock(&state);
     reply(
         StatusCode::OK,
-        json!({"login_requests": s.login_requests, "load_requests": s.load_requests}),
+        json!({
+            "login_requests": s.login_requests,
+            "load_requests": s.load_requests,
+            "action_requests": s.action_requests,
+            "verify_requests": s.verify_requests,
+        }),
     )
 }
 

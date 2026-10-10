@@ -10,7 +10,7 @@ info:
     Method yang salah pada rute yang ada (mis. `GET /login`) dijawab `405` tanpa body oleh axum; rute yang tidak ada `404 {"error":"not_found"}`. Keduanya tidak ditulis ulang per path di bawah.
 
     **Semua state ada di memori dan global untuk satu proses fixture** (bukan per pengguna, bukan per sesi):
-    hitungan login gagal, counter tiap action id, counter load, dan counter request login.
+    hitungan login gagal, counter tiap action id, state gerbang racy, counter load, dan counter request (login, action, verify).
     Satu-satunya cara mengosongkannya selain restart adalah `POST /__admin/reset`.
 
     Tiga kelompok endpoint:
@@ -18,7 +18,7 @@ info:
     | Kelompok | Endpoint | Dipakai check |
     | --- | --- | --- |
     | Login | `/login` (sehat), `/broken/login/*` (sengaja rusak) | brute force |
-    | Aksi write-once | `/actions/{id}/apply`, `/actions/{id}` | race (P2) |
+    | Aksi write-once | `/actions/{id}/apply` (sehat), `/broken/actions/{id}/apply-racy` (sengaja rusak), `/idempotent/actions/{id}/apply` (sehat, idempotent), `/actions/{id}` (verifier) | race (P2) |
     | Beban | `/critical` | load (P3) |
     | Alat dev | `/__admin/reset`, `/__admin/stats` | dipakai test dan pengguna, tidak oleh check |
 
@@ -35,6 +35,8 @@ tags:
     description: Varian login yang sengaja rusak, untuk membuktikan check bisa mengatakan FAIL.
   - name: action
     description: Aksi write-once, untuk check race.
+  - name: broken-action
+    description: Varian aksi yang sengaja rusak (duplikat side effect), untuk membuktikan check race bisa FAIL.
   - name: load
     description: Endpoint beban, untuk check load.
   - name: admin
@@ -122,8 +124,8 @@ paths:
         - Apply pertama untuk `id` itu: `200 {"applied": true}` dan `execution_count` menjadi 1.
         - Apply berikutnya: `409 already_applied`, counter **tidak** bertambah.
         - Keputusan atomik: lock dipegang selama cek dan increment, jadi permintaan paralel pun
-          menghasilkan tepat satu 200 dan sisanya 409. Ini varian **sehat**. (Varian rusak yang bisa dobel
-          ditambahkan di P2.)
+          menghasilkan tepat satu 200 dan sisanya 409. Ini varian **sehat**. Varian rusak:
+          `/broken/actions/{id}/apply-racy`.
         - Tanpa header `Authorization` yang benar: `401`, dan state tidak berubah.
         - Body request diabaikan.
         - `id` apa pun dibuat otomatis (lihat `GET /actions/{id}`).
@@ -151,6 +153,72 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
               example: {error: already_applied}
+  /broken/actions/{id}/apply-racy:
+    post:
+      tags: [broken-action]
+      operationId: applyActionRacy
+      summary: Aksi rusak (check-then-act) dengan titik sinkronisasi eksplisit
+      description: |
+        Counter 0 dibaca, lalu increment dilakukan terpisah, dan ada gerbang di antaranya.
+
+        - Counter id sudah > 0: `409 already_applied`.
+        - Counter 0: request menunggu di gerbang (`tokio::sync::watch` per id) sampai minimal **2** request
+          telah membaca 0 (maksimum **2 detik**), lalu menaikkan counter dan menjawab `200 {"applied": true}`.
+        - Client yang benar-benar konkuren: minimal dua `200` dan `execution_count >= 2`, deterministik
+          (bukan timing keberuntungan). Check race harus `fail` / `duplicate_side_effect`.
+        - Client sekuensial: gerbang timeout 2 detik, counter tetap 1. Test duplikat jadi merah, bukan PASS palsu.
+        - `POST /__admin/reset` melepas request yang sedang menunggu dan mengosongkan gerbang.
+        - Tanpa header `Authorization` yang benar: `401`, state tidak berubah.
+      security:
+        - fixtureBearer: []
+      parameters:
+        - $ref: '#/components/parameters/ActionId'
+      responses:
+        '200':
+          description: Increment dilakukan (bisa terjadi lebih dari sekali untuk id yang sama).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [applied]
+                properties:
+                  applied: {type: boolean, const: true}
+              example: {applied: true}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Counter sudah > 0 saat dibaca.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example: {error: already_applied}
+  /idempotent/actions/{id}/apply:
+    post:
+      tags: [action]
+      operationId: applyActionIdempotent
+      summary: Aksi sehat idempotent
+      description: |
+        Selalu `200 {"applied": true}` dan counter id menjadi 1 (tepat satu side effect, tidak pernah lebih),
+        berapa pun request yang masuk. Check race N=5: lima `200`, delta 1, `pass` / `single_side_effect`.
+        Tanpa header `Authorization` yang benar: `401`.
+      security:
+        - fixtureBearer: []
+      parameters:
+        - $ref: '#/components/parameters/ActionId'
+      responses:
+        '200':
+          description: Diterima; counter 1.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [applied]
+                properties:
+                  applied: {type: boolean, const: true}
+              example: {applied: true}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /actions/{id}:
     get:
       tags: [action]
@@ -214,7 +282,7 @@ paths:
       operationId: adminReset
       summary: Reset seluruh state
       description: |
-        Mengosongkan hitungan login gagal, semua counter action, `load_requests`, dan `login_requests`.
+        Mengosongkan hitungan login gagal, semua counter action, state gerbang racy, `load_requests`, `login_requests`, `action_requests`, dan `verify_requests`.
         Alat pengembangan: `api-toolkit` tidak pernah memanggilnya. Jalankan sebelum mengulang check
         (baseline login butuh hitungan gagal 0; race butuh counter awal 0).
       responses:
@@ -241,6 +309,8 @@ paths:
           termasuk body rusak (400). Method selain POST (405) dan body di atas batas default axum (2 MB)
           ditolak sebelum handler dan **tidak** dihitung.
         - `load_requests` menghitung `GET /critical` yang terotorisasi.
+        - `action_requests` menghitung setiap `POST` ke tiga rute apply (sehat, racy, idempotent), termasuk `401`.
+        - `verify_requests` menghitung setiap `GET /actions/{id}`, termasuk `401`. Race sehat N=5: `action_requests` 5, `verify_requests` 2.
         - Request ke stats sendiri tidak dihitung.
       responses:
         '200':
@@ -249,11 +319,13 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [login_requests, load_requests]
+                required: [login_requests, load_requests, action_requests, verify_requests]
                 properties:
                   login_requests: {type: integer, minimum: 0}
                   load_requests: {type: integer, minimum: 0}
-              example: {login_requests: 9, load_requests: 0}
+                  action_requests: {type: integer, minimum: 0}
+                  verify_requests: {type: integer, minimum: 0}
+              example: {login_requests: 9, load_requests: 0, action_requests: 0, verify_requests: 0}
 components:
   securitySchemes:
     fixtureBearer:

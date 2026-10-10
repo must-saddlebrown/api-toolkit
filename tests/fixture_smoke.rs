@@ -206,7 +206,12 @@ async fn stats_count_login_requests_on_all_login_routes() {
     let (c, url) = (client(), fx.base_url());
     assert_eq!(
         get_stats(&c, &url).await,
-        json!({"login_requests": 0, "load_requests": 0})
+        json!({
+            "login_requests": 0,
+            "load_requests": 0,
+            "action_requests": 0,
+            "verify_requests": 0
+        })
     );
     post_login(&c, &url, "/login", LOGIN_USER, "x").await;
     post_login(&c, &url, "/broken/login/unprotected", LOGIN_USER, "x").await;
@@ -236,5 +241,65 @@ async fn reset_zeroes_login_counter_and_healthy_state() {
     assert_eq!(get_stats(&c, &url).await["login_requests"], 0);
     let r = post_login(&c, &url, "/login", LOGIN_USER, "x").await;
     assert_eq!(r["status"], 401);
+    fx.shutdown().await;
+}
+
+async fn post_apply(c: &reqwest::Client, url: &str, path: &str, auth: bool) -> u16 {
+    let mut req = c.post(format!("{url}{path}"));
+    if auth {
+        req = req.header("Authorization", TEST_AUTHORIZATION);
+    }
+    req.send().await.unwrap().status().as_u16()
+}
+
+#[tokio::test]
+async fn racy_route_duplicates_when_concurrent_and_idempotent_applies_once() {
+    let fx = Fixture::start(0).await.unwrap();
+    let (c, url) = (client(), fx.base_url());
+    let path = "/broken/actions/r1/apply-racy";
+    let (a, b, d) = tokio::join!(
+        post_apply(&c, &url, path, true),
+        post_apply(&c, &url, path, true),
+        post_apply(&c, &url, path, true)
+    );
+    assert!([a, b, d].iter().filter(|s| **s == 200).count() >= 2);
+    let v: Value = c
+        .get(format!("{url}/actions/r1"))
+        .header("Authorization", TEST_AUTHORIZATION)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(v["execution_count"].as_u64().unwrap() >= 2);
+    // After the increments, a late request is 409.
+    assert_eq!(post_apply(&c, &url, path, true).await, 409);
+    assert_eq!(post_apply(&c, &url, path, false).await, 401);
+
+    let idem = "/idempotent/actions/i1/apply";
+    for _ in 0..3 {
+        assert_eq!(post_apply(&c, &url, idem, true).await, 200);
+    }
+    assert_eq!(post_apply(&c, &url, idem, false).await, 401);
+    let v: Value = c
+        .get(format!("{url}/actions/i1"))
+        .header("Authorization", TEST_AUTHORIZATION)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["execution_count"], 1);
+
+    let stats = get_stats(&c, &url).await;
+    assert_eq!(stats["action_requests"], 3 + 2 + 3 + 1);
+    assert_eq!(stats["verify_requests"], 2);
+    c.post(format!("{url}/__admin/reset")).send().await.unwrap();
+    let stats = get_stats(&c, &url).await;
+    assert_eq!(stats["action_requests"], 0);
+    assert_eq!(stats["verify_requests"], 0);
+    assert_eq!(count(&c, &url).await, 0);
     fx.shutdown().await;
 }

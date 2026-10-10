@@ -1,6 +1,6 @@
-# Fixture lokal (healthy dan broken login)
+# Fixture lokal (healthy, broken login, varian race)
 
-Alat pengembangan, bukan fitur produk dan bukan mock server produk. Varian healthy plus dua varian broken login (P1). Varian broken race/load ditambahkan di P2-P3.
+Alat pengembangan, bukan fitur produk dan bukan mock server produk. Varian healthy, dua varian broken login (P1), varian racy dan idempotent untuk race (P2). Varian broken load ditambahkan di P3.
 Kode: `tests/support/fixture.rs`, dijalankan lewat `examples/fixture.rs`.
 Spesifikasi OpenAPI semua rute: [fixture.openapi.yaml](fixture.openapi.yaml) (bisa dibuka di Swagger Editor atau `npx @redocly/cli preview-docs docs/fixture.openapi.yaml`).
 
@@ -34,11 +34,13 @@ Jika memakai `--port` selain 8080, ubah `base_url` di salinan config.
 | `POST /login` JSON `{"username","password"}` | Kredensial benar dan hitungan gagal < 6: 200 `{"access_token": "fixture-access-token"}`. Kredensial salah: 401 untuk kegagalan ke-1 sampai ke-5, 429 mulai kegagalan ke-6 (proteksi pada attempt 6, sesuai `protect_by_attempt` contoh). Login benar TIDAK mereset hitungan gagal; setelah hitungan >= 6, login benar pun 429. Hanya reset admin yang menghapus hitungan. |
 | `POST /broken/login/unprotected` | Varian broken: tanpa proteksi. Kredensial benar 200 token; salah selalu 401, tidak pernah 429, tanpa state. Body rusak 400. |
 | `POST /broken/login/accepts-invalid` | Varian broken: username `demo` dengan password apa pun dijawab 200 token (kredensial salah diterima). Username lain 401. Body rusak 400. |
-| `GET /__admin/stats` | Alat dev. 200 `{"login_requests": n, "load_requests": m}`. `login_requests` menghitung setiap POST yang sampai ke handler tiga rute login (termasuk body rusak 400; method selain POST dan body di atas batas default axum tidak dihitung); `load_requests` menghitung `GET /critical` yang terotorisasi. Request stats sendiri tidak dihitung. |
+| `GET /__admin/stats` | Alat dev. 200 `{"login_requests", "load_requests", "action_requests", "verify_requests"}` (semua angka). `login_requests` menghitung setiap POST yang sampai ke handler tiga rute login (termasuk body rusak 400; method selain POST dan body di atas batas default axum tidak dihitung); `load_requests` menghitung `GET /critical` yang terotorisasi; `action_requests` menghitung setiap POST ke tiga rute apply (`/actions/{id}/apply`, `/broken/actions/{id}/apply-racy`, `/idempotent/actions/{id}/apply`), termasuk yang 401; `verify_requests` menghitung setiap `GET /actions/{id}`, termasuk 401. Request stats sendiri tidak dihitung. |
 | `POST /actions/{id}/apply` | Wajib `Authorization` = `Bearer fixture-token`, jika tidak 401. Apply pertama untuk id itu: 200 dan `execution_count` jadi 1. Selanjutnya 409 tanpa menambah counter. Keputusan atomik (lock dipegang selama cek + tambah), jadi N request bersamaan menghasilkan tepat satu 200. |
+| `POST /broken/actions/{id}/apply-racy` | Varian broken (check-then-act) dengan titik sinkronisasi eksplisit. Auth seperti healthy (tanpa header: 401). Bila counter id sudah > 0: 409. Bila counter 0: request mendaftar di gerbang (`tokio::sync::watch` per id) dan menunggu sampai minimal 2 request telah membaca 0 (maks 2 detik), baru menaikkan counter dan menjawab 200 `{"applied": true}`. Client yang benar-benar konkuren: minimal 2 kali 200 dan `execution_count >= 2` secara deterministik (bukan timing keberuntungan). Client sekuensial: gerbang timeout 2 detik, counter tetap 1, sehingga test duplikat MERAH (bukan PASS palsu). Check race harus FAIL `duplicate_side_effect`. |
+| `POST /idempotent/actions/{id}/apply` | Varian healthy idempotent. Auth seperti healthy. Selalu 200 `{"applied": true}` dan counter id menjadi 1 (tepat satu side effect, tidak pernah lebih). Check race dengan N=5 harus PASS `single_side_effect` dengan lima 200 dan delta 1. |
 | `GET /actions/{id}` | Wajib `Authorization`. 200 `{"id": "...", "execution_count": n}`, n awal 0. Id apa pun dibuat otomatis dengan count 0 saat pertama diakses. |
 | `GET /critical` | Wajib `Authorization`. 200 `{"ok": true}` cepat. |
-| `POST /__admin/reset` | Alat dev. Mereset hitungan gagal login, semua counter action, counter load, dan counter `login_requests` ke 0. 200 `{"reset": true}`. |
+| `POST /__admin/reset` | Alat dev. Mereset hitungan gagal login, semua counter action, state gerbang racy, counter load, dan counter `login_requests`, `action_requests`, `verify_requests` ke 0. 200 `{"reset": true}`. |
 | rute lain | 404 JSON `{"error": "not_found"}`. |
 
 Respons selalu JSON dengan body tetap (`{"error": ...}` untuk 400/401/404/409/429; stats berisi angka saja); tidak pernah memantulkan data request. Rute login (ketiganya) dengan body rusak atau bertipe salah dijawab `400 {"error":"bad_request"}`.
@@ -50,6 +52,14 @@ curl -X POST http://127.0.0.1:8080/__admin/reset
 ```
 
 atau restart proses fixture. Reset adalah alat pengembangan: tool `api-toolkit` tidak memanggilnya. Jalankan reset sebelum mengulang check (baseline login berjalan sebelum probe dan butuh hitungan gagal 0; race butuh counter awal 0).
+
+## Varian race (P2)
+
+Ketiga rute apply memakai map counter yang sama, dan verifier tetap `GET /actions/{id}`. Kasus lain dibuat lewat config, tanpa rute baru: counter hilang (`counter_pointer=/nope`), bukan integer (`/id` -> string), delta 0 (id action berbeda dari id verifier), status ambigu (`expected_action_statuses=[200]` pada rute healthy, 409 jadi ambigu), tanpa header auth (401).
+
+Titik sinkronisasi racy: request pertama yang membaca counter 0 tidak menaikkan counter sebelum request kedua juga membaca 0. Karena itu duplikasi tidak bergantung pada kecepatan mesin. Timeout gerbang 2 detik harus lebih kecil daripada `request_timeout_ms` config. Reset menjatuhkan semua gerbang (request yang menunggu dilepas). Setiap run racy butuh id baru atau reset, karena counter > 0 membuat run berikutnya `initial_counter_not_zero`.
+
+Bukti jumlah request: setelah satu run race sehat, `action_requests` = N dan `verify_requests` = 2 (tanpa retry).
 
 ## Varian prelocked (akun sudah terkunci)
 
