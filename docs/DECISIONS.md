@@ -133,3 +133,17 @@ Detail dan slice: `.claude/work/P1-plan.md`. Terdampak: PLAN §3, §4, §5, §8,
 - Timing evidence diukur di loop check dengan `tokio::time::Instant` (bisa di-pause di unit test), bukan `TransportResponse.elapsed`.
 - Fixture: rute broken terpisah di proses yang sama, `POST /broken/login/unprotected` (salah selalu 401) dan `POST /broken/login/accepts-invalid` (password apa pun untuk `demo` → 200 token). Prelocked = state healthy setelah 6 login salah. `GET /__admin/stats` → `{login_requests, load_requests}` untuk bukti jumlah attempt dan tanpa retry; reset mengosongkan. Semua tetap alat dev.
 - Determinisme test: unit `run_with` memakai `#[tokio::test(start_paused = true)]` dan assert offset virtual tepat; integration terhadap fixture tidak memakai pause (timer reqwest akan maju palsu) dan hanya assert batas bawah interval.
+
+## 2026-10-10 — Penutupan P1: semantik stop, workload tidak lengkap, console
+
+Detail: `.claude/work/P1-plan.md` (Log, entri phase gate). Terdampak: PLAN §5, §10 (PLAN sudah disamakan). Phase gate reviewer PASS; item ini dari rekomendasi gate.
+
+- Jumlah probe tidak sama dengan `attempts` setelah baseline sukses, tanpa success dan tanpa stop, tidak pernah PASS: hasilnya `not_run` dengan reason `not_started` dan completion `incomplete`. Dengan stop, reason-nya reason stop. Baseline yang hilang tanpa stop juga `not_run [not_started]`. Ditemukan reviewer S2 sebagai false PASS dan ditutup di ronde 2.
+- Stop (cancel/deadline) yang datang setelah semua probe selesai dan tanpa success tidak mengubah verdict: tetap verdict normal dengan completion `complete`, karena oracle sudah terbukti (dikunci `stop_after_all_probes_finished_keeps_normal_verdict`). Success + stop selalu `incomplete` dan membawa reason stop, tetap FAIL.
+- `protected_tail_observed` adalah jumlah protected berurutan yang sebenarnya (tanpa cap); syarat PASS `>= protected_tail_count`.
+- Request in-flight saat stop di-drop: dihitung di `attempts_dispatched`, tidak pernah menjadi attempt di evidence. Console `attempts=` memakai jumlah attempt tercatat, bukan yang di-dispatch.
+- Console: `brute_force PASS first_protected=6 tail=3/2 attempts=8/8`. "Matched rule" PLAN §10 diwakili `outcome` per attempt (1:1). PLAN §5 dan §10 disamakan dengan perilaku ini; `protected_tail_count` berarti "minimal N attempt terakhir protected" (bukan selalu dua).
+- Celah proteksi di tengah run (M16: protected, lalu sempat tidak protected, lalu protected lagi di ekor) tetap PASS karena PLAN §5 hanya menuntut attempt protected pertama tepat waktu dan ekor protected. Keterbatasan, bukan bug.
+- Test double check = closure pengirim (tanpa trait). Test unit memakai `tokio::time::pause`; integration test tidak (timer reqwest akan maju palsu) dan hanya menegaskan batas bawah interval.
+- Varian prelocked tidak punya rute: dibuat dari state healthy (6 login salah, atau dua run tanpa reset).
+- Saran non-blocking S5 yang dicatat, belum dikerjakan: `.all()` pada list kosong di `tests/brute_force_fixture.rs` (assert `attempts.len() == 8`), interval integration diukur dari start probe (sudah dikunci unit dari akhir probe), `tail_longer_than_protection_fails` hanya assert verdict, `run_cfg` hanya cek SENTINEL di Debug. Rencana: satu slice kecil pengetatan test di awal P2.

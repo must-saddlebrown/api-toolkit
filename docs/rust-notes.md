@@ -63,3 +63,26 @@ Body dibaca potong demi potong dan berhenti saat melewati batas, sehingga body t
 
 ### Test: `#[cfg(test)]`, `#[cfg(unix)]`, tabel kasus, proses nyata
 Unit test inline di `#[cfg(test)] mod tests`; test khusus Unix (direktori read-only) memakai `#[cfg(unix)]`; test tabel memakai `Vec<(&str, fn(&mut Config), &str)>`; test integrasi menjalankan binary nyata lewat `env!("CARGO_BIN_EXE_api-toolkit")` dan `std::process::Command`. Lihat `src/config/validate.rs`, `src/report.rs`, `tests/validate_cli.rs`, `tests/support/cli.rs`.
+
+## Catatan P1 (brute-force check)
+
+### Closure generik yang mengembalikan `Future`
+`run_with` menerima `F: FnMut(Kind) -> Fut` dengan `Fut: Future<Output = ...>`. Production memberi closure yang memanggil `http::send`; test memberi closure skrip. Jadi tidak perlu trait untuk test double. Lihat `src/checks/brute_force.rs` (`run_with`, `run`).
+
+### `tokio::select!` (`biased`), `watch`, `std::future::pending`
+Request berjalan sambil menunggu sinyal stop. `select!` mengambil yang selesai lebih dulu; `biased;` memeriksa stop dulu. Stop dikirim lewat `tokio::sync::watch`; bila pengirim di-drop, `pending()` membuat "tidak pernah stop". Request yang kalah di-drop (dibatalkan). Lihat `run_with`, `wait_stop`, `current_stop`, `src/checks/mod.rs` (`Stop`).
+
+### `#[serde(skip_serializing_if = "Option::is_none")]`
+Field `evidence` tidak muncul di JSON bila `None`, sehingga golden report P0 tetap sama. Lihat `src/report.rs` (`CheckResult`).
+
+### Test dengan waktu virtual: `#[tokio::test(start_paused = true)]`
+Waktu tokio maju otomatis saat semua task menunggu, jadi interval 100 ms tidak membuat test lambat dan hasilnya deterministik. Jangan dipakai di integration test dengan reqwest (timer-nya ikut maju palsu). Lihat tes `run_*` di `src/checks/brute_force.rs`.
+
+### `Rc<RefCell<T>>`, `Pin<Box<dyn Future>>`, `impl FnMut`
+State bersama satu thread untuk mencatat panggilan di test double; `Pin<Box<dyn Future>>` sebagai tipe kembalian closure skrip. Lihat `scripted` di tes `brute_force.rs`.
+
+### `#[track_caller]`, `std::mem::forget`, `slice::windows`
+`#[track_caller]` membuat panic assert menunjuk baris pemanggil (`assert_eval`). `mem::forget` menjaga `watch::Sender` tetap hidup di test. `windows(2)` membandingkan pasangan berurutan (`tests/brute_force_fixture.rs`, cek interval).
+
+### Server TCP mentah di test
+`tokio::net::TcpListener` plus `AsyncReadExt`/`AsyncWriteExt` untuk server skrip yang sengaja menggantung (timeout). Lihat `scripted_server` di `tests/brute_force_fixture.rs`.

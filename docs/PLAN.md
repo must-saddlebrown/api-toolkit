@@ -83,11 +83,11 @@ Credential baseline dan probe harus merujuk akun yang sama. Ini precondition pen
 2. Kirim probe invalid pertama. Harus ditolak normal, bukan sudah protected; attempt ini dihitung sebagai attempt 1.
 3. Lanjutkan probe yang sama secara sequential sampai jumlah attempt yang ditetapkan, dengan interval tetap dan tanpa retry.
 4. Catat outcome setiap attempt: success, normal rejection, protection, unexpected, atau transport error.
-5. Tentukan attempt pertama yang protected dan apakah protection tetap terlihat pada minimal dua attempt terakhir yang berurutan.
+5. Tentukan attempt pertama yang protected dan apakah protection tetap terlihat pada minimal `protected_tail_count` attempt terakhir yang berurutan (config, 1..=attempts-1; contoh config memakai 2).
 
 ### Verdict
 
-PASS: baseline sukses, probe pertama rejected, tidak ada invalid-credential success, proteksi mulai paling lambat `protect_by_attempt`, dan dua attempt terakhir protected. Semua request yang diperlukan harus menghasilkan outcome yang dapat diklasifikasi.
+PASS: baseline sukses, probe pertama rejected, tidak ada invalid-credential success, proteksi mulai paling lambat `protect_by_attempt`, dan `protected_tail_count` attempt terakhir protected. Semua request yang diperlukan harus menghasilkan outcome yang dapat diklasifikasi.
 
 FAIL: invalid credential diterima; atau seluruh probe dapat diklasifikasi tetapi proteksi tidak memenuhi deadline/persistensi policy. Reason membedakan `invalid_credentials_accepted` dan `protection_policy_not_met`.
 
@@ -234,7 +234,7 @@ v0.1 ketiga check wajib dikonfigurasi. Tidak ada skip flags yang memungkinkan co
 
 ## 10. Reporting dan exit code
 
-Console menampilkan satu baris per check: verdict, evidence utama, threshold, dan reason. Contoh healthy fixture: race PASS delta=1; load PASS error_rate=0/p95=120ms; brute_force PASS first_protected=6/tail=2. Angka latency merupakan ilustrasi.
+Console menampilkan satu baris per check: verdict, evidence utama, threshold, dan reason. Contoh healthy fixture: race PASS delta=1; load PASS error_rate=0/p95=120ms; brute_force PASS first_protected=6 tail=3/2 attempts=8/8 (tail = jumlah protected berurutan yang teramati / `protected_tail_count`; attempts = probe yang selesai dan tercatat / direncanakan). Angka latency merupakan ilustrasi.
 
 JSON report memuat report_version=1, run ID, tool version, config hash nonsecret, timestamps UTC, configured workloads/thresholds, counts/timings/status distribution, before/after counter, per-check verdict/reasons, dan completion status. Request body/header values, raw response bodies, token/password, serta resolved secret path/query tidak dipersist.
 
