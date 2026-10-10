@@ -63,3 +63,15 @@ Detail: `.claude/work/P0-plan.md`. Terdampak: PLAN §4, §9. Reviewer PASS.
 - Semua kondisi yang ada di-AND. `status_in` kosong = tidak cocok. Pointer yang menunjuk ke `null` dianggap ada; expected `null` di `json_equals` hanya cocok dengan `null` eksplisit, bukan key yang hilang. Kesetaraan mengikuti serde_json: `1` ≠ `1.0` ≠ `"1"`.
 - Body `None` (tidak ada / bukan JSON / terpotong) dengan kondisi `json_*` yang ada, termasuk container kosong, = tidak cocok (tanpa false PASS). Pointer tidak valid, indeks di luar jangkauan, atau body non-object = tidak cocok, tanpa panic.
 - Pemanggil P1–P3 harus mengirim `None` untuk body non-JSON, terpotong, atau melebihi batas, bukan `Some(Null)`.
+
+## 2026-10-10 — Transport bersama (P0 S6)
+
+Detail: `.claude/work/P0-plan.md`. Terdampak: PLAN §4, §8, §10. Reviewer PASS (plus satu ronde perbaikan).
+
+- Client reqwest 0.13: redirect `Policy::none()`, tanpa `.retry()`, TLS verification aktif, `.no_proxy()` (env `HTTP(S)_PROXY` tidak boleh membelokkan trafik), `pool_max_idle_per_host(0)` (tanpa reuse koneksi, jadi koneksi basi tidak memicu percobaan kedua tersembunyi; longgarkan di P3 bila load butuh pooling). Satu request = satu koneksi. Nilai header ditandai `set_sensitive`.
+- reqwest tanpa fitur dekompresi (hanya `json`, `rustls`), tidak ada `Accept-Encoding`: batas body berlaku pada byte mentah, tidak ada decompression bomb.
+- Body dibaca streaming via `chunk()`; lebih dari `max_body_bytes` = `body_too_large` (tepat di batas diterima). `content_length()` yang diketahui dan melebihi batas ditolak sebelum body dibaca. Tidak ada flag `truncated`: body kosong / bukan JSON = `None`; oversize = error. Pemanggil P1–P3 mengirim `None` ke matcher untuk body non-JSON.
+- `timeout` total mencakup pembacaan body (slow-drip kena timeout). Connect timeout dilaporkan sebagai `timeout`.
+- `TransportErrorCode` (di `src/report.rs`, sebelum S7): `timeout`, `connect_failed`, `tls_failed`, `body_too_large`, `body_read_failed`, `request_invalid`, `other`; snake_case. `tls_failed` belum pernah dihasilkan (reqwest tidak membedakan dari kegagalan connect; jatuh ke `connect_failed`). Tambahkan hanya bila ada sinyal andal. `TransportError` hanya membawa kode: tanpa URL, tanpa teks error reqwest, tanpa `source()`.
+- Method harus huruf besar (ditolak di `validate`; transport juga meng-uppercase sebagai pertahanan). Header `Host`, `Content-Length`, `Transfer-Encoding`, `Connection` ditolak di `validate` (tanpa memandang huruf besar/kecil). `Content-Type` buatan pengguna diizinkan; transport hanya menambah `application/json` bila ada body dan tidak ada `Content-Type` pengguna.
+- Tidak ada test connect-timeout (tidak bisa andal di loopback tanpa alamat non-routable); dicatat dengan komentar `ponytail:`.

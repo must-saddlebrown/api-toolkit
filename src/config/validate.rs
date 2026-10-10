@@ -16,6 +16,9 @@ const MAX_RACE_CONCURRENCY: u32 = 32;
 const MAX_LOAD_REQUESTS: u32 = 1000;
 const MAX_LOAD_CONCURRENCY: u32 = 32;
 
+/// Headers a config may not set: they change how the request is framed.
+const FORBIDDEN_HEADERS: [&str; 4] = ["host", "content-length", "transfer-encoding", "connection"];
+
 /// What a run will cost before it starts (PLAN §8): planned request count and the
 /// waits that cannot be avoided (sleeps between probes, race settle delay).
 /// Worst-case timeout based estimates are not computed here.
@@ -260,6 +263,9 @@ fn check_request(path: &str, r: &RequestSpec) -> Result<(), ConfigError> {
             "is not a valid HTTP method",
         ));
     }
+    if r.method != r.method.to_ascii_uppercase() {
+        return Err(invalid(&format!("{path}.method"), "must be uppercase"));
+    }
     check_path(path, r)?;
 
     if let Some(headers) = &r.headers {
@@ -269,6 +275,16 @@ fn check_request(path: &str, r: &RequestSpec) -> Result<(), ConfigError> {
                 return Err(invalid(
                     &format!("{path}.headers"),
                     "contains an invalid header name",
+                ));
+            }
+            // These would break request framing; the transport owns them.
+            if FORBIDDEN_HEADERS
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(name))
+            {
+                return Err(invalid(
+                    &format!("{path}.headers"),
+                    &format!("header `{name}` is not allowed (it controls request framing)"),
                 ));
             }
             if !seen.insert(name.to_ascii_lowercase()) {
@@ -767,6 +783,36 @@ mod tests {
                 |c| c.load.request.json = Some(serde_json::Value::Null),
                 "load.request.json",
             ),
+            (
+                "lowercase method",
+                |c| c.load.request.method = "get".into(),
+                "load.request.method",
+            ),
+            (
+                "mixed-case method",
+                |c| c.load.request.method = "Post".into(),
+                "load.request.method",
+            ),
+            (
+                "header Host",
+                |c| c.load.request.headers = map(&[("hOsT", "a")]),
+                "load.request.headers",
+            ),
+            (
+                "header Content-Length",
+                |c| c.load.request.headers = map(&[("Content-length", "a")]),
+                "load.request.headers",
+            ),
+            (
+                "header Transfer-Encoding",
+                |c| c.load.request.headers = map(&[("TRANSFER-encoding", "a")]),
+                "load.request.headers",
+            ),
+            (
+                "header Connection",
+                |c| c.load.request.headers = map(&[("connectION", "a")]),
+                "load.request.headers",
+            ),
         ];
         for (name, mutate, want_path) in cases {
             match run(mutate) {
@@ -853,6 +899,9 @@ mod tests {
             ("different headers", |c| {
                 c.load.request.headers = map(&[("Authorization", "a"), ("X-Other", "b")])
             }),
+            ("user content-type", |c| {
+                c.load.request.headers = map(&[("content-TYPE", "application/vnd.x+json")])
+            }),
             ("json object body", |c| {
                 c.load.request.json = Some(serde_json::json!({}))
             }),
@@ -879,6 +928,12 @@ mod tests {
 
         let mut cfg = base();
         cfg.load.request.path = format!("/{{{sentinel}");
+        let msg = validate(&cfg).unwrap_err().to_string();
+        assert!(!msg.contains(sentinel), "{msg}");
+
+        // A forbidden header: the name may appear, the value must not.
+        let mut cfg = base();
+        cfg.load.request.headers = map(&[("Host", sentinel)]);
         let msg = validate(&cfg).unwrap_err().to_string();
         assert!(!msg.contains(sentinel), "{msg}");
     }
