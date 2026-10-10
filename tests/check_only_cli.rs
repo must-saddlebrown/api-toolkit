@@ -769,3 +769,345 @@ async fn unwritable_report_dir_keeps_console_line_and_old_content_exit_2() {
     assert_eq!(names_in(&ro), ["result.json"], "temp file left behind");
     fx.shutdown().await;
 }
+
+// ---------- check --only race (P2 S8) ----------
+
+const RACE_EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/race-only.json");
+const RACE_AUTH: &str = support::fixture::TEST_AUTHORIZATION;
+
+fn race_cfg(base: &str, mutate: impl FnOnce(&mut Value)) -> String {
+    let mut v: Value =
+        serde_json::from_str(&std::fs::read_to_string(RACE_EXAMPLE).unwrap()).unwrap();
+    v["base_url"] = json!(base);
+    v["race"]["settle_ms"] = json!(50);
+    v["race"]["max_dispatch_skew_ms"] = json!(1000); // skew must never decide these cases
+    mutate(&mut v);
+    serde_json::to_string_pretty(&v).unwrap()
+}
+
+fn race_env(id: &str, auth: &str) -> EnvVars {
+    vec![
+        ("TEST_ACTION_ID".to_string(), id.to_string()),
+        ("TEST_AUTHORIZATION".to_string(), auth.to_string()),
+    ]
+}
+
+fn race_job(w: &Work, env: EnvVars) -> Job {
+    let mut j = w.job(env);
+    j.only = Some("race".into());
+    j
+}
+
+async fn stat(fx: &RunningFixture, key: &str) -> u64 {
+    let resp = http(fx, "GET", "/__admin/stats", String::new()).await;
+    let body = resp.split("\r\n\r\n").nth(1).expect("http body");
+    let v: Value = serde_json::from_str(body.trim()).unwrap();
+    v[key].as_u64().unwrap()
+}
+
+/// (action_requests, verify_requests)
+async fn race_stats(fx: &RunningFixture) -> (u64, u64) {
+    (
+        stat(fx, "action_requests").await,
+        stat(fx, "verify_requests").await,
+    )
+}
+
+fn race_entry(rep: &Value) -> &Value {
+    &rep["checks"][0]
+}
+
+/// Partial shape for `--only race`: order race, load, brute_force; the two others excluded.
+fn assert_race_partial(rep: &Value) {
+    assert_eq!(rep["report_version"], 1);
+    assert_eq!(rep["scope"], "partial");
+    let checks = rep["checks"].as_array().unwrap();
+    let names: Vec<&str> = checks
+        .iter()
+        .map(|c| c["check"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["race", "load", "brute_force"]);
+    for (i, n) in [(1, "load"), (2, "brute_force")] {
+        assert_eq!(
+            checks[i],
+            json!({"check": n, "verdict": "not_run", "reasons": ["excluded_by_only"], "completion": "incomplete"}),
+            "excluded entry {n}"
+        );
+    }
+}
+
+fn assert_race(rep: &Value, verdict: &str, reasons: Value, completion: &str) {
+    assert_race_partial(rep);
+    assert_eq!(race_entry(rep)["verdict"], verdict, "report: {rep}");
+    assert_eq!(race_entry(rep)["reasons"], reasons);
+    assert_eq!(race_entry(rep)["completion"], completion);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn race_healthy_is_pass_line_exit_2_partial_report() {
+    let fx = Fixture::start(0).await.unwrap();
+    let w = Work::new(&race_cfg(&fx.base_url(), |_| {}));
+    let run = exec(&race_job(&w, race_env("s8-healthy", RACE_AUTH))).await;
+    assert_eq!(run.code, 2, "stderr: {}", run.stderr);
+    let line = one_line(&run);
+    // Measured skew varies per run; only the stable parts are pinned.
+    assert!(
+        line.starts_with("race PASS delta=1 before=0 after=1 actions=5/5 skew="),
+        "{line}"
+    );
+    assert!(
+        line.ends_with("/1000ms reasons=single_side_effect"),
+        "{line}"
+    );
+    assert!(
+        run.stderr.starts_with("note: partial run (--only race)"),
+        "stderr: {}",
+        run.stderr
+    );
+    let rep = w.report();
+    assert_race(&rep, "pass", json!(["single_side_effect"]), "complete");
+    assert_eq!(rep["completion"], "complete");
+    let ev = &race_entry(&rep)["evidence"];
+    assert_eq!(ev["counter_before"], 0);
+    assert_eq!(ev["counter_after"], 1);
+    assert_eq!(ev["delta"], 1);
+    assert_eq!(ev["actions"].as_array().unwrap().len(), 5);
+    // No retry: 1 verifier before + 5 actions + 1 verifier after.
+    assert_eq!(race_stats(&fx).await, (5, 2));
+    assert_eq!(w.file_names(), ["c.json", "result.json"]);
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn race_racy_variant_is_fail_exit_1_duplicate_side_effect() {
+    let fx = Fixture::start(0).await.unwrap();
+    let w = Work::new(&race_cfg(&fx.base_url(), |v| {
+        v["race"]["action_request"]["path"] = json!("/broken/actions/{id}/apply-racy");
+        v["limits"]["request_timeout_ms"] = json!(5000); // > the 2 s racy gate
+    }));
+    let run = exec(&race_job(&w, race_env("s8-racy", RACE_AUTH))).await;
+    assert_eq!(run.code, 1, "stderr: {}", run.stderr);
+    let line = one_line(&run);
+    assert!(line.starts_with("race FAIL"), "{line}");
+    assert!(line.ends_with("reasons=duplicate_side_effect"), "{line}");
+    let rep = w.report();
+    assert_race(&rep, "fail", json!(["duplicate_side_effect"]), "complete");
+    assert!(race_entry(&rep)["evidence"]["delta"].as_u64().unwrap() >= 2);
+    assert_eq!(race_stats(&fx).await, (5, 2));
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn race_used_resource_second_run_is_inconclusive_with_no_action() {
+    let fx = Fixture::start(0).await.unwrap();
+    let w = Work::new(&race_cfg(&fx.base_url(), |_| {}));
+    let job = race_job(&w, race_env("s8-reuse", RACE_AUTH));
+    let first = exec(&job).await;
+    assert_eq!(first.code, 2, "stderr: {}", first.stderr);
+    assert!(one_line(&first).starts_with("race PASS"));
+    let (a0, v0) = race_stats(&fx).await;
+    assert_eq!((a0, v0), (5, 2));
+
+    let second = exec(&job).await;
+    assert_eq!(second.code, 2, "stderr: {}", second.stderr);
+    assert!(one_line(&second).starts_with("race INCONCLUSIVE"));
+    let rep = w.report();
+    assert_race(
+        &rep,
+        "inconclusive",
+        json!(["initial_counter_not_zero"]),
+        "complete",
+    );
+    assert_eq!(race_entry(&rep)["evidence"]["counter_before"], 1);
+    let (a1, v1) = race_stats(&fx).await;
+    assert_eq!((a1 - a0, v1 - v0), (0, 1), "no action, one verifier");
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn race_rejected_inputs_exit_2_with_zero_connections_and_out_untouched() {
+    let fx = Fixture::start(0).await.unwrap();
+    let base = fx.base_url();
+    let ok_env = || race_env("s8-rej", RACE_AUTH);
+    let cases: Vec<(&str, Option<&str>, String, EnvVars, &str)> = vec![
+        (
+            "202 in expected_action_statuses",
+            Some("race"),
+            race_cfg(&base, |v| {
+                v["race"]["expected_action_statuses"] = json!([200, 202, 409])
+            }),
+            ok_env(),
+            "expected_action_statuses",
+        ),
+        (
+            "both env missing",
+            Some("race"),
+            race_cfg(&base, |_| {}),
+            vec![],
+            "TEST_ACTION_ID",
+        ),
+        (
+            "TEST_AUTHORIZATION missing",
+            Some("race"),
+            race_cfg(&base, |_| {}),
+            vec![("TEST_ACTION_ID".into(), "s8-rej".into())],
+            "TEST_AUTHORIZATION",
+        ),
+        (
+            "TEST_ACTION_ID missing",
+            Some("race"),
+            race_cfg(&base, |_| {}),
+            vec![("TEST_AUTHORIZATION".into(), RACE_AUTH.into())],
+            "TEST_ACTION_ID",
+        ),
+        (
+            "--only load",
+            Some("load"),
+            race_cfg(&base, |_| {}),
+            ok_env(),
+            "not available yet",
+        ),
+    ];
+    for existing in [false, true] {
+        for (name, only, cfg, env, needle) in &cases {
+            let w = Work::new(cfg);
+            if existing {
+                std::fs::write(&w.out, "OLD").unwrap();
+            }
+            let mut job = w.job(env.clone());
+            job.only = only.map(String::from);
+            let run = exec(&job).await;
+            let ctx = format!("case `{name}` existing_out={existing}");
+            assert_eq!(run.code, 2, "{ctx}: stderr {}", run.stderr);
+            assert!(run.stderr.contains(needle), "{ctx}: stderr {}", run.stderr);
+            assert!(run.stdout.is_empty(), "{ctx}: stdout {}", run.stdout);
+            if existing {
+                assert_eq!(std::fs::read_to_string(&w.out).unwrap(), "OLD", "{ctx}");
+            } else {
+                assert!(!w.out.exists(), "{ctx}: out was created");
+            }
+            assert_eq!(race_stats(&fx).await, (0, 0), "{ctx}: touched the fixture");
+            assert_eq!(login_requests(&fx).await, 0, "{ctx}");
+        }
+    }
+    fx.shutdown().await;
+}
+
+/// Raw listener that records the bytes of every request and never answers.
+struct Recorder {
+    port: u16,
+    wire: Arc<std::sync::Mutex<Vec<u8>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Recorder {
+    async fn start() -> Recorder {
+        use tokio::io::AsyncReadExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let wire = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let w = wire.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let w = w.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        w.lock().unwrap().extend_from_slice(&buf[..n]);
+                    }
+                });
+            }
+        });
+        Recorder { port, wire, task }
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.wire.lock().unwrap()).into_owned()
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn race_sentinel_is_on_the_wire_but_not_in_cli_output() {
+    let rec = Recorder::start().await;
+    let w = Work::new(&race_cfg(&format!("http://127.0.0.1:{}", rec.port), |v| {
+        v["limits"]["request_timeout_ms"] = json!(500);
+        for k in ["action_request", "verify_request"] {
+            v["race"][k]["headers"]["X-Sentinel"] = json!("${ENV:TEST_ACTION_ID}");
+        }
+    }));
+    // exec() also searches stdout, stderr and the report for every env value (>= 6 chars).
+    let run = exec(&race_job(&w, race_env(SENTINEL, SENTINEL))).await;
+    // The server never answers: verifier before times out, a non-PASS result.
+    assert_eq!(run.code, 2, "stderr: {}", run.stderr);
+    let line = one_line(&run);
+    assert!(line.starts_with("race ERROR"), "{line}");
+    assert!(line.contains("verifier_failed"), "{line}");
+    let rep = w.report();
+    assert_race(
+        &rep,
+        "error",
+        json!(["verifier_failed", "transport_error"]),
+        "complete",
+    );
+    // Positive control: the sentinel really was sent (path, Authorization, extra header).
+    let wire = rec.text().to_ascii_lowercase();
+    let s = SENTINEL.to_ascii_lowercase();
+    assert!(wire.contains(&format!("get /actions/{s} ")), "wire: {wire}");
+    assert!(
+        wire.contains(&format!("authorization: {s}")),
+        "wire: {wire}"
+    );
+    assert!(wire.contains(&format!("x-sentinel: {s}")), "wire: {wire}");
+    // Negative: nowhere in console output or report (checked again explicitly).
+    let report_text = std::fs::read_to_string(&w.out).unwrap();
+    for hay in [&run.stdout, &run.stderr, &report_text] {
+        assert!(!hay.contains(SENTINEL), "sentinel leaked: {hay}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn race_sentinel_id_against_fixture_does_not_leak_on_pass_or_fail() {
+    for (path, want_code) in [
+        ("/actions/{id}/apply", 2),
+        ("/broken/actions/{id}/apply-racy", 1),
+    ] {
+        let fx = Fixture::start(0).await.unwrap();
+        let w = Work::new(&race_cfg(&fx.base_url(), |v| {
+            v["race"]["action_request"]["path"] = json!(path);
+            v["limits"]["request_timeout_ms"] = json!(5000);
+        }));
+        let run = exec(&race_job(&w, race_env(SENTINEL, RACE_AUTH))).await;
+        assert_eq!(run.code, want_code, "{path}: stderr {}", run.stderr);
+        // A real verdict proves the sentinel id was used end to end.
+        let rep = w.report();
+        assert_eq!(race_entry(&rep)["evidence"]["counter_before"], 0, "{path}");
+        let report_text = std::fs::read_to_string(&w.out).unwrap();
+        for hay in [&run.stdout, &run.stderr, &report_text] {
+            assert!(
+                !hay.contains(SENTINEL) && !hay.contains(RACE_AUTH),
+                "{path}: {hay}"
+            );
+        }
+        fx.shutdown().await;
+    }
+}
+
+#[test]
+fn validate_only_race_example_exits_0() {
+    let r = support::cli::run_bin(
+        &["validate", "--config", RACE_EXAMPLE, "--only", "race"],
+        &[
+            ("TEST_ACTION_ID", "act-1"),
+            ("TEST_AUTHORIZATION", RACE_AUTH),
+        ],
+    );
+    assert_eq!(r.code, 0, "stderr: {} stdout: {}", r.stderr, r.stdout);
+}
