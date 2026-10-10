@@ -103,3 +103,35 @@ Cancel dan deadline berlomba dengan check. `tokio::pin!` mem-pin future agar bis
 
 ### Test end-to-end dengan binary nyata
 `env!("CARGO_BIN_EXE_api-toolkit")` memberi path binary; `Command::env_clear().envs(..)` membuat env hanya berlaku untuk proses anak; `tokio::task::spawn_blocking` memanggil proses dari test async; `impl Drop` pada struct pembantu (`Hang`) membatalkan task server; `#[cfg(unix)]` untuk `kill -INT`. Lihat `tests/check_only_cli.rs`.
+
+## Catatan P2 (race check)
+
+### `#[serde(untagged)]` pada enum
+`Evidence` adalah enum `{ BruteForce, Race }`. Dengan `#[serde(untagged)]`, JSON hanya berisi isi varian tanpa nama varian, jadi report brute_force tetap identik dengan golden P0. Aman karena tipenya hanya di-serialize, tidak pernah dibaca balik. Lihat `src/report.rs` (`Evidence`).
+
+### Future itu malas (lazy) dan `join_all`
+Memanggil fungsi `async` hanya membuat future; tidak ada byte terkirim sampai future itu di-poll. `futures_util::future::join_all` mem-poll N future sekaligus dalam satu task, jadi N action dilepas bersamaan tanpa `spawn` dan tanpa `Barrier`. Tiap future mencatat waktu dispatch pada poll pertama. Keterbatasannya (skew hanya mikrodetik) ada di komentar `ponytail:` dan jalur upgradenya `spawn` + `tokio::sync::Barrier`. Lihat `src/checks/race.rs` (`run_with`).
+
+### `Fn` versus `FnMut`
+Closure pengirim di `race::run_with` bertipe `Fn(Kind) -> Fut` karena N future meminjam closure yang sama secara bersamaan (hanya baca). `brute_force::run_with` memakai `FnMut` karena dipanggil berurutan dan boleh mengubah state. Lihat `src/checks/race.rs`, `src/checks/brute_force.rs`.
+
+### Blok berlabel `'run: { ... break 'run; }`
+Alur "before -> action -> settle -> after" punya banyak jalan keluar dini (stop, counter bukan 0). Blok berlabel memungkinkan `break 'run` keluar dari seluruh rangkaian tanpa fungsi bantu tambahan. Lihat `run_with`.
+
+### `tokio::sync::watch` dan `select!`
+Stop (cancel/deadline) dikirim lewat `watch`; tiap future memegang `Receiver::clone` dan berlomba dengan request memakai `select! { biased; .. }`. Di fixture, `watch::Sender::send_modify` dan `Receiver::wait_for` dipakai sebagai gerbang sinkronisasi eksplisit untuk varian racy: request yang membaca counter 0 menunggu sampai minimal dua request membaca 0 (timeout 2 detik). Lihat `src/checks/mod.rs` (`current_stop`, `wait_stop`) dan `tests/support/fixture.rs` (`apply_racy`).
+
+### Melepas `MutexGuard` sebelum `.await`
+Guard kunci tidak boleh ditahan melintasi `.await` (risiko deadlock dan future tidak `Send`). Blok `{ ... }` mengembalikan hanya data yang dibutuhkan sehingga guard dilepas sebelum menunggu. Lihat `apply_racy` di `tests/support/fixture.rs`.
+
+### Mengurai nilai JSON dengan aman
+`Value::pointer(..).and_then(Value::as_u64)` hanya menerima bilangan bulat non-negatif; `"1"`, `1.5`, `true`, `null`, dan `-1` jatuh ke `counter_invalid`. `u128::div_ceil` membulatkan skew ke atas dalam milidetik, `Option::is_some_and` dan `matches!(x, Ok(r) if ..)` (pola dengan guard) mempersingkat pengecekan. `let ... else` memberi jalan keluar dini yang rapi. Lihat `src/checks/race.rs` (`read_verifier`, `skew_ms`, `evaluate`).
+
+### Visibilitas `pub(crate)`
+`current_stop` dan `wait_stop` dipakai bersama check brute_force dan race tetapi tidak perlu terlihat di luar crate. Lihat `src/checks/mod.rs`.
+
+### Enum dengan data per varian di CLI
+`Selected` membawa varian check yang sedang dijalankan; `match &prepared.selected` memilih check dan `Option::take_if` memindahkan hasil ke slot yang sesuai saat menyusun report partial. Lihat `src/cli.rs`.
+
+### Alat bantu test
+`Cell`/`RefCell` untuk state bersama di test satu thread, `Arc<AtomicUsize>` untuk menghitung koneksi, `TcpStream::peek` untuk membedakan GET dari POST tanpa mengonsumsi byte, `Child::kill`/`wait` untuk membersihkan proses anak sebelum `panic!`, dan `JoinHandle::abort` di `Drop` untuk menutup listener. Test dengan `tokio::time::pause` memberi clock virtual untuk unit test; integration test tidak memakainya. Lihat `src/checks/race.rs` (`mod tests`), `src/cli.rs` (`mod tests`), `tests/check_only_cli.rs`, `tests/race_fixture.rs`.

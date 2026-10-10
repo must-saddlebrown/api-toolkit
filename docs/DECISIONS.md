@@ -189,3 +189,14 @@ Detail dan slice: `.claude/work/P2-plan.md`. Terdampak: PLAN §3, §4, §6, §8,
 - Console: `race PASS delta=1 before=0 after=1 actions=5/5 skew=0/100ms reasons=single_side_effect` (`none` untuk null).
 - Fixture: `POST /broken/actions/{id}/apply-racy` dengan titik sinkronisasi eksplisit: request yang membaca counter 0 menunggu (gerbang `tokio::sync::watch` per id, timeout 2 s) sampai minimal 2 request membaca 0, baru menaikkan counter. Hasilnya delta ≥ 2 deterministik bila client benar-benar konkuren; bila tidak, gerbang timeout dan test merah, bukan PASS. `POST /idempotent/actions/{id}/apply` selalu 200 dengan satu increment. Verifier tetap `GET /actions/{id}` (map bersama). `/__admin/stats` menambah `action_requests` dan `verify_requests`; reset mengosongkan semua state baru. Kasus missing/noninteger/delta 0 dibuat lewat config, tanpa rute baru.
 - CLI: `--only race` aktif di `check` dan `validate`; `--only load` tetap ditolak sampai P3. `Prepared` memegang `enum Selected { BruteForce, Race }`; jalur cancel/deadline/report/exit `--only` tidak berubah. Contoh config `examples/race-only.json` (7 request, 250 ms fixed waits).
+
+## 2026-10-10 — Penutupan P2
+
+Detail: `.claude/work/P2-plan.md` (Log, entri phase gate). Terdampak: PLAN §3 (daftar check yang ditolak `--only` kini hanya `load`). Phase gate reviewer PASS (P2-AC1–AC25, 303 test).
+
+- Pengaman tambahan di `evaluate`: action tercatat tetapi skew kosong → INCONCLUSIVE `dispatch_incomplete`, tidak pernah PASS. Alasan: bila `run_with` salah menyambung nilai skew, hasilnya tidak boleh menjadi false PASS (temuan review S3, dikunci test S4).
+- Pengetatan test P1 dan `--only` dikerjakan di P2 S1. Dua test deadline unit (race dan brute_force) dan satu test deadline di `tests/check_only_cli.rs` melonggarkan assert jumlah koneksi menjadi `<= 1` / dihapus karena flaky di bawah beban berat; jaminan yang dipertahankan: exit 2, `not_run [deadline_exceeded]`, `incomplete`, tidak ada action terkirim. Pelajaran sama dengan `check --only`: test yang butuh "request sedang berjalan" menunggu kondisi teramati, bukan timing.
+- `check_help_has_required_phrases` kini mengunci `Available: brute_force, race`.
+- Keterbatasan yang diterima: dispatch satu task (skew mikrodetik), status pending lewat body tidak terdeteksi, action yang di-drop saat stop mungkin tetap dieksekusi server (resource butuh id baru/reset).
+- Tafsiran yang bisa dibalik: transport error pada request action → INCONCLUSIVE `action_outcome_ambiguous` + `transport_error` (bukan ERROR). Membaliknya cukup mengubah satu baris di `evaluate` dan baris R15 di matrix handoff.
+- Saran test yang belum dikerjakan, tidak memblokir: satu test `evaluate` untuk kombinasi delta>1 + transport error pada action (AC16), tambahan assert di test healthy (angka skew di console sama dengan `evidence.dispatch_skew_ms`), dan `planned requests: 7` di test `validate` binary nyata.
