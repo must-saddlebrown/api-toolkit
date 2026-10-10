@@ -187,6 +187,10 @@ fn check_race(r: &Race) -> Result<(), ConfigError> {
         return Err(invalid("race.expected_delta", "must be 1"));
     }
     check_range("race.concurrency", r.concurrency, MAX_RACE_CONCURRENCY)?;
+    // One request can only ever produce delta 1, so a "race" with it proves nothing.
+    if r.concurrency < 2 {
+        return Err(invalid("race.concurrency", "must be at least 2"));
+    }
     check_statuses("race.expected_action_statuses", &r.expected_action_statuses)?;
     check_positive("race.max_dispatch_skew_ms", r.max_dispatch_skew_ms)?;
     check_positive("race.settle_ms", r.settle_ms)
@@ -419,6 +423,7 @@ mod tests {
             ),
             ("race 33", |c| c.race.concurrency = 33, "race.concurrency"),
             ("race 0", |c| c.race.concurrency = 0, "race.concurrency"),
+            ("race 1", |c| c.race.concurrency = 1, "race.concurrency"),
             ("load 1001", |c| c.load.requests = 1001, "load.requests"),
             ("load 0", |c| c.load.requests = 0, "load.requests"),
             (
@@ -838,7 +843,7 @@ mod tests {
                 c.brute_force.protected_tail_count = 1;
             }),
             ("race 32", |c| c.race.concurrency = 32),
-            ("race 1", |c| c.race.concurrency = 1),
+            ("race 2", |c| c.race.concurrency = 2),
             ("load 1000", |c| c.load.requests = 1000),
             ("load 1", |c| c.load.requests = 1),
             ("load conc 32", |c| c.load.concurrency = 32),

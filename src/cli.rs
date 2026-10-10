@@ -93,6 +93,11 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 fn read_config(path: &Path) -> anyhow::Result<String> {
     let ctx = || format!("cannot read config file `{}`", path.display());
+    // Refuse FIFOs, devices and directories up front: reading them can block forever.
+    let meta = std::fs::metadata(path).with_context(ctx)?;
+    if !meta.is_file() {
+        anyhow::bail!("config path `{}` is not a regular file", path.display());
+    }
     let file = std::fs::File::open(path).with_context(ctx)?;
     let mut bytes = Vec::new();
     file.take(MAX_CONFIG_BYTES + 1)

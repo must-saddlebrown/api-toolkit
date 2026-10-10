@@ -109,3 +109,11 @@ Detail: `.claude/work/P0-plan.md`. Terdampak: PLAN §3, §9, §10. Reviewer PASS
 - Placeholder `${ENV:NAME}` utuh di posisi yang TIDAK di-resolve (base_url, path, kunci/nilai string `json_equals`, pointer `json_exists`, `counter_pointer`, semua matcher) ditolak (`ConfigError::Invalid`, hanya path field) agar tidak diam-diam menjadi literal. Literal yang kebetulan mirip placeholder di `json_equals` ikut ditolak; jalan keluarnya bentuk awalan/akhiran (`x${ENV:ok}`) yang tetap literal sesuai PLAN §9.
 - Catatan: jalur error untuk key `json_equals` mencantumkan key itu (teks config milik pengguna, bukan nilai env).
 - Belum (carry-over ke phase gate): placeholder di key `query` dan key objek body json masih diam-diam literal; `--config` berupa FIFO bisa menggantung (cukup cek `is_file`); tes batas tepat 1 MiB.
+
+## 2026-10-10 — Penutupan P0: race.concurrency minimal 2 dan config harus file biasa
+
+Detail: `.claude/work/P0-plan.md` (Log, entri phase gate). Terdampak: PLAN §6, §8. Phase gate reviewer PASS; item ini dari rekomendasi gate.
+
+- `race.concurrency` harus ≥ 2 (batas atas tetap 32, PLAN §8). Satu request hanya bisa menghasilkan delta 1, sehingga "race" dengan concurrency 1 bisa PASS tanpa membuktikan apa pun. Ditolak di `validate` dengan path `race.concurrency`; boundary test 1 ditolak dan 2 diterima.
+- `--config` harus file biasa: FIFO, device, atau direktori ditolak di awal (`metadata().is_file()`), karena membacanya bisa menggantung selamanya.
+- Carry-over yang sengaja belum dikerjakan (tidak menimbulkan false PASS; tercatat di STATUS Known limitations): placeholder di key `query`/key objek body JSON masih literal; jalur error key `json_equals`; cancel sebelum ada check exit 2 (P4); `fail` + reason pass exit 1; `tls_failed` belum dihasilkan.
