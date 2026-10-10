@@ -54,3 +54,12 @@ Detail: `.claude/work/P0-plan.md`. Terdampak: PLAN §8, §9. Reviewer PASS.
 - Nilai header hasil resolve yang memuat CR, LF, atau NUL ditolak di `resolve` (nama field saja). Aturan persis itu, tidak lebih lebar.
 - URL: `percent-encoding 2.3` jadi dependency langsung (sudah ada di tree via reqwest); parsing lewat `reqwest::Url`. Semua karakter selain `A-Za-z0-9-._~` di-encode. Segmen `.`/`..` ditolak (`DotSegment`); `%` di nilai di-encode (`%2e%2e` jadi `%252e%252e`). Hasil dicek ulang: scheme, host, port, jumlah segmen sama dengan base. Nilai path param kosong dan key query kosong ditolak.
 - `resolve` tidak memanggil `validate`; S9 wajib memanggil `validate` dulu. Saran yang belum diambil: `BadPlaceholder` dan `MissingEnv` dilaporkan terpisah (dua run); `validate` bisa memberi peringatan untuk placeholder yang tampak typo (`${env:x}`).
+
+## 2026-10-10 — Semantik matcher (P0 S5)
+
+Detail: `.claude/work/P0-plan.md`. Terdampak: PLAN §4, §9. Reviewer PASS.
+
+- `impl MatcherSpec { matches(status, Option<&Value>) -> bool }` di `src/matchers.rs`; tanpa tipe wrapper dan tanpa trait. Hanya mengembalikan bool, tidak pernah mencetak isi body.
+- Semua kondisi yang ada di-AND. `status_in` kosong = tidak cocok. Pointer yang menunjuk ke `null` dianggap ada; expected `null` di `json_equals` hanya cocok dengan `null` eksplisit, bukan key yang hilang. Kesetaraan mengikuti serde_json: `1` ≠ `1.0` ≠ `"1"`.
+- Body `None` (tidak ada / bukan JSON / terpotong) dengan kondisi `json_*` yang ada, termasuk container kosong, = tidak cocok (tanpa false PASS). Pointer tidak valid, indeks di luar jangkauan, atau body non-object = tidak cocok, tanpa panic.
+- Pemanggil P1–P3 harus mengirim `None` untuk body non-JSON, terpotong, atau melebihi batas, bukan `Some(Null)`.
