@@ -84,3 +84,33 @@ echo $?    # run parsial tidak pernah exit 0: PASS = 2, FAIL = 1
 ```
 
 Varian broken: salin `examples/load-only.json`, ubah `load.request.path` ke `/broken/critical/slow` (dengan `max_p95_ms` 100), `/broken/critical/flaky` (FAIL `error_rate_exceeded`, 10 dari 100), atau `/broken/critical/hang` (dengan `limits.request_timeout_ms` 500 dan `requests` 20; dua request timeout). Reset di antara run. Cek jumlah request dengan `GET /__admin/stats`.
+
+## Suite lengkap (P4)
+
+`check` tanpa `--only` menjalankan ketiga check berurutan race → load → brute_force (lockout terakhir), satu deadline untuk seluruh suite. Check berikutnya tetap jalan walau check sebelumnya FAIL/ERROR. Exit 0 hanya bila ketiganya PASS dan complete.
+
+Env yang dibutuhkan (lima nama, nilai dev publik dari bagian "Env var" di atas): `LOGIN_USER`, `LOGIN_VALID_PASSWORD`, `LOGIN_INVALID_PASSWORD`, `TEST_ACTION_ID`, `TEST_AUTHORIZATION`.
+
+Reset fixture sebelum TIAP suite. Tanpa reset, race INCONCLUSIVE `initial_counter_not_zero` dan brute_force INCONCLUSIVE `account_already_locked` (exit 2); counter flaky juga bergeser.
+
+```sh
+cargo run --example fixture &              # terminal lain juga boleh
+curl -X POST http://127.0.0.1:8080/__admin/reset
+cargo run -- validate --config examples/core-checks.json
+cargo run -- check --config examples/core-checks.json --out /tmp/suite-report.json
+echo $?    # healthy: 0
+
+curl -X POST http://127.0.0.1:8080/__admin/reset
+cargo run -- check --config examples/core-checks-broken.json --out /tmp/suite-broken.json
+echo $?    # tiga FAIL: 1
+```
+
+`examples/core-checks-broken.json` identik dengan `core-checks.json` (env sama, tanpa nilai rahasia) kecuali tiga path:
+
+| Check | Path rusak | Hasil |
+| --- | --- | --- |
+| race | `/broken/actions/{id}/apply-racy` | FAIL `duplicate_side_effect` |
+| load | `/broken/critical/flaky` | FAIL `error_rate_exceeded` (10 dari 100, berbasis counter) |
+| brute_force | `/broken/login/unprotected` | FAIL `protection_policy_not_met` |
+
+Varian lain (ganti path di salinan config): login `/broken/login/accepts-invalid` → FAIL `invalid_credentials_accepted`; load `/broken/critical/slow` dengan `max_p95_ms` 100 → FAIL `latency_exceeded`.

@@ -560,6 +560,37 @@ mod tests {
     }
 
     #[test]
+    fn validate_broken_example_ok_and_matches_healthy_env() {
+        let broken = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/core-checks-broken.json"
+        );
+        let (code, out, err) = validate(broken, &full_env);
+        assert_eq!(code, 0, "stderr: {err}");
+        assert!(out.contains("planned requests: 117"), "{out}");
+        assert!(out.contains("fixed waits: 950 ms"), "{out}");
+        for name in ENV_NAMES {
+            assert!(out.contains(name), "missing {name} in {out}");
+        }
+        assert_no_sentinel(&out, &err);
+        // Same env placeholders as the healthy example, and no literal secret values.
+        let placeholders = |text: &str| -> Vec<String> {
+            text.split("${ENV:")
+                .skip(1)
+                .map(|s| s[..s.find('}').unwrap()].to_string())
+                .collect()
+        };
+        let text = std::fs::read_to_string(broken).unwrap();
+        assert_eq!(placeholders(&text), placeholders(&example_text()));
+        for literal in ["demo-pass", "wrong-pass", "fixture-token", "act-1"] {
+            assert!(
+                !text.contains(literal),
+                "literal {literal} in broken example"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_field_is_2() {
         let text = example_text().replacen("{", "{\"bogus\": 1,", 1);
         let (_d, path) = temp_config(&text);

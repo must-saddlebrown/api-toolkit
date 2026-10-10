@@ -1,0 +1,57 @@
+{
+  "config_version": 1,
+  "base_url": "http://127.0.0.1:8080",
+  "limits": {
+    "request_timeout_ms": 5000,
+    "suite_deadline_ms": 120000,
+    "response_body_limit_bytes": 1048576
+  },
+  "brute_force": {
+    "baseline_request": {
+      "method": "POST", "path": "/broken/login/unprotected",
+      "json": {"username": "${ENV:LOGIN_USER}", "password": "${ENV:LOGIN_VALID_PASSWORD}"}
+    },
+    "probe_request": {
+      "method": "POST", "path": "/broken/login/unprotected",
+      "json": {"username": "${ENV:LOGIN_USER}", "password": "${ENV:LOGIN_INVALID_PASSWORD}"}
+    },
+    "success_match": {"status_in": [200], "json_exists": ["/access_token"]},
+    "rejection_match": {"status_in": [401]},
+    "protection_match": {"status_in": [429]},
+    "attempts": 8,
+    "interval_ms": 100,
+    "protect_by_attempt": 6,
+    "protected_tail_count": 2
+  },
+  "race": {
+    "action_request": {
+      "method": "POST", "path": "/broken/actions/{id}/apply-racy",
+      "path_params": {"id": "${ENV:TEST_ACTION_ID}"},
+      "headers": {"Authorization": "${ENV:TEST_AUTHORIZATION}"}
+    },
+    "verify_request": {
+      "method": "GET", "path": "/actions/{id}",
+      "path_params": {"id": "${ENV:TEST_ACTION_ID}"},
+      "headers": {"Authorization": "${ENV:TEST_AUTHORIZATION}"}
+    },
+    "verify_match": {"status_in": [200]},
+    "counter_pointer": "/execution_count",
+    "initial_counter": 0,
+    "expected_delta": 1,
+    "concurrency": 5,
+    "expected_action_statuses": [200, 409],
+    "max_dispatch_skew_ms": 100,
+    "settle_ms": 250
+  },
+  "load": {
+    "request": {
+      "method": "GET", "path": "/broken/critical/flaky",
+      "headers": {"Authorization": "${ENV:TEST_AUTHORIZATION}"}
+    },
+    "response_match": {"status_in": [200]},
+    "requests": 100,
+    "concurrency": 10,
+    "max_error_rate": 0.01,
+    "max_p95_ms": 500
+  }
+}
