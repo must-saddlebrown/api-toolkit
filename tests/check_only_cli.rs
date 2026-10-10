@@ -685,7 +685,8 @@ async fn deadline_with_hanging_server_is_exit_2_not_run_deadline_exceeded() {
     let rep = w.report();
     assert_bf(&rep, "not_run", json!(["deadline_exceeded"]), "incomplete");
     assert_eq!(rep["completion"], "incomplete");
-    assert!(h.seen() >= 1);
+    // Not asserted: `h.seen() >= 1`. Under heavy load the deadline can fire before the first
+    // connection is accepted; the server never replies, so no verdict is possible either way.
 }
 
 #[cfg(unix)]

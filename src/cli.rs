@@ -893,7 +893,7 @@ mod tests {
         for want in [
             "--only",
             "required until P4",
-            "Available: brute_force",
+            "Available: brute_force, race",
             "never exits 0",
             "exit 1 = FAIL",
             "2 = PASS or any other result",
