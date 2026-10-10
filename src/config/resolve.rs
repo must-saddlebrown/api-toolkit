@@ -9,7 +9,7 @@ use std::fmt;
 
 use serde_json::Value;
 
-use super::{Config, ConfigError, RequestSpec};
+use super::{Config, ConfigError, MatcherSpec, RequestSpec};
 use crate::http::request::{ResolvedRequest, build_url};
 
 /// A string that must never be printed. `Debug` is redacted on purpose; there is no
@@ -41,6 +41,73 @@ pub struct ResolvedRequests {
     pub action: ResolvedRequest,
     pub verify: ResolvedRequest,
     pub load: ResolvedRequest,
+    /// Sorted, de-duplicated NAMES of every env var `resolve` looked up (never values).
+    pub env_names: Vec<String>,
+}
+
+/// Whole-string placeholder shape, same rule as `parse_placeholder`.
+fn looks_like_placeholder(s: &str) -> bool {
+    s.starts_with("${ENV:") && s.ends_with('}')
+}
+
+fn reject_placeholder(path: &str, s: &str) -> Result<(), ConfigError> {
+    if looks_like_placeholder(s) {
+        return Err(ConfigError::Invalid {
+            path: path.to_string(),
+            rule: "${ENV:NAME} is only substituted in path_params, query, headers and json body; \
+                   it is not allowed here"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn reject_in_json(path: &str, v: &Value) -> Result<(), ConfigError> {
+    match v {
+        Value::String(s) => reject_placeholder(path, s),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .try_for_each(|(i, v)| reject_in_json(&format!("{path}[{i}]"), v)),
+        Value::Object(map) => map
+            .iter()
+            .try_for_each(|(k, v)| reject_in_json(&format!("{path}.{k}"), v)),
+        _ => Ok(()),
+    }
+}
+
+fn reject_in_matcher(path: &str, m: &MatcherSpec) -> Result<(), ConfigError> {
+    for (k, v) in m.json_equals.iter().flatten() {
+        // ponytail: the key (a pointer) is checked by name only; the path never prints it.
+        reject_placeholder(&format!("{path}.json_equals"), k)?;
+        reject_in_json(&format!("{path}.json_equals.{k}"), v)?;
+    }
+    for (i, p) in m.json_exists.iter().flatten().enumerate() {
+        reject_placeholder(&format!("{path}.json_exists[{i}]"), p)?;
+    }
+    Ok(())
+}
+
+/// Reject whole-string placeholders where `resolve` never substitutes: a silent literal
+/// would let a check pass or fail against the wrong expectation.
+fn reject_unresolved_placeholders(cfg: &Config) -> Result<(), ConfigError> {
+    reject_placeholder("base_url", &cfg.base_url)?;
+    let bf = &cfg.brute_force;
+    for (f, r) in [
+        ("brute_force.baseline_request", &bf.baseline_request),
+        ("brute_force.probe_request", &bf.probe_request),
+        ("race.action_request", &cfg.race.action_request),
+        ("race.verify_request", &cfg.race.verify_request),
+        ("load.request", &cfg.load.request),
+    ] {
+        reject_placeholder(&format!("{f}.path"), &r.path)?;
+    }
+    reject_in_matcher("brute_force.success_match", &bf.success_match)?;
+    reject_in_matcher("brute_force.rejection_match", &bf.rejection_match)?;
+    reject_in_matcher("brute_force.protection_match", &bf.protection_match)?;
+    reject_in_matcher("race.verify_match", &cfg.race.verify_match)?;
+    reject_placeholder("race.counter_pointer", &cfg.race.counter_pointer)?;
+    reject_in_matcher("load.response_match", &cfg.load.response_match)
 }
 
 /// `Ok(Some(name))` for a whole-string `${ENV:name}`, `Ok(None)` for a plain literal,
@@ -66,10 +133,16 @@ fn parse_placeholder(raw: &str) -> Result<Option<&str>, ()> {
 struct Resolver<'a, F: Fn(&str) -> Option<String>> {
     lookup: &'a F,
     missing: BTreeSet<String>,
+    used: BTreeSet<String>,
     malformed: Vec<String>,
 }
 
 impl<F: Fn(&str) -> Option<String>> Resolver<'_, F> {
+    fn lookup_name(&mut self, name: &str) -> Option<String> {
+        self.used.insert(name.to_string());
+        (self.lookup)(name)
+    }
+
     /// On a problem the error is recorded and an empty string is returned; the caller
     /// discards the result because `finish` fails.
     fn string(&mut self, field: &str, raw: &str) -> String {
@@ -81,7 +154,7 @@ impl<F: Fn(&str) -> Option<String>> Resolver<'_, F> {
             }
             // An empty env var counts as missing (conservative: an empty credential
             // or id is almost never intended).
-            Ok(Some(name)) => match (self.lookup)(name) {
+            Ok(Some(name)) => match self.lookup_name(name) {
                 Some(v) if !v.is_empty() => v,
                 _ => {
                     self.missing.insert(name.to_string());
@@ -173,9 +246,11 @@ pub fn resolve<F: Fn(&str) -> Option<String>>(
     cfg: &Config,
     lookup: &F,
 ) -> Result<ResolvedRequests, ConfigError> {
+    reject_unresolved_placeholders(cfg)?;
     let mut r = Resolver {
         lookup,
         missing: BTreeSet::new(),
+        used: BTreeSet::new(),
         malformed: Vec::new(),
     };
     let base = cfg.base_url.as_str();
@@ -200,6 +275,7 @@ pub fn resolve<F: Fn(&str) -> Option<String>>(
         action: action?,
         verify: verify?,
         load: load?,
+        env_names: r.used.into_iter().collect(),
     })
 }
 
@@ -378,6 +454,51 @@ mod tests {
             resolve(&cfg, &env),
             Err(ConfigError::BadPlaceholder { .. })
         ));
+    }
+
+    #[test]
+    fn env_names_are_exactly_the_looked_up_names() {
+        let reqs = resolve(&base(), &full_env).expect("resolves");
+        assert_eq!(
+            reqs.env_names,
+            [
+                "LOGIN_INVALID_PASSWORD",
+                "LOGIN_USER",
+                "LOGIN_VALID_PASSWORD",
+                "TEST_ACTION_ID",
+                "TEST_AUTHORIZATION"
+            ]
+        );
+    }
+
+    #[test]
+    fn placeholder_in_unresolved_position_is_rejected_by_path_only() {
+        let ph = "${ENV:ZED}";
+        let mut cases: Vec<(Config, &str)> = Vec::new();
+        let mut c = base();
+        c.brute_force.success_match.json_equals =
+            Some([("/a".to_string(), serde_json::json!({"x": [ph]}))].into());
+        cases.push((c, "brute_force.success_match.json_equals./a.x[0]"));
+        let mut c = base();
+        c.load.response_match.json_exists = Some(vec![ph.to_string()]);
+        cases.push((c, "load.response_match.json_exists[0]"));
+        let mut c = base();
+        c.race.counter_pointer = ph.to_string();
+        cases.push((c, "race.counter_pointer"));
+        let mut c = base();
+        c.base_url = ph.to_string();
+        cases.push((c, "base_url"));
+        let mut c = base();
+        c.load.request.path = ph.to_string();
+        cases.push((c, "load.request.path"));
+        for (cfg, want) in cases {
+            let err = resolve(&cfg, &full_env).unwrap_err();
+            let ConfigError::Invalid { path, .. } = &err else {
+                panic!("{want}: expected Invalid, got {err:?}");
+            };
+            assert_eq!(path, want);
+            assert!(!err.to_string().contains("ZED"), "{err}");
+        }
     }
 
     #[test]

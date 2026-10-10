@@ -1,4 +1,12 @@
-fn main() {
-    // Thin binary: real entry point is added in slice S9.
-    println!("api-toolkit {}", env!("CARGO_PKG_VERSION"));
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let lookup = |name: &str| std::env::var(name).ok();
+    let code = api_toolkit::cli::run(
+        std::env::args_os(),
+        &lookup,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    );
+    ExitCode::from(code)
 }

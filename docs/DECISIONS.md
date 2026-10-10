@@ -97,3 +97,15 @@ Detail: `.claude/work/P0-plan.md`, `docs/fixture.md`. Terdampak: PLAN §9, §11 
 - Respons fixture berisi JSON tetap dan tidak pernah memantulkan body/header request (body login yang salah bentuk → 400 `{"error":"bad_request"}`). Fixture tidak mencatat request.
 - Varian broken/idempotent/slow/prelocked ditambahkan di P1–P3 saat dibutuhkan. Counter `load_requests` dihitung tetapi belum dibaca (dipakai P3).
 - Catatan untuk S10 dan seterusnya: test konkurensi memakai `flavor = "multi_thread"`; client test memakai `.no_proxy()`.
+
+## 2026-10-10 — CLI validate dan check (P0 S9)
+
+Detail: `.claude/work/P0-plan.md`. Terdampak: PLAN §3, §9, §10. Reviewer PASS di ronde 2 (ronde 1 FIX: `validate` mencetak nama env dari pemindaian JSON mentah, bukan dari yang benar-benar di-resolve).
+
+- `api-toolkit validate --config <path>`: baca file → `parse` → `validate` → `resolve` dengan lookup env yang diinjeksi; tidak pernah membuat `Transport` (0 koneksi, dibuktikan dengan listener penghitung). Sukses (exit 0) mencetak jumlah request terencana, fixed waits (ms), dan NAMA env yang benar-benar dicari `resolve` (`ResolvedRequests.env_names`, terurut, tanpa duplikat); tidak pernah nilai. Semua error → stderr `error: <Display>` + exit 2; env hilang dilaporkan sekaligus. Pesan CLI berbahasa Inggris. Exit code: 0 valid, 2 untuk semua error termasuk salah pakai (clap). `--help`/`--version` 0.
+- `api-toolkit check --config --out`: stub P0, tidak memuat config, tidak menulis/menyentuh file `--out`, pesan not-implemented-until-P4, selalu exit 2 (tidak pernah 0).
+- `run(args, env_lookup, out, err) -> u8`; `main.rs` tipis (`ExitCode::from`). `anyhow` hanya di cli/main. Error tulis stdout (EPIPE) tidak panic (exit 2).
+- File config dibatasi 1 MiB (dibaca maksimal 1 MiB + 1 byte); lebih besar → exit 2 menyebut path dan batas.
+- Placeholder `${ENV:NAME}` utuh di posisi yang TIDAK di-resolve (base_url, path, kunci/nilai string `json_equals`, pointer `json_exists`, `counter_pointer`, semua matcher) ditolak (`ConfigError::Invalid`, hanya path field) agar tidak diam-diam menjadi literal. Literal yang kebetulan mirip placeholder di `json_equals` ikut ditolak; jalan keluarnya bentuk awalan/akhiran (`x${ENV:ok}`) yang tetap literal sesuai PLAN §9.
+- Catatan: jalur error untuk key `json_equals` mencantumkan key itu (teks config milik pengguna, bukan nilai env).
+- Belum (carry-over ke phase gate): placeholder di key `query` dan key objek body json masih diam-diam literal; `--config` berupa FIFO bisa menggantung (cukup cek `is_file`); tes batas tepat 1 MiB.
