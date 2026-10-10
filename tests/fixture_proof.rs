@@ -78,7 +78,15 @@ fn set_login(v: &mut Value, path: &str) {
 
 /// Writes the config to a temp dir and runs `check` (full suite) with the binary.
 async fn run_suite(cfg: &Value) -> Out {
+    run_suite_env(cfg, &ENV).await
+}
+
+async fn run_suite_env(cfg: &Value, env: &[(&str, &str)]) -> Out {
     let cfg = cfg.clone();
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     tokio::task::spawn_blocking(move || {
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("c.json");
@@ -91,7 +99,7 @@ async fn run_suite(cfg: &Value) -> Out {
             .arg("--out")
             .arg(&out_path)
             .env_clear()
-            .envs(ENV)
+            .envs(env)
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
@@ -385,4 +393,336 @@ fn config_examples_are_not_modified_by_these_tests() {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
         assert_eq!(v["base_url"], "http://127.0.0.1:8080", "{p}");
     }
+}
+
+// ---------- S5: report atomicity, SIGINT, redaction ----------
+
+fn file_names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Collects every string value that looks like an RFC 3339 UTC timestamp.
+fn timestamps(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) if s.len() >= 19 && s.as_bytes()[4] == b'-' && s.contains('T') => {
+            out.push(s.clone())
+        }
+        Value::Array(a) => a.iter().for_each(|x| timestamps(x, out)),
+        Value::Object(m) => m.values().for_each(|x| timestamps(x, out)),
+        _ => {}
+    }
+}
+
+/// Inode of a file (unix only; 0 elsewhere so the atomic check is skipped).
+fn inode(p: &Path) -> u64 {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(p).unwrap())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        0
+    }
+}
+
+// AC5.1, AC5.2
+#[tokio::test(flavor = "multi_thread")]
+async fn out_with_old_content_is_replaced_by_valid_json_and_no_temp_file_remains() {
+    let fx = Fixture::start(0).await.unwrap();
+    let cfg = config(HEALTHY, &fx.base_url(), |_| {});
+    let (code, stdout, stderr, names, text, inodes) = tokio::task::spawn_blocking(move || {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("c.json");
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir(&out_dir).unwrap();
+        let out_path = out_dir.join("result.json");
+        std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
+        std::fs::write(&out_path, "OLD").unwrap();
+        let ino_before = inode(&out_path);
+        let o = Command::new(env!("CARGO_BIN_EXE_api-toolkit"))
+            .args(["check", "--config"])
+            .arg(&cfg_path)
+            .arg("--out")
+            .arg(&out_path)
+            .env_clear()
+            .envs(ENV)
+            .output()
+            .unwrap();
+        (
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+            file_names(&out_dir),
+            std::fs::read_to_string(&out_path).unwrap(),
+            (ino_before, inode(&out_path)),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, Some(0), "stdout: {stdout} stderr: {stderr}");
+    assert_eq!(names, ["result.json"], "temp file left behind");
+    #[cfg(unix)]
+    assert_ne!(
+        inodes.0, inodes.1,
+        "--out was written in place, not renamed"
+    );
+    #[cfg(not(unix))]
+    let _ = inodes;
+    let report: Value = serde_json::from_str(&text).expect("report is valid JSON");
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["scope"], "full");
+    assert_eq!(report["checks"].as_array().unwrap().len(), 3);
+    let mut ts = Vec::new();
+    timestamps(&report, &mut ts);
+    assert!(!ts.is_empty(), "no timestamp found in report");
+    for t in &ts {
+        assert!(
+            t.ends_with('Z') && !t.contains('.'),
+            "timestamp has fraction or no Z: {t}"
+        );
+    }
+    fx.shutdown().await;
+}
+
+/// Accepts connections and never answers. `seen()` is the number of accepted connections.
+struct Hang {
+    port: u16,
+    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Hang {
+    async fn start() -> Hang {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = count.clone();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = l.accept().await {
+                held.push(s);
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        Hang { port, count, task }
+    }
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+    fn seen(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for Hang {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+// AC3.4 (binary)
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sigint_on_full_suite_is_exit_130_all_three_reported_and_no_new_connection() {
+    use std::time::Duration;
+    let h = Hang::start().await;
+    let cfg = config(HEALTHY, &h.base_url(), |_| {});
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("c.json");
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    let out_path = out_dir.join("result.json");
+    std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_api-toolkit"))
+        .args(["check", "--config"])
+        .arg(&cfg_path)
+        .arg("--out")
+        .arg(&out_path)
+        .env_clear()
+        .envs(ENV)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Observed condition, not a guessed sleep: the first request reached the listener.
+    let mut waited = 0;
+    while h.seen() == 0 {
+        if waited >= 10_000 {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the binary never connected");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        waited += 10;
+    }
+    let seen_at_sigint = h.seen();
+    assert_eq!(
+        seen_at_sigint, 1,
+        "only the race request should be in flight"
+    );
+    let st = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    if !st.success() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("kill -INT failed");
+    }
+    let o = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+    assert_eq!(
+        o.status.code(),
+        Some(130),
+        "stdout: {stdout} stderr: {stderr}"
+    );
+    let report: Value = serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["scope"], "full");
+    assert_eq!(report["completion"], "incomplete");
+    let checks = report["checks"].as_array().unwrap();
+    let names: Vec<&str> = checks
+        .iter()
+        .map(|c| c["check"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["race", "load", "brute_force"]);
+    for c in checks {
+        assert_ne!(c["verdict"], "pass", "cancelled run must not pass: {c}");
+        assert_eq!(c["completion"], "incomplete", "{c}");
+    }
+    // The hanging check (race) and the ones that never started: not_run / cancelled.
+    for i in [0, 1, 2] {
+        assert_eq!(checks[i]["verdict"], "not_run", "{}", checks[i]);
+        assert_eq!(checks[i]["reasons"], json!(["cancelled"]), "{}", checks[i]);
+    }
+    assert_eq!(stdout.lines().count(), 3, "stdout: {stdout}");
+    for (line, name) in stdout.lines().zip(["race", "load", "brute_force"]) {
+        assert!(line.starts_with(name), "line `{line}`");
+        assert!(!line.contains("PASS"), "line `{line}`");
+    }
+    assert_eq!(
+        file_names(&out_dir),
+        ["result.json"],
+        "temp file left behind"
+    );
+    // The process is gone. Give a stray connection time to arrive; the count must not grow.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.seen(),
+        seen_at_sigint,
+        "a connection was opened after cancel"
+    );
+}
+
+const SENT_ID: &str = "SENTINEL-id-7d41c9";
+const SENT_PW: &str = "SENTINEL-pw-3b9e52";
+const SENT_ENV: [(&str, &str); 5] = [
+    ("LOGIN_USER", support::fixture::LOGIN_USER),
+    (
+        "LOGIN_VALID_PASSWORD",
+        support::fixture::LOGIN_VALID_PASSWORD,
+    ),
+    ("LOGIN_INVALID_PASSWORD", SENT_PW),
+    ("TEST_ACTION_ID", SENT_ID),
+    ("TEST_AUTHORIZATION", support::fixture::TEST_AUTHORIZATION),
+];
+
+fn assert_no_sentinel(o: &Out) {
+    let report_text = o.report.to_string();
+    for hay in [&o.stdout, &o.stderr, &report_text] {
+        for s in [SENT_ID, SENT_PW] {
+            assert!(!hay.contains(s), "sentinel {s} leaked in: {hay}");
+        }
+    }
+    // Positive control: output and report really carry the three checks.
+    for name in ["race", "load", "brute_force"] {
+        assert!(o.stdout.contains(name), "stdout: {}", o.stdout);
+        assert!(report_text.contains(name));
+    }
+}
+
+// AC5.3 (redaction), full suite
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_env_values_never_appear_in_full_suite_output_or_report() {
+    let fx = Fixture::start(0).await.unwrap();
+    let healthy = run_suite_env(&config(HEALTHY, &fx.base_url(), |_| {}), &SENT_ENV).await;
+    // The sentinel id is accepted by the fixture, so a real verdict proves it was used.
+    assert_eq!(
+        healthy.code, 0,
+        "stdout: {} stderr: {}",
+        healthy.stdout, healthy.stderr
+    );
+    assert_no_sentinel(&healthy);
+    admin(&fx, "POST", "/__admin/reset").await;
+    let broken = run_suite_env(&config(BROKEN, &fx.base_url(), |_| {}), &SENT_ENV).await;
+    assert_eq!(
+        broken.code, 1,
+        "stdout: {} stderr: {}",
+        broken.stdout, broken.stderr
+    );
+    assert_no_sentinel(&broken);
+    fx.shutdown().await;
+}
+
+// AC5.3 (redaction), sentinel really on the wire
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_sent_on_the_wire_still_absent_from_output_and_report() {
+    use tokio::io::AsyncReadExt;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
+    let wire = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let w = wire.clone();
+    let task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut s, _)) = l.accept().await {
+            let w = w.clone();
+            held.push(tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = s.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    w.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+            }));
+        }
+    });
+    let cfg = config(HEALTHY, &base, |v| {
+        v["limits"]["request_timeout_ms"] = json!(300);
+        v["load"]["requests"] = json!(10);
+        let b = &mut v["brute_force"];
+        b["attempts"] = json!(2);
+        b["protect_by_attempt"] = json!(2);
+        b["protected_tail_count"] = json!(1);
+    });
+    // The valid password is the sentinel too, so the baseline request carries it.
+    let env = [
+        ("LOGIN_USER", "demo"),
+        ("LOGIN_VALID_PASSWORD", SENT_PW),
+        ("LOGIN_INVALID_PASSWORD", SENT_PW),
+        ("TEST_ACTION_ID", SENT_ID),
+        ("TEST_AUTHORIZATION", "Bearer fixture-token"),
+    ];
+    let o = run_suite_env(&cfg, &env).await;
+    let wire_text = String::from_utf8_lossy(&wire.lock().unwrap()).into_owned();
+    task.abort();
+    // Positive control: both sentinels were really sent.
+    assert!(wire_text.contains(SENT_ID), "id not on wire: {wire_text}");
+    assert!(
+        wire_text.contains(SENT_PW),
+        "password not on wire: {wire_text}"
+    );
+    // The server never answers: nothing can PASS.
+    assert_ne!(o.code, 0, "stdout: {}", o.stdout);
+    assert!(!o.stdout.contains("PASS"), "stdout: {}", o.stdout);
+    assert_no_sentinel(&o);
 }
