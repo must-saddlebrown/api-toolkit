@@ -16,8 +16,8 @@ use clap::{Parser, Subcommand};
 use time::OffsetDateTime;
 use tokio::sync::watch;
 
-use crate::checks::{Stop, brute_force};
-use crate::config::{self, BruteForceRequests, Selection};
+use crate::checks::{Stop, brute_force, race};
+use crate::config::{self, BruteForceRequests, RaceRequests, Selection};
 use crate::http::Transport;
 use crate::report::{self, CheckName, CheckResult, Completion, ReasonCode, Report, Scope, Verdict};
 
@@ -41,7 +41,7 @@ enum Command {
     Validate {
         #[arg(long)]
         config: PathBuf,
-        /// Validate only this check's section (available: brute_force). Without it the
+        /// Validate only this check's section (available: brute_force, race). Without it the
         /// full suite config is validated.
         #[arg(long)]
         only: Option<String>,
@@ -54,7 +54,7 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         out: PathBuf,
-        /// Check to run (required until P4). Available: brute_force.
+        /// Check to run (required until P4). Available: brute_force, race.
         #[arg(long)]
         only: Option<String>,
     },
@@ -114,21 +114,41 @@ where
     }
 }
 
-/// Map the `--only` value to a check. Only `brute_force` exists so far (K6).
+/// Map the `--only` value to a check. `load` comes in P3 (K6).
 fn parse_only(name: &str) -> anyhow::Result<CheckName> {
     match name {
         "brute_force" => Ok(CheckName::BruteForce),
-        "race" => anyhow::bail!("check `race` is not available yet (planned for P2)"),
+        "race" => Ok(CheckName::Race),
         "load" => anyhow::bail!("check `load` is not available yet (planned for P3)"),
-        _ => anyhow::bail!("unknown check `{name}`; available: brute_force"),
+        _ => anyhow::bail!("unknown check `{name}`; available: brute_force, race"),
+    }
+}
+
+/// The one check a run executes, with its config section and resolved requests.
+enum Selected {
+    BruteForce {
+        cfg: config::BruteForce,
+        requests: BruteForceRequests,
+    },
+    Race {
+        cfg: config::Race,
+        requests: RaceRequests,
+    },
+}
+
+impl Selected {
+    fn name(&self) -> CheckName {
+        match self {
+            Selected::BruteForce { .. } => CheckName::BruteForce,
+            Selected::Race { .. } => CheckName::Race,
+        }
     }
 }
 
 /// Everything a `check` run needs, ready before the first request.
 struct Prepared {
     limits: config::Limits,
-    cfg: config::BruteForce,
-    requests: BruteForceRequests,
+    selected: Selected,
     config_hash: String,
 }
 
@@ -142,10 +162,11 @@ fn check_args(
 ) -> anyhow::Result<Prepared> {
     let Some(only) = only else {
         anyhow::bail!(
-            "the full suite is not implemented until P4 (full suite available in P4); run one check with --only brute_force. The config was not read, no request was sent and no report was written."
+            "the full suite is not implemented until P4 (full suite available in P4); run one check with --only brute_force or --only race. The config was not read, no request was sent and no report was written."
         );
     };
-    let sel = Selection::Only(parse_only(only)?);
+    let name = parse_only(only)?;
+    let sel = Selection::Only(name);
     let text = read_config(config)?;
     let cfg = config::parse(&text)?;
     config::validate(&cfg, sel)?; // validate before resolve
@@ -154,17 +175,28 @@ fn check_args(
     let config::Config {
         limits,
         brute_force,
+        race,
         ..
     } = cfg;
-    let (Some(cfg), Some(requests)) = (brute_force, resolved.brute_force) else {
-        anyhow::bail!(
-            "invalid config at `brute_force`: section is required for the selected check"
-        );
+    // `validate` already rejected a missing selected section; the `else` arms are a backstop.
+    let selected = match name {
+        CheckName::BruteForce => match (brute_force, resolved.brute_force) {
+            (Some(cfg), Some(requests)) => Selected::BruteForce { cfg, requests },
+            _ => anyhow::bail!(
+                "invalid config at `brute_force`: section is required for the selected check"
+            ),
+        },
+        CheckName::Race => match (race, resolved.race) {
+            (Some(cfg), Some(requests)) => Selected::Race { cfg, requests },
+            _ => anyhow::bail!(
+                "invalid config at `race`: section is required for the selected check"
+            ),
+        },
+        CheckName::Load => anyhow::bail!("check `load` is not available yet (planned for P3)"),
     };
     Ok(Prepared {
         limits,
-        cfg,
-        requests,
+        selected,
         config_hash: report::config_hash(text.as_bytes()),
     })
 }
@@ -225,13 +257,24 @@ async fn run_check(
     };
 
     let (stop_tx, stop_rx) = watch::channel(None);
-    let check = brute_force::run(
-        &transport,
-        &prepared.cfg,
-        &prepared.requests.baseline,
-        &prepared.requests.probe,
-        stop_rx,
-    );
+    // One future for either check, so the cancel/deadline loop below is shared.
+    let check = async {
+        match &prepared.selected {
+            Selected::BruteForce { cfg, requests } => {
+                brute_force::run(
+                    &transport,
+                    cfg,
+                    &requests.baseline,
+                    &requests.probe,
+                    stop_rx,
+                )
+                .await
+            }
+            Selected::Race { cfg, requests } => {
+                race::run(&transport, cfg, &requests.action, &requests.verify, stop_rx).await
+            }
+        }
+    };
     tokio::pin!(check, deadline, cancel);
     let mut stop_sent: Option<Stop> = None;
     let result = loop {
@@ -251,10 +294,22 @@ async fn run_check(
     let finished = OffsetDateTime::now_utc();
 
     // Console first, so the result is on screen even if the report cannot be written.
-    let _ = writeln!(out, "{}", brute_force::console_line(&result));
+    let line = match result.check {
+        CheckName::Race => race::console_line(&result),
+        _ => brute_force::console_line(&result),
+    };
+    let _ = writeln!(out, "{line}");
+    let selected = prepared.selected.name();
+    let not_run: Vec<&str> = [CheckName::Race, CheckName::Load, CheckName::BruteForce]
+        .into_iter()
+        .filter(|c| *c != selected)
+        .map(CheckName::as_str)
+        .collect();
     let _ = writeln!(
         err,
-        "note: partial run (--only brute_force): race, load not run; a partial run never exits 0, read the verdict above or in {}",
+        "note: partial run (--only {}): {} not run; a partial run never exits 0, read the verdict above or in {}",
+        selected.as_str(),
+        not_run.join(", "),
         out_path.display()
     );
 
@@ -285,8 +340,9 @@ fn excluded(check: CheckName) -> CheckResult {
     }
 }
 
-/// Report of a `--only brute_force` run: entries in the default order race, load,
-/// brute_force; timestamps cut to whole seconds; suite completion follows the selected check.
+/// Report of a `--only` run: entries in the default order race, load, brute_force, the
+/// selected one replaced by its result; timestamps cut to whole seconds; suite
+/// completion follows the selected check.
 fn partial_report(
     started: OffsetDateTime,
     finished: OffsetDateTime,
@@ -297,6 +353,14 @@ fn partial_report(
     let run_id = report::run_id(unix_ms, config_hash);
     let whole_second = |t: OffsetDateTime| t.replace_nanosecond(0).unwrap_or(t);
     let completion = result.completion;
+    let mut result = Some(result);
+    let checks = [CheckName::Race, CheckName::Load, CheckName::BruteForce]
+        .into_iter()
+        .map(|name| match result.take_if(|r| r.check == name) {
+            Some(r) => r,
+            None => excluded(name),
+        })
+        .collect();
     Report::new(
         run_id,
         config_hash.to_string(),
@@ -304,7 +368,7 @@ fn partial_report(
         whole_second(finished),
         completion,
         Scope::Partial,
-        vec![excluded(CheckName::Race), excluded(CheckName::Load), result],
+        checks,
     )
 }
 
@@ -670,7 +734,6 @@ mod tests {
             ("bogus", "unknown check"),
             ("Brute_Force", "unknown check"),
             ("", "unknown check"),
-            ("race", "not available yet"),
             ("load", "not available yet"),
         ];
         for (name, want) in cases {
@@ -705,9 +768,7 @@ mod tests {
             assert!(out.is_empty(), "{out}");
         }
         let (_, _, err) = check_only(&["--config", "x", "--out", rep, "--only", "bogus"]);
-        assert!(err.contains("available: brute_force"), "{err}");
-        let (_, _, err) = check_only(&["--config", "x", "--out", rep, "--only", "race"]);
-        assert!(err.contains("P2"), "{err}");
+        assert!(err.contains("available: brute_force, race"), "{err}");
         let (_, _, err) = check_only(&["--config", "x", "--out", rep, "--only", "load"]);
         assert!(err.contains("P3"), "{err}");
     }
@@ -1232,5 +1293,227 @@ mod tests {
         assert_eq!(report::exit_code(&r), 130);
         assert_eq!(r.checks[0], excluded(CheckName::Race));
         assert_eq!(r.checks[1], excluded(CheckName::Load));
+    }
+
+    // ---- `--only race` (P2.S7) ----
+
+    const RACE_EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/race-only.json");
+
+    #[test]
+    fn parse_only_race_ok_load_p3_unknown_lists_both() {
+        assert_eq!(parse_only("race").unwrap(), CheckName::Race);
+        assert_eq!(parse_only("brute_force").unwrap(), CheckName::BruteForce);
+        let e = parse_only("load").unwrap_err().to_string();
+        assert!(e.contains("not available yet") && e.contains("P3"), "{e}");
+        let e = parse_only("Race").unwrap_err().to_string();
+        assert!(
+            e.contains("unknown check") && e.contains("brute_force, race"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn partial_report_race_order_and_excluded_entries() {
+        let t = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let race = CheckResult {
+            check: CheckName::Race,
+            verdict: Verdict::NotRun,
+            reasons: vec![ReasonCode::Cancelled],
+            completion: Completion::Incomplete,
+            evidence: None,
+        };
+        let r = partial_report(t, t, "abcdef0123456789", race.clone()).unwrap();
+        assert_eq!(r.scope, Scope::Partial);
+        assert_eq!(r.completion, Completion::Incomplete);
+        assert_eq!(r.checks.len(), 3);
+        assert_eq!(r.checks[0], race);
+        assert_eq!(r.checks[1], excluded(CheckName::Load));
+        assert_eq!(r.checks[2], excluded(CheckName::BruteForce));
+        assert_eq!(report::exit_code(&r), 130);
+    }
+
+    #[test]
+    fn validate_only_race_example_needs_no_brute_force_env() {
+        let env = |n: &str| n.starts_with("TEST_").then(|| SENTINEL.to_string());
+        let (code, out, err) = run_args(
+            &[
+                "api-toolkit",
+                "validate",
+                "--config",
+                RACE_EXAMPLE,
+                "--only",
+                "race",
+            ],
+            &env,
+        );
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("planned requests: 7"), "{out}");
+        assert!(out.contains("fixed waits: 250 ms"), "{out}");
+        assert!(
+            out.contains("environment variables present: TEST_ACTION_ID, TEST_AUTHORIZATION"),
+            "{out}"
+        );
+        assert!(!out.contains("LOGIN_"), "{out}");
+        assert_no_sentinel(&out, &err);
+    }
+
+    #[test]
+    fn race_example_has_no_literal_secret() {
+        let text = std::fs::read_to_string(RACE_EXAMPLE).unwrap();
+        assert!(text.contains("${ENV:TEST_AUTHORIZATION}"));
+        assert!(!text.contains("Bearer"), "literal credential in example");
+    }
+
+    #[test]
+    fn only_race_without_race_section_is_2_and_sends_nothing() {
+        // The brute_force example has no `race` section.
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("r.json");
+        let rep = report.to_str().unwrap();
+        let (code, out, err) = check_only(&["--config", PARTIAL, "--out", rep, "--only", "race"]);
+        assert_eq!(code, 2);
+        assert!(err.contains("invalid config at `race`"), "{err}");
+        assert!(!report.exists());
+        assert_no_sentinel(&out, &err);
+        let (code, out, err) = run_args(
+            &[
+                "api-toolkit",
+                "validate",
+                "--config",
+                PARTIAL,
+                "--only",
+                "race",
+            ],
+            &full_env,
+        );
+        assert_eq!(code, 2);
+        assert!(err.contains("invalid config at `race`"), "{err}");
+        assert!(out.is_empty(), "{out}");
+    }
+
+    /// Prepare `check --only race` through `check_args`, then `run_check`.
+    async fn run_race(
+        base_url: &str,
+        tweak: impl FnOnce(&mut Value),
+        cancel: impl Future<Output = ()>,
+    ) -> RunOut {
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(RACE_EXAMPLE).unwrap()).unwrap();
+        v["base_url"] = Value::from(base_url);
+        v["race"]["settle_ms"] = Value::from(1);
+        tweak(&mut v);
+        let (dir, cfg) = temp_config(&v.to_string());
+        let report_path = Path::new(&cfg).with_file_name("report.json");
+        let prepared = check_args(Path::new(&cfg), &report_path, Some("race"), &full_env)
+            .unwrap_or_else(|e| panic!("prepare failed: {e:#}"));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_check(prepared, &report_path, cancel, &mut out, &mut err).await;
+        RunOut {
+            code,
+            out: String::from_utf8(out).unwrap(),
+            err: String::from_utf8(err).unwrap(),
+            report_path,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_check_race_cancel_while_actions_in_flight_is_130() {
+        // Verifier GETs are answered; action POSTs hang. Cancel once all 5 actions are
+        // observed in flight (a condition, not a delay).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+        let (p, t) = (posts.clone(), total.clone());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut sock, _)) = listener.accept().await {
+                t.fetch_add(1, Ordering::SeqCst);
+                let p = p.clone();
+                // Peek at the request line to tell verifier from action.
+                let mut buf = [0u8; 8];
+                let n = sock.peek(&mut buf).await.unwrap_or(0);
+                if buf[..n].starts_with(b"POST") {
+                    p.fetch_add(1, Ordering::SeqCst);
+                    held.push(sock);
+                } else {
+                    read_request(&mut sock).await;
+                    let body = r#"{"execution_count":0}"#;
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                }
+            }
+        });
+        let seen = posts.clone();
+        let cancel = async move {
+            while seen.load(Ordering::SeqCst) < 5 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        let r = run_race(&format!("http://{addr}"), |_| {}, cancel).await;
+        assert_eq!(r.code, 130, "{}", r.err);
+        assert!(r.out.starts_with("race NOT_RUN"), "{}", r.out);
+        assert_eq!(r.out.lines().count(), 1, "{}", r.out);
+        assert!(
+            r.err
+                .contains("partial run (--only race): load, brute_force not run"),
+            "{}",
+            r.err
+        );
+        let rep = r.report();
+        assert_eq!(rep["scope"], "partial");
+        assert_eq!(rep["completion"], "incomplete");
+        assert_eq!(rep["checks"][0]["check"], "race");
+        assert_eq!(rep["checks"][0]["verdict"], "not_run");
+        assert_eq!(
+            rep["checks"][0]["reasons"],
+            serde_json::json!(["cancelled"])
+        );
+        assert_eq!(rep["checks"][0]["completion"], "incomplete");
+        for i in 1..3 {
+            assert_eq!(
+                rep["checks"][i]["reasons"],
+                serde_json::json!(["excluded_by_only"])
+            );
+        }
+        assert_eq!(total.load(Ordering::SeqCst), 6); // 1 verifier before + 5 actions
+        assert_no_sentinel(&r.out, &r.err);
+        assert!(!r.report_text().contains(SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn run_check_race_deadline_is_2_not_run_deadline_exceeded() {
+        let (addr, count) = hang().await;
+        let r = run_race(
+            &format!("http://{addr}"),
+            |v| v["limits"]["suite_deadline_ms"] = Value::from(200),
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(r.code, 2, "{}", r.err);
+        assert!(r.out.starts_with("race NOT_RUN"), "{}", r.out);
+        let rep = r.report();
+        assert_eq!(
+            rep["checks"][0]["reasons"],
+            serde_json::json!(["deadline_exceeded"])
+        );
+        assert_eq!(rep["completion"], "incomplete");
+        assert_eq!(count.load(Ordering::SeqCst), 1); // verifier before only
+    }
+
+    #[tokio::test]
+    async fn run_check_race_cancel_before_dispatch_sends_nothing() {
+        let (addr, count) = hang().await;
+        let r = run_race(&format!("http://{addr}"), |_| {}, std::future::ready(())).await;
+        assert_eq!(r.code, 130, "{}", r.err);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            r.report()["checks"][0]["reasons"],
+            serde_json::json!(["cancelled"])
+        );
     }
 }

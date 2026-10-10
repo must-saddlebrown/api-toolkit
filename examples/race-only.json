@@ -1,0 +1,46 @@
+{
+  "config_version": 1,
+  "base_url": "http://127.0.0.1:8080",
+  "limits": {
+    "request_timeout_ms": 5000,
+    "suite_deadline_ms": 120000,
+    "response_body_limit_bytes": 1048576
+  },
+  "race": {
+    "action_request": {
+      "method": "POST",
+      "path": "/actions/{id}/apply",
+      "path_params": {
+        "id": "${ENV:TEST_ACTION_ID}"
+      },
+      "headers": {
+        "Authorization": "${ENV:TEST_AUTHORIZATION}"
+      }
+    },
+    "verify_request": {
+      "method": "GET",
+      "path": "/actions/{id}",
+      "path_params": {
+        "id": "${ENV:TEST_ACTION_ID}"
+      },
+      "headers": {
+        "Authorization": "${ENV:TEST_AUTHORIZATION}"
+      }
+    },
+    "verify_match": {
+      "status_in": [
+        200
+      ]
+    },
+    "counter_pointer": "/execution_count",
+    "initial_counter": 0,
+    "expected_delta": 1,
+    "concurrency": 5,
+    "expected_action_statuses": [
+      200,
+      409
+    ],
+    "max_dispatch_skew_ms": 100,
+    "settle_ms": 250
+  }
+}

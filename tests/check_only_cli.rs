@@ -509,7 +509,6 @@ fn rejected_cases(base: &str) -> Vec<Case> {
     vec![
         plain("no --only", None, "available in P4"),
         plain("bogus", Some("bogus"), "unknown check"),
-        plain("race", Some("race"), "not available yet"),
         plain("load", Some("load"), "not available yet"),
         Case {
             name: "selected section missing",
