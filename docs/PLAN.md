@@ -150,7 +150,7 @@ Input: request, total request count, concurrency, response matcher, max error ra
 
 PASS: semua N attempts selesai, error rate ≤threshold, dan p95 ≤threshold. FAIL: workload lengkap tetapi salah satu threshold terlampaui. Network failures yang terjadi saat load masuk failed outcomes, bukan dikeluarkan dari statistik.
 
-INCONCLUSIVE: run dihentikan/deadline sebelum N attempts lengkap atau runner tidak mampu menyelesaikan workload. ERROR: preflight transport/oracle failure atau internal runner error. Preflight mismatch menghasilkan INCONCLUSIVE `target_not_ready`; load tidak dilanjutkan.
+NOT_RUN: run dihentikan (cancel) atau deadline habis sebelum N attempts lengkap (reason stop + `workload_incomplete`). INCONCLUSIVE: runner tidak mampu menyelesaikan workload tanpa stop (`workload_incomplete`). ERROR: preflight transport/oracle failure atau internal runner error. Preflight mismatch menghasilkan INCONCLUSIVE `target_not_ready`; load tidak dilanjutkan.
 
 Console/report menampilkan attempted vs planned, concurrency aktual maksimum, jumlah samples, histogram status, timeout, dan thresholds. Closed-loop workload serta client bottleneck membatasi generalisasi hasil. Konsep metric thresholds untuk verdict: [Grafana k6 Thresholds](https://grafana.com/docs/k6/latest/using-k6/thresholds/). Toolkit ini tidak menggunakan k6 sebagai runtime dependency.
 
