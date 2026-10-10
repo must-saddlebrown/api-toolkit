@@ -1,6 +1,8 @@
 //! Local fixture server (healthy and intentionally broken variants). Usage: `cargo run --example fixture [-- --port <n>]`.
 //! Race routes: /actions/{id}/apply (healthy), /broken/actions/{id}/apply-racy (duplicates through an
-//! explicit sync gate), /idempotent/actions/{id}/apply. Reset between runs: POST /__admin/reset.
+//! explicit sync gate), /idempotent/actions/{id}/apply.
+//! Load routes: /critical (healthy), /broken/critical/{slow,flaky,hang} (every 10th request fails or
+//! hangs, counted by load_requests). Reset between runs: POST /__admin/reset.
 //! See docs/fixture.md.
 
 #[path = "../tests/support/fixture.rs"]

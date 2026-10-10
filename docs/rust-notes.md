@@ -135,3 +135,23 @@ Guard kunci tidak boleh ditahan melintasi `.await` (risiko deadlock dan future t
 
 ### Alat bantu test
 `Cell`/`RefCell` untuk state bersama di test satu thread, `Arc<AtomicUsize>` untuk menghitung koneksi, `TcpStream::peek` untuk membedakan GET dari POST tanpa mengonsumsi byte, `Child::kill`/`wait` untuk membersihkan proses anak sebelum `panic!`, dan `JoinHandle::abort` di `Drop` untuk menutup listener. Test dengan `tokio::time::pause` memberi clock virtual untuk unit test; integration test tidak memakainya. Lihat `src/checks/race.rs` (`mod tests`), `src/cli.rs` (`mod tests`), `tests/check_only_cli.rs`, `tests/race_fixture.rs`.
+
+## Catatan P3 (load check)
+
+### `f64` hanya `PartialEq`, tanpa `Eq`
+`f64` punya NaN yang tidak sama dengan dirinya sendiri, jadi `derive(Eq)` tidak bisa dipakai pada struct yang memuat `f64`. Karena `LoadEvidence` memuat `error_rate` dan `throughput_rps`, `Eq` ikut dilepas dari `Evidence`, `CheckResult`, dan `Report`; hanya `PartialEq` yang tersisa. Lihat `src/report.rs` dan `Evaluation` di `src/checks/load.rs`. serde_json menulis NaN/inf sebagai `null` tanpa error, jadi `error_rate` hanya dihitung bila `attempted > 0` (`bool::then`).
+
+### `BTreeMap` dan enum `Ord` sebagai kunci
+`status_counts: BTreeMap<u16, u32>` dan `error_counts: BTreeMap<TransportErrorCode, u32>` menghasilkan objek JSON dengan kunci terurut dan stabil (golden test tidak goyah). Kunci enum butuh `derive(PartialOrd, Ord)`. Diisi dengan `entry(k).or_insert(0)`. Lihat `src/report.rs` dan `src/checks/load.rs`.
+
+### Atomik: `AtomicU32` dan `Ordering::Relaxed`
+Worker bersama mengambil nomor request berikutnya dengan `fetch_add(1)`; jumlah request yang sedang berjalan naik dengan `fetch_add`, turun dengan `fetch_sub`, dan nilai tertinggi dicatat dengan `fetch_max`. `Ordering::Relaxed` cukup karena yang dibutuhkan hanya hitungan yang benar, bukan urutan antar variabel. Lihat `worker` dan `run_with` di `src/checks/load.rs`.
+
+### Worker pool dalam satu task
+`min(concurrency, requests)` future `worker` meminjam state bersama lewat `&` (`Shared<'a>`, struct dengan lifetime) lalu dijalankan `futures_util::future::join_all`. Tanpa `spawn` karena `spawn` butuh `'static` sedangkan `Secret` sengaja tanpa `Clone`. `select! { biased; .. }` memberi stop prioritas atas request yang sedang berjalan.
+
+### Pembulatan dan konversi aman
+`u128::div_ceil` membulatkan durasi ke atas (500,0004 ms jadi 501, tidak lolos batas 500), `u64::try_from(..).unwrap_or(u64::MAX)` menjenuhkan alih-alih panic, `Vec::sort_unstable` + rumus nearest-rank `ceil(pct*n/100)` untuk p95. `Option::is_some_and` dan `let ... else` mempersingkat cek dan jalan keluar dini. Lihat `ceil_ms`, `nearest_rank_ms`, `evaluate`.
+
+### Alat bantu test P3
+`Box<dyn Fn(u32) -> Step>` sebagai skrip respons; closure pengirim bertipe `Pin<Box<dyn Future + 'a>>`; `std::future::pending()` / `ready(())` sebagai future cancel yang tak pernah/langsung selesai; `std::mem::forget` menjaga sender `watch` tetap hidup; struct update syntax `..facts(&s)`; `std::panic::catch_unwind` membuktikan kontrol positif benar-benar panic; `u64::is_multiple_of` di fixture untuk "setiap request ke-10". Lihat `src/checks/load.rs` (`mod tests`), `tests/load_fixture.rs`, `tests/support/fixture.rs`.

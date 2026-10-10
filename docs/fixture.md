@@ -1,4 +1,4 @@
-# Fixture lokal (healthy, broken login, varian race)
+# Fixture lokal (healthy, broken login, varian race, varian load)
 
 Alat pengembangan, bukan fitur produk dan bukan mock server produk. Varian healthy, dua varian broken login (P1), varian racy dan idempotent untuk race (P2). Varian broken load (slow, flaky, hang) ada sejak P3.
 Kode: `tests/support/fixture.rs`, dijalankan lewat `examples/fixture.rs`.

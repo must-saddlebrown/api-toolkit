@@ -10,12 +10,12 @@ Dokumen ini hanya membahas **check brute-force login** (fase P1).
 | --- | --- |
 | Logika check brute-force (`checks::brute_force::run`) | Selesai, teruji (unit dan integrasi terhadap fixture) |
 | `api-toolkit validate --config ...` | Berfungsi, memvalidasi config termasuk bagian `brute_force` |
-| `api-toolkit check --config ... --out ... --only brute_force` atau `--only race` | Berfungsi terhadap fixture lokal: menjalankan check, mencetak satu baris console, menulis report JSON (`scope: partial`). **Exit code tidak pernah 0** (FAIL → 1, selain itu → 2, Ctrl-C → 130) |
+| `api-toolkit check --config ... --out ... --only brute_force`, `--only race`, atau `--only load` | Berfungsi terhadap fixture lokal: menjalankan check, mencetak satu baris console, menulis report JSON (`scope: partial`). **Exit code tidak pernah 0** (FAIL → 1, selain itu → 2, Ctrl-C → 130) |
 | `api-toolkit check` tanpa `--only` | Ditolak (exit 2, nol request) sampai suite lengkap tersedia di P4 |
-| Check load | Belum (P3) |
+| Check load (`checks::load::run`) | Selesai, teruji (unit, integrasi terhadap fixture, dan CLI end-to-end) |
 | Dijalankan terhadap API nyata | Belum. Hanya fixture lokal yang sudah dibuktikan |
 
-Check brute-force dan race bisa dijalankan lewat perintah `check --only brute_force` atau `check --only race` (lihat "Mencobanya" dan [docs/STATUS.md](docs/STATUS.md) bagian "Mencoba `check --only race`") dan lewat test.
+Check brute-force, race, dan load bisa dijalankan lewat perintah `check --only brute_force`, `check --only race`, atau `check --only load` (lihat "Mencobanya" dan [docs/STATUS.md](docs/STATUS.md) bagian "Mencoba `check --only race`") dan lewat test.
 
 ## Apa yang dibuktikan check ini
 
@@ -174,7 +174,8 @@ cargo run -q -- validate --config examples/core-checks.json
 | `POST /broken/login/unprotected` | Tidak pernah 429 | `fail` `protection_policy_not_met` |
 | `POST /broken/login/accepts-invalid` | Password salah dijawab 200 + token | `fail` `invalid_credentials_accepted` |
 | `/login` setelah 6 login salah | Baseline 429 (akun prelocked) | `inconclusive` `account_already_locked` |
-| `GET /__admin/stats` | `{"login_requests", "load_requests"}` | untuk memverifikasi jumlah request |
+| `GET /critical`, `/broken/critical/{slow,flaky,hang}` | Rute load: healthy, 300 ms, setiap request ke-10 → 500, setiap ke-10 tidur 3 s | `pass`, `fail` `latency_exceeded`, `fail` `error_rate_exceeded`, timeout (lihat `docs/fixture.md`) |
+| `GET /__admin/stats` | `{"login_requests", "load_requests", ...}` (`load_requests` menghitung semua request rute load, termasuk 401) | untuk memverifikasi jumlah request |
 | `POST /__admin/reset` | Mengembalikan state ke awal | jalankan sebelum mengulang check |
 
 Login benar **tidak** mereset hitungan gagal pada fixture healthy. Menjalankan check dua kali tanpa reset membuat baseline kedua 429, sehingga hasilnya `inconclusive`. Itu perilaku yang disengaja.
