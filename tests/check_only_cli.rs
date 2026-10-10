@@ -1125,3 +1125,289 @@ fn validate_only_race_reports_seven_planned_requests() {
     assert_eq!(r.code, 0, "stderr: {} stdout: {}", r.stderr, r.stdout);
     assert!(r.stdout.contains("planned requests: 7"), "{}", r.stdout);
 }
+
+// ---------- check --only load (P3 S8) ----------
+
+const LOAD_EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/load-only.json");
+const SENT_HDR: &str = "SENTINEL-hdr-c0ffee";
+const SENT_Q: &str = "SENTINEL-qry-9a41d7";
+
+fn load_cfg(base: &str, mutate: impl FnOnce(&mut Value)) -> String {
+    let mut v: Value =
+        serde_json::from_str(&std::fs::read_to_string(LOAD_EXAMPLE).unwrap()).unwrap();
+    v["base_url"] = json!(base);
+    mutate(&mut v);
+    serde_json::to_string_pretty(&v).unwrap()
+}
+
+fn load_env(auth: &str) -> EnvVars {
+    vec![("TEST_AUTHORIZATION".to_string(), auth.to_string())]
+}
+
+fn load_job(w: &Work, env: EnvVars) -> Job {
+    let mut j = w.job(env);
+    j.only = Some("load".into());
+    j
+}
+
+fn load_entry(rep: &Value) -> &Value {
+    &rep["checks"][1]
+}
+
+/// Partial shape for `--only load`: order race, load, brute_force; the two others excluded.
+fn assert_load(rep: &Value, verdict: &str, reasons: Value, completion: &str) {
+    assert_eq!(rep["report_version"], 1);
+    assert_eq!(rep["scope"], "partial");
+    let checks = rep["checks"].as_array().unwrap();
+    let names: Vec<&str> = checks
+        .iter()
+        .map(|c| c["check"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["race", "load", "brute_force"]);
+    for (i, n) in [(0, "race"), (2, "brute_force")] {
+        assert_eq!(
+            checks[i],
+            json!({"check": n, "verdict": "not_run", "reasons": ["excluded_by_only"], "completion": "incomplete"}),
+            "excluded entry {n}"
+        );
+    }
+    assert_eq!(load_entry(rep)["verdict"], verdict, "report: {rep}");
+    assert_eq!(load_entry(rep)["reasons"], reasons);
+    assert_eq!(load_entry(rep)["completion"], completion);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn load_healthy_is_pass_line_exit_2_partial_report_and_101_requests() {
+    let fx = Fixture::start(0).await.unwrap();
+    let w = Work::new(&load_cfg(&fx.base_url(), |_| {}));
+    let run = exec(&load_job(&w, load_env(RACE_AUTH))).await;
+    assert_eq!(run.code, 2, "stderr: {}", run.stderr);
+    let line = one_line(&run);
+    assert!(line.starts_with("load PASS "), "{line}");
+    assert!(line.contains("thresholds_met"), "{line}");
+    assert!(
+        run.stderr.starts_with("note: partial run (--only load)"),
+        "stderr: {}",
+        run.stderr
+    );
+    let rep = w.report();
+    assert_load(&rep, "pass", json!(["thresholds_met"]), "complete");
+    assert_eq!(rep["completion"], "complete");
+    let ev = &load_entry(&rep)["evidence"];
+    assert_eq!(
+        (ev["dispatched"].as_u64(), ev["attempted"].as_u64()),
+        (Some(100), Some(100))
+    );
+    // No retry: 1 preflight + 100 load requests.
+    assert_eq!(stat(&fx, "load_requests").await, 101);
+    assert_eq!(w.file_names(), ["c.json", "result.json"]);
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn load_slow_is_fail_exit_1_latency_exceeded() {
+    let fx = Fixture::start(0).await.unwrap();
+    let w = Work::new(&load_cfg(&fx.base_url(), |v| {
+        v["load"]["request"]["path"] = json!("/broken/critical/slow");
+        v["load"]["requests"] = json!(20);
+        v["load"]["concurrency"] = json!(5);
+        v["load"]["max_p95_ms"] = json!(100);
+    }));
+    let run = exec(&load_job(&w, load_env(RACE_AUTH))).await;
+    assert_eq!(run.code, 1, "stderr: {}", run.stderr);
+    assert!(one_line(&run).starts_with("load FAIL "));
+    let rep = w.report();
+    assert_load(&rep, "fail", json!(["latency_exceeded"]), "complete");
+    // Lower bound only: the fixture sleeps 300 ms, laptop speed cannot lower it.
+    assert!(load_entry(&rep)["evidence"]["p95_ms"].as_u64().unwrap() >= 300);
+    assert_eq!(stat(&fx, "load_requests").await, 21);
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn load_flaky_is_fail_exit_1_error_rate_exceeded() {
+    let fx = Fixture::start(0).await.unwrap();
+    let w = Work::new(&load_cfg(&fx.base_url(), |v| {
+        v["load"]["request"]["path"] = json!("/broken/critical/flaky");
+    }));
+    let run = exec(&load_job(&w, load_env(RACE_AUTH))).await;
+    assert_eq!(run.code, 1, "stderr: {}", run.stderr);
+    assert!(one_line(&run).starts_with("load FAIL "));
+    let rep = w.report();
+    assert_load(&rep, "fail", json!(["error_rate_exceeded"]), "complete");
+    assert_eq!(load_entry(&rep)["evidence"]["failed"], 10);
+    assert_eq!(stat(&fx, "load_requests").await, 101);
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn load_closed_port_is_error_exit_2_preflight_failed() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }; // dropped: nothing listens here any more
+    let w = Work::new(&load_cfg(&format!("http://127.0.0.1:{port}"), |_| {}));
+    let run = exec(&load_job(&w, load_env(RACE_AUTH))).await;
+    assert_eq!(run.code, 2, "stderr: {}", run.stderr);
+    assert!(one_line(&run).starts_with("load ERROR "), "{}", run.stdout);
+    assert!(!run.stderr.contains("panicked"), "{}", run.stderr);
+    let rep = w.report();
+    assert_load(
+        &rep,
+        "error",
+        json!(["preflight_failed", "transport_error"]),
+        "complete",
+    );
+    assert_eq!(load_entry(&rep)["evidence"]["dispatched"], 0);
+    assert_eq!(w.file_names(), ["c.json", "result.json"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn load_rejected_inputs_exit_2_with_zero_connections_and_out_untouched() {
+    let l = CountingListener::start();
+    let base = l.base_url();
+    let cases: Vec<(&str, String, EnvVars, &str)> = vec![
+        (
+            "requests = 0",
+            load_cfg(&base, |v| v["load"]["requests"] = json!(0)),
+            load_env(RACE_AUTH),
+            "load",
+        ),
+        (
+            "TEST_AUTHORIZATION missing",
+            load_cfg(&base, |_| {}),
+            vec![],
+            "TEST_AUTHORIZATION",
+        ),
+        (
+            "load section missing",
+            load_cfg(&base, |v| {
+                v.as_object_mut().unwrap().remove("load");
+            }),
+            load_env(RACE_AUTH),
+            "load",
+        ),
+    ];
+    for existing in [false, true] {
+        for (name, cfg, env, needle) in &cases {
+            let w = Work::new(cfg);
+            if existing {
+                std::fs::write(&w.out, "OLD").unwrap();
+            }
+            let run = exec(&load_job(&w, env.clone())).await;
+            let ctx = format!("case `{name}` existing_out={existing}");
+            assert_eq!(run.code, 2, "{ctx}: stderr {}", run.stderr);
+            assert!(run.stderr.contains(needle), "{ctx}: stderr {}", run.stderr);
+            assert!(run.stdout.is_empty(), "{ctx}: stdout {}", run.stdout);
+            if existing {
+                assert_eq!(std::fs::read_to_string(&w.out).unwrap(), "OLD", "{ctx}");
+            } else {
+                assert!(!w.out.exists(), "{ctx}: out was created");
+            }
+        }
+    }
+    assert_eq!(l.finish(), 0, "a rejected input opened a connection");
+}
+
+#[test]
+fn check_help_lists_load_as_available() {
+    let r = support::cli::run_bin(&["check", "--help"], &[]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    let flat = r.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("Available: brute_force, race, load"),
+        "{flat}"
+    );
+}
+
+#[test]
+fn validate_only_load_example_exits_0_with_101_planned_requests() {
+    let r = support::cli::run_bin(
+        &["validate", "--config", LOAD_EXAMPLE, "--only", "load"],
+        &[("TEST_AUTHORIZATION", RACE_AUTH)],
+    );
+    assert_eq!(r.code, 0, "stderr: {} stdout: {}", r.stderr, r.stdout);
+    assert!(r.stdout.contains("planned requests: 101"), "{}", r.stdout);
+}
+
+/// Add the sentinel header and query to the load request.
+fn add_sentinels(v: &mut Value) {
+    v["load"]["request"]["headers"]["X-Sentinel"] = json!("${ENV:SENTINEL_HDR}");
+    v["load"]["request"]["query"] = json!({"q": "${ENV:SENTINEL_Q}"});
+}
+
+fn sentinel_load_env(auth: &str) -> EnvVars {
+    let mut e = load_env(auth);
+    e.push(("SENTINEL_HDR".into(), SENT_HDR.into()));
+    e.push(("SENTINEL_Q".into(), SENT_Q.into()));
+    e
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn load_sentinels_are_on_the_wire_but_not_in_cli_output() {
+    let rec = Recorder::start().await;
+    let w = Work::new(&load_cfg(&format!("http://127.0.0.1:{}", rec.port), |v| {
+        v["limits"]["request_timeout_ms"] = json!(500);
+        add_sentinels(v);
+    }));
+    // exec() also searches stdout, stderr and the report for every env value (>= 6 chars).
+    let run = exec(&load_job(&w, sentinel_load_env(SENTINEL))).await;
+    // The server never answers: preflight times out, a non-PASS result.
+    assert_eq!(run.code, 2, "stderr: {}", run.stderr);
+    assert!(one_line(&run).starts_with("load ERROR "), "{}", run.stdout);
+    assert_load(
+        &w.report(),
+        "error",
+        json!(["preflight_failed", "transport_error"]),
+        "complete",
+    );
+    // Positive control per channel: each sentinel really was sent, in its own place.
+    let wire = rec.text().to_ascii_lowercase();
+    let (s, h, q) = (
+        SENTINEL.to_ascii_lowercase(),
+        SENT_HDR.to_ascii_lowercase(),
+        SENT_Q.to_ascii_lowercase(),
+    );
+    assert!(
+        wire.contains(&format!("get /critical?q={q} ")),
+        "wire: {wire}"
+    );
+    assert!(
+        wire.contains(&format!("authorization: {s}")),
+        "wire: {wire}"
+    );
+    assert!(wire.contains(&format!("x-sentinel: {h}")), "wire: {wire}");
+    // Negative, explicit: none of the three values in any console stream or the report.
+    let report_text = std::fs::read_to_string(&w.out).unwrap();
+    for hay in [&run.stdout, &run.stderr, &report_text] {
+        for secret in [SENTINEL, SENT_HDR, SENT_Q] {
+            assert!(!hay.contains(secret), "{secret} leaked: {hay}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn load_sentinels_against_fixture_do_not_leak_on_pass_or_fail() {
+    for (path, want_code, line) in [
+        ("/critical", 2, "load PASS "),
+        ("/broken/critical/flaky", 1, "load FAIL "),
+    ] {
+        let fx = Fixture::start(0).await.unwrap();
+        let w = Work::new(&load_cfg(&fx.base_url(), |v| {
+            v["load"]["request"]["path"] = json!(path);
+            add_sentinels(v);
+        }));
+        let run = exec(&load_job(&w, sentinel_load_env(RACE_AUTH))).await;
+        assert_eq!(run.code, want_code, "{path}: stderr {}", run.stderr);
+        assert!(one_line(&run).starts_with(line), "{path}: {}", run.stdout);
+        // A real workload proves the sentinel request was accepted end to end.
+        assert_eq!(stat(&fx, "load_requests").await, 101, "{path}");
+        let report_text = std::fs::read_to_string(&w.out).unwrap();
+        for hay in [&run.stdout, &run.stderr, &report_text] {
+            for secret in [SENT_HDR, SENT_Q, RACE_AUTH] {
+                assert!(!hay.contains(secret), "{path}: {secret} leaked: {hay}");
+            }
+        }
+        fx.shutdown().await;
+    }
+}

@@ -307,20 +307,29 @@ fn sentinel_config(url: &str, path: &str) -> Value {
 
 const FORBIDDEN: [&str; 3] = [SENTINEL_HDR, SENTINEL_Q, TEST_AUTHORIZATION];
 
-/// Positive control: `assert_no_leak` really panics when a needle is present in a channel.
-/// "p95" is in the report file, in `{r:?}` and in `console_line`; each channel is
-/// also checked on its own so a channel dropped from the search is caught.
+/// Positive control: `assert_no_leak` really panics for a needle in each channel. Every channel
+/// has its own needle that exists in that channel only, so dropping one channel from the
+/// search turns exactly one `catch_unwind` below into a failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn l26_control_search_can_find_needle() {
     let fx = Fixture::start(0).await.unwrap();
     let r = run_cfg(&sentinel_config(&fx.base_url(), HEALTHY)).await;
-    let needle = "p95";
     let ch = channels(&r);
     assert_eq!(ch.len(), 3);
-    for (name, text) in &ch {
-        assert!(text.contains(needle), "needle missing in {name}");
+    let needles = ["\"run_id\"", "LoadEvidence", "samples="];
+    for ((name, _), needle) in ch.iter().zip(needles) {
+        for (other, text) in &ch {
+            assert_eq!(
+                text.contains(needle),
+                other == name,
+                "needle {needle} must be unique to {name}, checked in {other}"
+            );
+        }
+        assert!(
+            std::panic::catch_unwind(|| assert_no_leak(&r, &[needle])).is_err(),
+            "assert_no_leak missed {needle} in {name}"
+        );
     }
-    assert!(std::panic::catch_unwind(|| assert_no_leak(&r, &[needle])).is_err());
     fx.shutdown().await;
 }
 
