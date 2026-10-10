@@ -1,0 +1,7 @@
+/target
+.env
+.claude/work/
+.claude/agent-memory/
+.claude/agent-memory-local/
+.claude/settings.local.json
+CLAUDE.local.md
