@@ -1279,6 +1279,66 @@ mod tests {
         assert_eq!(exit_code(&reordered), 0);
     }
 
+    /// P4 matrix E1-E8 for a full suite, checks in the real order race, load, brute_force.
+    #[test]
+    fn exit_code_full_suite_matrix() {
+        use CheckName::*;
+        use Completion::{Complete, Incomplete};
+        use Verdict::*;
+        let none: &[ReasonCode] = &[];
+        let deadline: &[ReasonCode] = &[ReasonCode::DeadlineExceeded];
+        let cancel: &[ReasonCode] = &[ReasonCode::Cancelled];
+        let suite = |r: (Verdict, Completion, &[ReasonCode]),
+                     l: (Verdict, Completion, &[ReasonCode]),
+                     b: (Verdict, Completion, &[ReasonCode])| {
+            report_with(&[
+                (Race, r.0, r.1, r.2),
+                (Load, l.0, l.1, l.2),
+                (BruteForce, b.0, b.1, b.2),
+            ])
+        };
+        let p = (Pass, Complete, none);
+        let f = (Fail, Complete, none);
+        // E1
+        assert_eq!(exit_code(&suite(p, p, p)), 0);
+        // E2: one fail in each position
+        assert_eq!(exit_code(&suite(f, p, p)), 1);
+        assert_eq!(exit_code(&suite(p, f, p)), 1);
+        assert_eq!(exit_code(&suite(p, p, f)), 1);
+        // E3
+        assert_eq!(exit_code(&suite(f, f, f)), 1);
+        // E4: fail + inconclusive
+        assert_eq!(exit_code(&suite((Inconclusive, Complete, none), p, f)), 2);
+        assert_eq!(exit_code(&suite(f, (Inconclusive, Complete, none), p)), 2);
+        // E5: error + pass + fail
+        assert_eq!(exit_code(&suite((Error, Complete, none), p, f)), 2);
+        // E6: deadline leaves the last check not_run
+        assert_eq!(exit_code(&suite(p, p, (NotRun, Incomplete, deadline))), 2);
+        // E7: cancel anywhere, also next to a fail
+        assert_eq!(
+            exit_code(&suite(
+                f,
+                (NotRun, Incomplete, cancel),
+                (NotRun, Incomplete, cancel)
+            )),
+            130
+        );
+        assert_eq!(
+            exit_code(&suite(
+                (NotRun, Incomplete, cancel),
+                (NotRun, Incomplete, cancel),
+                (NotRun, Incomplete, cancel)
+            )),
+            130
+        );
+        // E8: a fail that is incomplete (stopped) is never 1
+        assert_eq!(exit_code(&suite(p, p, (Fail, Incomplete, deadline))), 2);
+        assert_eq!(exit_code(&suite(p, p, (Fail, Incomplete, none))), 2);
+        // E10: a complete fail carrying excluded_by_only is never 1
+        let excl: &[ReasonCode] = &[ReasonCode::ExcludedByOnly];
+        assert_eq!(exit_code(&suite((Fail, Complete, excl), p, p)), 2);
+    }
+
     #[test]
     fn exit_code_partial_table() {
         use CheckName::*;

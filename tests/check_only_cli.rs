@@ -764,7 +764,10 @@ async fn unwritable_report_dir_keeps_console_line_and_old_content_exit_2() {
     let run = exec(&job).await;
     restore(&ro);
     assert_eq!(run.code, 2, "stderr: {}", run.stderr);
-    assert_eq!(one_line(&run), PASS_LINE);
+    assert_eq!(
+        run.stdout,
+        format!("{PASS_LINE}\nreport NOT WRITTEN: {}\n", out.display())
+    );
     assert!(run.stderr.contains("cannot write report"), "{}", run.stderr);
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "OLD");
     assert_eq!(names_in(&ro), ["result.json"], "temp file left behind");

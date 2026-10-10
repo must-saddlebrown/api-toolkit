@@ -352,11 +352,13 @@ async fn run_check(
         Ok(r) => r,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
+            let _ = writeln!(out, "report NOT WRITTEN: {}", out_path.display());
             return if cancelled { 130 } else { EXIT_INVALID };
         }
     };
     if let Err(e) = report::write_report_atomic(out_path, &report) {
         let _ = writeln!(err, "error: {e}");
+        let _ = writeln!(out, "report NOT WRITTEN: {}", out_path.display());
         return if cancelled { 130 } else { EXIT_INVALID };
     }
     u8::try_from(report::exit_code(&report)).unwrap_or(EXIT_INVALID)
@@ -1338,6 +1340,10 @@ mod tests {
         let (o, e) = (String::from_utf8(o).unwrap(), String::from_utf8(e).unwrap());
         assert_eq!(code, 2, "{e}");
         assert!(o.starts_with("brute_force PASS"), "{o}");
+        assert_eq!(
+            o.lines().last().unwrap(),
+            format!("report NOT WRITTEN: {}", out_path.display())
+        );
         assert!(e.contains("cannot write report"), "{e}");
         assert!(e.contains(out_path.to_str().unwrap()), "{e}");
         assert_eq!(std::fs::read_to_string(&out_path).unwrap(), "OLD");
@@ -1878,6 +1884,90 @@ mod tests {
             report_path,
             _dir: dir,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_check_full_report_write_failure_is_2_with_marker_and_old_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let out_path = out_dir.path().join("report.json");
+        std::fs::write(&out_path, "OLD").unwrap();
+        let mut v: Value = serde_json::from_str(&example_text()).unwrap();
+        v["base_url"] = Value::from(closed_port_url());
+        v["brute_force"]["interval_ms"] = Value::from(1);
+        v["race"]["settle_ms"] = Value::from(1);
+        let cfg = cfg_dir.path().join("c.json");
+        std::fs::write(&cfg, v.to_string()).unwrap();
+        // prepare while writable, then lock the directory; root ignores permissions: skip
+        let prepared = check_args(&cfg, &out_path, None, &full_env).unwrap();
+        let dir_mode =
+            |m| std::fs::set_permissions(out_dir.path(), std::fs::Permissions::from_mode(m));
+        dir_mode(0o555).unwrap();
+        if std::fs::File::create(out_dir.path().join("probe")).is_ok() {
+            dir_mode(0o755).unwrap();
+            return;
+        }
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        let code = run_check(prepared, &out_path, std::future::pending(), &mut o, &mut e).await;
+        dir_mode(0o755).unwrap();
+        let (o, e) = (String::from_utf8(o).unwrap(), String::from_utf8(e).unwrap());
+        assert_eq!(code, 2, "{e}");
+        let lines: Vec<&str> = o.lines().collect();
+        assert_eq!(lines.len(), 4, "{o}");
+        assert!(lines[0].starts_with("race "), "{o}");
+        assert!(lines[1].starts_with("load "), "{o}");
+        assert!(lines[2].starts_with("brute_force "), "{o}");
+        assert_eq!(
+            lines[3],
+            format!("report NOT WRITTEN: {}", out_path.display())
+        );
+        assert!(e.contains("cannot write report"), "{e}");
+        assert_eq!(std::fs::read_to_string(&out_path).unwrap(), "OLD");
+        assert_eq!(std::fs::read_dir(out_dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_check_full_cancel_and_report_write_failure_is_130_with_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let out_path = out_dir.path().join("report.json");
+        std::fs::write(&out_path, "OLD").unwrap();
+        let mut v: Value = serde_json::from_str(&example_text()).unwrap();
+        v["base_url"] = Value::from(closed_port_url());
+        v["brute_force"]["interval_ms"] = Value::from(1);
+        v["race"]["settle_ms"] = Value::from(1);
+        let cfg = cfg_dir.path().join("c.json");
+        std::fs::write(&cfg, v.to_string()).unwrap();
+        // prepare while writable, then lock the directory; root ignores permissions: skip
+        let prepared = check_args(&cfg, &out_path, None, &full_env).unwrap();
+        let dir_mode =
+            |m| std::fs::set_permissions(out_dir.path(), std::fs::Permissions::from_mode(m));
+        dir_mode(0o555).unwrap();
+        if std::fs::File::create(out_dir.path().join("probe")).is_ok() {
+            dir_mode(0o755).unwrap();
+            return;
+        }
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        let code = run_check(prepared, &out_path, std::future::ready(()), &mut o, &mut e).await;
+        dir_mode(0o755).unwrap();
+        let (o, e) = (String::from_utf8(o).unwrap(), String::from_utf8(e).unwrap());
+        assert_eq!(code, 130, "{e}");
+        let lines: Vec<&str> = o.lines().collect();
+        assert_eq!(lines.len(), 4, "{o}");
+        assert!(lines[0].starts_with("race "), "{o}");
+        assert!(lines[1].starts_with("load "), "{o}");
+        assert!(lines[2].starts_with("brute_force "), "{o}");
+        assert_eq!(
+            lines[3],
+            format!("report NOT WRITTEN: {}", out_path.display())
+        );
+        assert!(e.contains("cannot write report"), "{e}");
+        assert_eq!(std::fs::read_to_string(&out_path).unwrap(), "OLD");
+        assert_eq!(std::fs::read_dir(out_dir.path()).unwrap().count(), 1);
     }
 
     fn assert_three_lines_in_order(r: &RunOut) {
