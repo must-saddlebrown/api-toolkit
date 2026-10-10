@@ -764,6 +764,22 @@ mod tests {
     }
 
     #[test]
+    fn r16b_duplicate_with_transport_error_action_fails_with_three_reasons() {
+        let e = run(counter(2), &five(TIMEOUT), 0);
+        check(
+            e,
+            Fail,
+            &[
+                R::DuplicateSideEffect,
+                R::ActionOutcomeAmbiguous,
+                R::TransportError,
+            ],
+            Complete,
+            Some(2),
+        );
+    }
+
+    #[test]
     fn r17_ambiguous_and_skew_is_inconclusive() {
         let e = run(counter(1), &five(AMBIGUOUS), 150);
         check(

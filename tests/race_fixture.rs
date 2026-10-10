@@ -132,6 +132,18 @@ async fn r1_healthy_passes_single_side_effect() {
     assert_eq!(count_status(e, 409), 4);
     assert!(e.actions.iter().all(|a| a.allowed));
     assert_eq!(stats(&url).await, (5, 2));
+    // The console skew number must be the report evidence value, not a separate computation.
+    let line = console_line(&r);
+    let shown = line
+        .split("skew=")
+        .nth(1)
+        .and_then(|t| t.split('/').next())
+        .unwrap_or_else(|| panic!("no skew in: {line}"));
+    let want = e
+        .dispatch_skew_ms
+        .expect("skew known after dispatch")
+        .to_string();
+    assert_eq!(shown, want, "{line}");
     fx.shutdown().await;
 }
 

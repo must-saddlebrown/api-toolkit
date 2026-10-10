@@ -1112,3 +1112,16 @@ fn validate_only_race_example_exits_0() {
     );
     assert_eq!(r.code, 0, "stderr: {} stdout: {}", r.stderr, r.stdout);
 }
+
+#[test]
+fn validate_only_race_reports_seven_planned_requests() {
+    let r = support::cli::run_bin(
+        &["validate", "--config", RACE_EXAMPLE, "--only", "race"],
+        &[
+            ("TEST_ACTION_ID", "act-1"),
+            ("TEST_AUTHORIZATION", RACE_AUTH),
+        ],
+    );
+    assert_eq!(r.code, 0, "stderr: {} stdout: {}", r.stderr, r.stdout);
+    assert!(r.stdout.contains("planned requests: 7"), "{}", r.stdout);
+}
