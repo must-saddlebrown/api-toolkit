@@ -22,9 +22,9 @@ sha2 = "0.11"
 percent-encoding = "2.3"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
 
 [dev-dependencies]
 axum = "0.8"
 tempfile = "3"
-tokio = { version = "1.53", features = ["test-util", "signal"] }
+tokio = { version = "1.53", features = ["test-util"] }

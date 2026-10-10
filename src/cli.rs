@@ -1,21 +1,27 @@
-//! Command line interface: `validate` (P0) and `check` (`--only` argument layer; the run
-//! itself is wired in S4, the full suite in P4).
+//! Command line interface: `validate` (P0) and `check --only` (one real run; the full
+//! suite comes in P4).
 //!
 //! `run` is a plain function over injected args, env lookup and output streams so it
 //! can be tested in-process. It returns the exit code; `main` only converts it.
 //! `validate` never builds a transport, so it cannot send a request.
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use time::OffsetDateTime;
+use tokio::sync::watch;
 
-use crate::config::{self, Selection};
-use crate::report::CheckName;
+use crate::checks::{Stop, brute_force};
+use crate::config::{self, BruteForceRequests, Selection};
+use crate::http::Transport;
+use crate::report::{self, CheckName, CheckResult, Completion, ReasonCode, Report, Scope, Verdict};
 
-/// Exit code for invalid config, usage errors and the `check` stub (PLAN §10).
+/// Exit code for invalid config, usage errors and every `check` outcome that is not a completed FAIL (PLAN §10).
 const EXIT_INVALID: u8 = 2;
 
 #[derive(Parser)]
@@ -99,14 +105,7 @@ where
             out: out_path,
             only,
         } => match check_args(&config, &out_path, only.as_deref(), env_lookup) {
-            Ok(()) => {
-                // ponytail: argument layer only; S4 replaces this with the real run.
-                let _ = writeln!(
-                    err,
-                    "error: `check --only` is not wired yet (the run itself comes in S4); no request was sent and no report was written"
-                );
-                EXIT_INVALID
-            }
+            Ok(prepared) => check_blocking(prepared, &out_path, out, err),
             Err(e) => {
                 let _ = writeln!(err, "error: {e:#}");
                 EXIT_INVALID
@@ -125,6 +124,14 @@ fn parse_only(name: &str) -> anyhow::Result<CheckName> {
     }
 }
 
+/// Everything a `check` run needs, ready before the first request.
+struct Prepared {
+    limits: config::Limits,
+    cfg: config::BruteForce,
+    requests: BruteForceRequests,
+    config_hash: String,
+}
+
 /// Everything `check` can know before sending a request. Order matters (K7): `--only`
 /// first, so a missing or bad value never reads the config or touches `--out`.
 fn check_args(
@@ -132,7 +139,7 @@ fn check_args(
     out: &Path,
     only: Option<&str>,
     env_lookup: &impl Fn(&str) -> Option<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Prepared> {
     let Some(only) = only else {
         anyhow::bail!(
             "the full suite is not implemented until P4 (full suite available in P4); run one check with --only brute_force. The config was not read, no request was sent and no report was written."
@@ -142,8 +149,163 @@ fn check_args(
     let text = read_config(config)?;
     let cfg = config::parse(&text)?;
     config::validate(&cfg, sel)?; // validate before resolve
-    config::resolve(&cfg, sel, env_lookup)?;
-    precheck_out(config, out)
+    let resolved = config::resolve(&cfg, sel, env_lookup)?;
+    precheck_out(config, out)?;
+    let config::Config {
+        limits,
+        brute_force,
+        ..
+    } = cfg;
+    let (Some(cfg), Some(requests)) = (brute_force, resolved.brute_force) else {
+        anyhow::bail!(
+            "invalid config at `brute_force`: section is required for the selected check"
+        );
+    };
+    Ok(Prepared {
+        limits,
+        cfg,
+        requests,
+        config_hash: report::config_hash(text.as_bytes()),
+    })
+}
+
+/// Sync wrapper: build the runtime, register SIGINT before the first request, then run.
+fn check_blocking(
+    prepared: Prepared,
+    out_path: &Path,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = writeln!(err, "error: cannot start the async runtime ({})", e.kind());
+            return EXIT_INVALID;
+        }
+    };
+    // `signal` needs a runtime context, so enter the runtime for this one call.
+    let mut sigint = {
+        let _guard = runtime.enter();
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(err, "error: cannot register SIGINT ({})", e.kind());
+                return EXIT_INVALID;
+            }
+        }
+    };
+    let cancel = async move {
+        if sigint.recv().await.is_none() {
+            std::future::pending::<()>().await; // signal stream closed: never cancel
+        }
+    };
+    runtime.block_on(run_check(prepared, out_path, cancel, out, err))
+}
+
+/// The run itself. `cancel` is injected so tests need no real signal. Not `Send`-bound:
+/// it is driven by `Runtime::block_on` on the calling thread.
+async fn run_check(
+    prepared: Prepared,
+    out_path: &Path,
+    cancel: impl Future<Output = ()>,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    let started = OffsetDateTime::now_utc();
+    let deadline = tokio::time::sleep(Duration::from_millis(prepared.limits.suite_deadline_ms));
+    let transport = match Transport::new(&prepared.limits) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = writeln!(err, "error: cannot build the HTTP client: {e}");
+            return EXIT_INVALID;
+        }
+    };
+
+    let (stop_tx, stop_rx) = watch::channel(None);
+    let check = brute_force::run(
+        &transport,
+        &prepared.cfg,
+        &prepared.requests.baseline,
+        &prepared.requests.probe,
+        stop_rx,
+    );
+    tokio::pin!(check, deadline, cancel);
+    let mut stop_sent: Option<Stop> = None;
+    let result = loop {
+        tokio::select! {
+            biased;
+            _ = &mut cancel, if stop_sent.is_none() => {
+                stop_sent = Some(Stop::Cancelled);
+                stop_tx.send_replace(stop_sent);
+            }
+            _ = &mut deadline, if stop_sent.is_none() => {
+                stop_sent = Some(Stop::DeadlineExceeded);
+                stop_tx.send_replace(stop_sent);
+            }
+            r = &mut check => break r,
+        }
+    };
+    let finished = OffsetDateTime::now_utc();
+
+    // Console first, so the result is on screen even if the report cannot be written.
+    let _ = writeln!(out, "{}", brute_force::console_line(&result));
+    let _ = writeln!(
+        err,
+        "note: partial run (--only brute_force): race, load not run; a partial run never exits 0, read the verdict above or in {}",
+        out_path.display()
+    );
+
+    let cancelled = result.reasons.contains(&ReasonCode::Cancelled);
+    let built = partial_report(started, finished, &prepared.config_hash, result);
+    let report = match built {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            return if cancelled { 130 } else { EXIT_INVALID };
+        }
+    };
+    if let Err(e) = report::write_report_atomic(out_path, &report) {
+        let _ = writeln!(err, "error: {e}");
+        return if cancelled { 130 } else { EXIT_INVALID };
+    }
+    u8::try_from(report::exit_code(&report)).unwrap_or(EXIT_INVALID)
+}
+
+/// A check that `--only` left out (K10): not run, incomplete, no evidence.
+fn excluded(check: CheckName) -> CheckResult {
+    CheckResult {
+        check,
+        verdict: Verdict::NotRun,
+        reasons: vec![ReasonCode::ExcludedByOnly],
+        completion: Completion::Incomplete,
+        evidence: None,
+    }
+}
+
+/// Report of a `--only brute_force` run: entries in the default order race, load,
+/// brute_force; timestamps cut to whole seconds; suite completion follows the selected check.
+fn partial_report(
+    started: OffsetDateTime,
+    finished: OffsetDateTime,
+    config_hash: &str,
+    result: CheckResult,
+) -> Result<Report, report::ReportError> {
+    let unix_ms = u64::try_from(started.unix_timestamp_nanos() / 1_000_000).unwrap_or(0);
+    let run_id = report::run_id(unix_ms, config_hash);
+    let whole_second = |t: OffsetDateTime| t.replace_nanosecond(0).unwrap_or(t);
+    let completion = result.completion;
+    Report::new(
+        run_id,
+        config_hash.to_string(),
+        whole_second(started),
+        whole_second(finished),
+        completion,
+        Scope::Partial,
+        vec![excluded(CheckName::Race), excluded(CheckName::Load), result],
+    )
 }
 
 /// Reject an unusable `--out` before any request is sent (K19): the check may change
@@ -583,20 +745,28 @@ mod tests {
     }
 
     #[test]
-    fn check_only_brute_force_valid_stops_not_wired_without_report() {
+    fn check_only_brute_force_valid_no_longer_says_not_wired() {
+        // The real run is covered by the `run_check_*` tests below (local listener).
+        // Here: a valid partial config with a closed port must run, not stop at the stub.
         let dir = tempfile::tempdir().unwrap();
         let report = dir.path().join("r.json");
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(PARTIAL).unwrap()).unwrap();
+        v["base_url"] = Value::from(closed_port_url());
+        v["brute_force"]["interval_ms"] = Value::from(1);
+        let (_d, cfg) = temp_config(&v.to_string());
         let (code, out, err) = check_only(&[
             "--config",
-            PARTIAL,
+            &cfg,
             "--out",
             report.to_str().unwrap(),
             "--only",
             "brute_force",
         ]);
-        assert_eq!(code, 2);
-        assert!(err.contains("not wired yet"), "{err}");
-        assert!(!report.exists());
+        assert_eq!(code, 2, "{err}");
+        assert!(!err.contains("not wired"), "{err}");
+        assert!(out.starts_with("brute_force ERROR"), "{out}");
+        assert!(report.exists());
         assert_no_sentinel(&out, &err);
     }
 
@@ -683,5 +853,377 @@ mod tests {
         let (code, out, _) = run_args(&["api-toolkit", "--version"], &full_env);
         assert_eq!(code, 0);
         assert!(out.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    // ---- real run (S4): local listener on 127.0.0.1 port 0, no real signal ----
+
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn closed_port_url() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        drop(l);
+        url
+    }
+
+    /// Reads one request (headers and body) so the client never sees a reset.
+    async fn read_request(sock: &mut tokio::net::TcpStream) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = sock.read(&mut chunk).await.unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+            let len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + len {
+                return;
+            }
+        }
+    }
+
+    /// Answers request number i (0 = baseline) with `status_of(i)`; counts requests.
+    async fn serve(status_of: fn(usize) -> u16) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let i = seen.fetch_add(1, Ordering::SeqCst);
+                read_request(&mut sock).await;
+                let status = status_of(i);
+                let body = r#"{"access_token":"t"}"#;
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        (addr, count)
+    }
+
+    /// Accepts connections and never answers; counts them.
+    async fn hang() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                held.push(sock);
+            }
+        });
+        (addr, count)
+    }
+
+    /// Healthy login: baseline 200, failed logins 1..=5 -> 401, 6.. -> 429.
+    fn healthy(i: usize) -> u16 {
+        match i {
+            0 => 200,
+            1..=5 => 401,
+            _ => 429,
+        }
+    }
+    fn unprotected(i: usize) -> u16 {
+        if i == 0 { 200 } else { 401 }
+    }
+    fn accepts_invalid(_: usize) -> u16 {
+        200
+    }
+
+    struct RunOut {
+        code: u8,
+        out: String,
+        err: String,
+        report_path: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl RunOut {
+        fn report(&self) -> Value {
+            serde_json::from_str(&std::fs::read_to_string(&self.report_path).unwrap()).unwrap()
+        }
+        fn report_text(&self) -> String {
+            std::fs::read_to_string(&self.report_path).unwrap_or_default()
+        }
+        fn bf(&self) -> Value {
+            self.report()["checks"][2].clone()
+        }
+    }
+
+    /// Prepare through `check_args` (so the whole path is real), then `run_check`.
+    async fn run_it(
+        base_url: &str,
+        tweak: impl FnOnce(&mut Value),
+        cancel: impl Future<Output = ()>,
+    ) -> RunOut {
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(PARTIAL).unwrap()).unwrap();
+        v["base_url"] = Value::from(base_url);
+        v["brute_force"]["interval_ms"] = Value::from(1);
+        tweak(&mut v);
+        let (dir, cfg) = temp_config(&v.to_string());
+        let report_path = Path::new(&cfg).with_file_name("report.json");
+        let prepared = check_args(
+            Path::new(&cfg),
+            &report_path,
+            Some("brute_force"),
+            &full_env,
+        )
+        .unwrap_or_else(|e| panic!("prepare failed: {e:#}"));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_check(prepared, &report_path, cancel, &mut out, &mut err).await;
+        RunOut {
+            code,
+            out: String::from_utf8(out).unwrap(),
+            err: String::from_utf8(err).unwrap(),
+            report_path,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_check_healthy_is_2_with_pass_report() {
+        let (addr, count) = serve(healthy).await;
+        let r = run_it(&format!("http://{addr}"), |_| {}, std::future::pending()).await;
+        assert_eq!(r.code, 2, "{}", r.err);
+        assert_eq!(
+            r.out,
+            "brute_force PASS first_protected=6 tail=3/2 attempts=8/8 reasons=protection_observed\n"
+        );
+        assert!(
+            r.err.contains("partial run (--only brute_force)"),
+            "{}",
+            r.err
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 9);
+        let rep = r.report();
+        assert_eq!(rep["report_version"], 1);
+        assert_eq!(rep["scope"], "partial");
+        assert_eq!(rep["completion"], "complete");
+        assert_eq!(rep["checks"][2]["verdict"], "pass");
+        assert_eq!(rep["checks"][2]["completion"], "complete");
+        assert!(rep["checks"][2]["evidence"].is_object());
+        assert_no_sentinel(&r.out, &r.err);
+        assert!(!r.report_text().contains(SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn run_check_report_shape_order_and_ids() {
+        let (addr, _) = serve(healthy).await;
+        let r = run_it(&format!("http://{addr}"), |_| {}, std::future::pending()).await;
+        let rep = r.report();
+        let names: Vec<&str> = rep["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["check"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["race", "load", "brute_force"]);
+        for i in 0..2 {
+            let c = rep["checks"][i].as_object().unwrap();
+            assert_eq!(c["verdict"], "not_run");
+            assert_eq!(c["reasons"], serde_json::json!(["excluded_by_only"]));
+            assert_eq!(c["completion"], "incomplete");
+            assert!(!c.contains_key("evidence"));
+        }
+        // config_hash = SHA-256 of the config file bytes; run_id = <unix_ms>-<8 hex>.
+        let cfg_bytes = std::fs::read(r.report_path.with_file_name("c.json")).unwrap();
+        let hash = report::config_hash(&cfg_bytes);
+        assert_eq!(rep["config_hash"], hash.as_str());
+        let id = rep["run_id"].as_str().unwrap();
+        let (ms, short) = id.split_once('-').unwrap();
+        assert!(ms.parse::<u64>().is_ok(), "{id}");
+        assert_eq!(short, &hash[..8]);
+        // Timestamps: RFC3339 UTC, whole seconds.
+        for key in ["started_at", "finished_at"] {
+            let t = rep[key].as_str().unwrap();
+            assert!(t.ends_with('Z') && !t.contains('.'), "{key}: {t}");
+        }
+        // No temp file left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(r.report_path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn run_check_fail_verdicts_are_1() {
+        for status_of in [unprotected as fn(usize) -> u16, accepts_invalid] {
+            let (addr, _) = serve(status_of).await;
+            let r = run_it(&format!("http://{addr}"), |_| {}, std::future::pending()).await;
+            assert_eq!(r.code, 1, "{} / {}", r.out, r.err);
+            assert!(r.out.starts_with("brute_force FAIL"), "{}", r.out);
+            assert_eq!(r.bf()["verdict"], "fail");
+            assert_eq!(r.report()["completion"], "complete");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_check_prelocked_is_inconclusive_2() {
+        let (addr, count) = serve(|_| 429).await;
+        let r = run_it(&format!("http://{addr}"), |_| {}, std::future::pending()).await;
+        assert_eq!(r.code, 2);
+        assert_eq!(r.bf()["verdict"], "inconclusive");
+        assert_eq!(count.load(Ordering::SeqCst), 1); // baseline only, no retry
+    }
+
+    #[tokio::test]
+    async fn run_check_closed_port_is_error_2() {
+        let r = run_it(&closed_port_url(), |_| {}, std::future::pending()).await;
+        assert_eq!(r.code, 2, "{}", r.err);
+        assert!(r.out.starts_with("brute_force ERROR"), "{}", r.out);
+        assert_eq!(r.bf()["verdict"], "error");
+        assert_no_sentinel(&r.out, &r.err);
+        assert!(!r.report_text().contains(SENTINEL));
+        assert!(!r.err.contains("127.0.0.1"), "url leaked: {}", r.err);
+    }
+
+    #[tokio::test]
+    async fn run_check_cancel_before_dispatch_is_130_with_report() {
+        let (addr, count) = serve(healthy).await;
+        let r = run_it(&format!("http://{addr}"), |_| {}, std::future::ready(())).await;
+        assert_eq!(r.code, 130, "{}", r.err);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        let rep = r.report();
+        assert_eq!(rep["scope"], "partial");
+        assert_eq!(rep["completion"], "incomplete");
+        let bf = &rep["checks"][2];
+        assert_eq!(bf["verdict"], "not_run");
+        assert_eq!(bf["reasons"], serde_json::json!(["cancelled"]));
+        assert_eq!(bf["completion"], "incomplete");
+        assert!(r.out.starts_with("brute_force NOT_RUN"), "{}", r.out);
+        assert!(r.out.contains("reasons=cancelled"), "{}", r.out);
+    }
+
+    #[tokio::test]
+    async fn run_check_cancel_while_request_hangs_is_130() {
+        let (addr, count) = hang().await;
+        let cancel = tokio::time::sleep(Duration::from_millis(150));
+        let r = run_it(&format!("http://{addr}"), |_| {}, cancel).await;
+        assert_eq!(r.code, 130, "{}", r.err);
+        assert_eq!(r.bf()["verdict"], "not_run");
+        assert_eq!(r.bf()["reasons"], serde_json::json!(["cancelled"]));
+        assert_eq!(r.report()["completion"], "incomplete");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_check_deadline_is_2_not_run_deadline_exceeded() {
+        let (addr, count) = hang().await;
+        let r = run_it(
+            &format!("http://{addr}"),
+            |v| v["limits"]["suite_deadline_ms"] = Value::from(200),
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(r.code, 2, "{}", r.err);
+        assert_eq!(r.bf()["verdict"], "not_run");
+        assert_eq!(r.bf()["reasons"], serde_json::json!(["deadline_exceeded"]));
+        assert_eq!(r.report()["completion"], "incomplete");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_check_overwrites_existing_report() {
+        let (addr, _) = serve(healthy).await;
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(PARTIAL).unwrap()).unwrap();
+        v["base_url"] = Value::from(format!("http://{addr}"));
+        v["brute_force"]["interval_ms"] = Value::from(1);
+        let (dir, cfg) = temp_config(&v.to_string());
+        let out_path = dir.path().join("report.json");
+        std::fs::write(&out_path, "OLD").unwrap();
+        let (code, _, err) = {
+            let prepared =
+                check_args(Path::new(&cfg), &out_path, Some("brute_force"), &full_env).unwrap();
+            let (mut o, mut e) = (Vec::new(), Vec::new());
+            let code = run_check(prepared, &out_path, std::future::pending(), &mut o, &mut e).await;
+            (code, o, String::from_utf8(e).unwrap())
+        };
+        assert_eq!(code, 2, "{err}");
+        assert!(
+            std::fs::read_to_string(&out_path)
+                .unwrap()
+                .contains("\"scope\"")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_check_report_write_failure_keeps_console_and_old_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (addr, _) = serve(healthy).await;
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(PARTIAL).unwrap()).unwrap();
+        v["base_url"] = Value::from(format!("http://{addr}"));
+        v["brute_force"]["interval_ms"] = Value::from(1);
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_dir.path().join("c.json");
+        std::fs::write(&cfg, v.to_string()).unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let out_path = out_dir.path().join("report.json");
+        std::fs::write(&out_path, "OLD").unwrap();
+        // root ignores directory permissions; skip in that case
+        std::fs::set_permissions(out_dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(out_dir.path().join("probe")).is_ok() {
+            std::fs::set_permissions(out_dir.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            return;
+        }
+        let prepared = check_args(&cfg, &out_path, Some("brute_force"), &full_env).unwrap();
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        let code = run_check(prepared, &out_path, std::future::pending(), &mut o, &mut e).await;
+        std::fs::set_permissions(out_dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (o, e) = (String::from_utf8(o).unwrap(), String::from_utf8(e).unwrap());
+        assert_eq!(code, 2, "{e}");
+        assert!(o.starts_with("brute_force PASS"), "{o}");
+        assert!(e.contains("cannot write report"), "{e}");
+        assert!(e.contains(out_path.to_str().unwrap()), "{e}");
+        assert_eq!(std::fs::read_to_string(&out_path).unwrap(), "OLD");
+        assert_eq!(std::fs::read_dir(out_dir.path()).unwrap().count(), 1);
+        assert_no_sentinel(&o, &e);
+    }
+
+    #[test]
+    fn partial_report_whole_seconds_and_excluded_shape() {
+        let t = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_789).unwrap();
+        let bf = CheckResult {
+            check: CheckName::BruteForce,
+            verdict: Verdict::NotRun,
+            reasons: vec![ReasonCode::Cancelled],
+            completion: Completion::Incomplete,
+            evidence: None,
+        };
+        let r = partial_report(t, t, "abcdef0123456789", bf).unwrap();
+        assert_eq!(r.started_at, "2023-11-14T22:13:20Z");
+        assert_eq!(r.run_id, "1700000000123-abcdef01");
+        assert_eq!(r.completion, Completion::Incomplete);
+        assert_eq!(r.scope, Scope::Partial);
+        assert_eq!(report::exit_code(&r), 130);
+        assert_eq!(r.checks[0], excluded(CheckName::Race));
+        assert_eq!(r.checks[1], excluded(CheckName::Load));
     }
 }
