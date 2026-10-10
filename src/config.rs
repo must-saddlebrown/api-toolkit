@@ -5,9 +5,16 @@
 //! like `"${ENV:LOGIN_USER}"` stay plain strings here.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::marker::PhantomData;
 
 use serde::Deserialize;
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::Value;
+
+mod validate;
+
+pub use validate::{RequestBudget, validate};
 
 /// The only config version this build understands.
 pub const SUPPORTED_VERSION: u32 = 1;
@@ -26,6 +33,11 @@ pub enum ConfigError {
         line: usize,
         column: usize,
     },
+    /// Semantic rule violation from `validate`. `path` is a field path such as
+    /// `brute_force.attempts`; `rule` states the rule. Neither contains config values
+    /// (only numbers and field/header names), because values may be secret placeholders.
+    #[error("invalid config at `{path}`: {rule}")]
+    Invalid { path: String, rule: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,9 +80,15 @@ impl Default for Limits {
 pub struct RequestSpec {
     pub method: String,
     pub path: String,
+    #[serde(default, deserialize_with = "unique_opt_map")]
     pub path_params: Option<BTreeMap<String, String>>,
+    #[serde(default, deserialize_with = "unique_opt_map")]
     pub query: Option<BTreeMap<String, String>>,
+    #[serde(default, deserialize_with = "unique_opt_map")]
     pub headers: Option<BTreeMap<String, String>>,
+    /// `null` is kept as `Some(Value::Null)` (not folded into `None`) so `validate`
+    /// can reject it explicitly.
+    #[serde(default, deserialize_with = "keep_null")]
     pub json: Option<Value>,
 }
 
@@ -80,6 +98,7 @@ pub struct RequestSpec {
 pub struct MatcherSpec {
     pub status_in: Vec<u16>,
     /// JSON Pointer -> expected JSON value.
+    #[serde(default, deserialize_with = "unique_opt_map")]
     pub json_equals: Option<BTreeMap<String, Value>>,
     /// JSON Pointers that must exist.
     pub json_exists: Option<Vec<String>>,
@@ -126,6 +145,50 @@ pub struct Load {
     pub max_p95_ms: u64,
 }
 
+/// `Option<Value>` normally turns JSON `null` into `None`; this keeps it as `Some(Null)`.
+fn keep_null<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+/// Reads a JSON object into a `BTreeMap`, but fails on a repeated key instead of
+/// letting the last one win silently. Only the key NAME goes in the message.
+struct UniqueMap<V>(BTreeMap<String, V>);
+
+struct UniqueMapVisitor<V>(PhantomData<V>);
+
+impl<'de, V: Deserialize<'de>> Visitor<'de> for UniqueMapVisitor<V> {
+    type Value = UniqueMap<V>;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+        let mut map = BTreeMap::new();
+        while let Some((key, value)) = access.next_entry::<String, V>()? {
+            if map.contains_key(&key) {
+                return Err(de::Error::custom(format!("duplicate key `{key}`")));
+            }
+            map.insert(key, value);
+        }
+        Ok(UniqueMap(map))
+    }
+}
+
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for UniqueMap<V> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_map(UniqueMapVisitor(PhantomData))
+    }
+}
+
+fn unique_opt_map<'de, D, V>(d: D) -> Result<Option<BTreeMap<String, V>>, D::Error>
+where
+    D: Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    Ok(Option::<UniqueMap<V>>::deserialize(d)?.map(|m| m.0))
+}
+
 /// Only reads `config_version`; other fields are ignored so a future-version
 /// file reports "unsupported version" instead of a schema error.
 #[derive(Deserialize)]
@@ -166,6 +229,7 @@ fn safe_detail(message: &str) -> String {
     if first_line.starts_with("unknown field ")
         || first_line.starts_with("missing field ")
         || first_line.starts_with("duplicate field ")
+        || first_line.starts_with("duplicate key ")
     {
         return first_line.to_string();
     }
@@ -222,14 +286,77 @@ mod tests {
         let err = parse(&text).unwrap_err();
         assert!(err.to_string().contains("unknown field `bogus`"), "{err}");
 
-        let text = example_with("\"status_in\": [429]", "\"status_in\": [429], \"nope\": 1");
-        assert!(parse(&text).is_err());
+        // (pattern, replacement, unknown field name) for each nested struct.
+        let cases = [
+            (
+                "\"status_in\": [429]",
+                "\"status_in\": [429], \"nope\": 1",
+                "nope",
+            ),
+            (
+                "\"request_timeout_ms\": 5000,",
+                "\"request_timeout_ms\": 5000, \"x\": 1,",
+                "x",
+            ),
+            (
+                "\"path\": \"/login\",",
+                "\"path\": \"/login\", \"req_extra\": 1,",
+                "req_extra",
+            ),
+            (
+                "\"settle_ms\": 250",
+                "\"settle_ms\": 250, \"race_extra\": 1",
+                "race_extra",
+            ),
+            (
+                "\"max_p95_ms\": 500",
+                "\"max_p95_ms\": 500, \"load_extra\": 1",
+                "load_extra",
+            ),
+        ];
+        for (from, to, name) in cases {
+            let err = parse(&example_with(from, to)).unwrap_err();
+            let want = format!("unknown field `{name}`");
+            assert!(err.to_string().contains(&want), "{err}");
+        }
+    }
 
+    #[test]
+    fn duplicate_map_keys_are_rejected_without_values() {
+        let headers = "\"headers\": {\"Authorization\": \"${ENV:TEST_AUTHORIZATION}\"}";
+        let cases = [
+            (
+                headers,
+                "\"headers\": {\"Authorization\": \"SENT1\", \"Authorization\": \"SENT2\"}",
+                "Authorization",
+            ),
+            (
+                "\"path_params\": {\"id\": \"${ENV:TEST_ACTION_ID}\"}",
+                "\"path_params\": {\"id\": \"SENT1\", \"id\": \"SENT2\"}",
+                "id",
+            ),
+            (
+                "\"status_in\": [200], \"json_exists\": [\"/access_token\"]",
+                "\"status_in\": [200], \"json_equals\": {\"/a\": \"SENT1\", \"/a\": \"SENT2\"}",
+                "/a",
+            ),
+        ];
+        for (from, to, key) in cases {
+            let err = parse(&example_with(from, to)).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(&format!("duplicate key `{key}`")), "{msg}");
+            assert!(!msg.contains("SENT"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn json_null_is_kept_as_some_null() {
         let text = example_with(
-            "\"request_timeout_ms\": 5000,",
-            "\"request_timeout_ms\": 5000, \"x\": 1,",
+            "\"method\": \"GET\", \"path\": \"/critical\",",
+            "\"method\": \"GET\", \"path\": \"/critical\", \"json\": null,",
         );
-        assert!(parse(&text).is_err());
+        let cfg = parse(&text).expect("null parses");
+        assert_eq!(cfg.load.request.json, Some(Value::Null));
     }
 
     #[test]
