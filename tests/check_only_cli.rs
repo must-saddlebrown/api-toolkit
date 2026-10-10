@@ -1185,6 +1185,9 @@ async fn load_healthy_is_pass_line_exit_2_partial_report_and_101_requests() {
     let line = one_line(&run);
     assert!(line.starts_with("load PASS "), "{line}");
     assert!(line.contains("thresholds_met"), "{line}");
+    for part in ["samples=100", "max_in_flight=10/10", "attempted=100/100"] {
+        assert!(line.contains(part), "missing `{part}` in: {line}");
+    }
     assert!(
         run.stderr.starts_with("note: partial run (--only load)"),
         "stderr: {}",
@@ -1198,6 +1201,9 @@ async fn load_healthy_is_pass_line_exit_2_partial_report_and_101_requests() {
         (ev["dispatched"].as_u64(), ev["attempted"].as_u64()),
         (Some(100), Some(100))
     );
+    assert_eq!(ev["failed"], 0, "evidence: {ev}");
+    assert_eq!(ev["succeeded"], 100, "evidence: {ev}");
+    assert_eq!(ev["status_counts"], json!({"200": 100}), "evidence: {ev}");
     // No retry: 1 preflight + 100 load requests.
     assert_eq!(stat(&fx, "load_requests").await, 101);
     assert_eq!(w.file_names(), ["c.json", "result.json"]);
@@ -1271,7 +1277,7 @@ async fn load_rejected_inputs_exit_2_with_zero_connections_and_out_untouched() {
             "requests = 0",
             load_cfg(&base, |v| v["load"]["requests"] = json!(0)),
             load_env(RACE_AUTH),
-            "load",
+            "invalid config at `load.requests`: must be in 1..=1000",
         ),
         (
             "TEST_AUTHORIZATION missing",
@@ -1285,7 +1291,7 @@ async fn load_rejected_inputs_exit_2_with_zero_connections_and_out_untouched() {
                 v.as_object_mut().unwrap().remove("load");
             }),
             load_env(RACE_AUTH),
-            "load",
+            "invalid config at `load`: is required for the selected check",
         ),
     ];
     for existing in [false, true] {
@@ -1362,21 +1368,26 @@ async fn load_sentinels_are_on_the_wire_but_not_in_cli_output() {
         "complete",
     );
     // Positive control per channel: each sentinel really was sent, in its own place.
-    let wire = rec.text().to_ascii_lowercase();
-    let (s, h, q) = (
-        SENTINEL.to_ascii_lowercase(),
-        SENT_HDR.to_ascii_lowercase(),
-        SENT_Q.to_ascii_lowercase(),
-    );
-    assert!(
-        wire.contains(&format!("get /critical?q={q} ")),
+    // Header names are case-insensitive; values and the request line are compared byte-exact.
+    let wire = rec.text();
+    let mut lines = wire.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    assert_eq!(
+        request_line,
+        format!("GET /critical?q={SENT_Q} HTTP/1.1"),
         "wire: {wire}"
     );
-    assert!(
-        wire.contains(&format!("authorization: {s}")),
-        "wire: {wire}"
-    );
-    assert!(wire.contains(&format!("x-sentinel: {h}")), "wire: {wire}");
+    let headers: Vec<(String, &str)> = lines
+        .take_while(|l| !l.is_empty())
+        .filter_map(|l| l.split_once(':'))
+        .map(|(n, v)| (n.to_ascii_lowercase(), v.trim()))
+        .collect();
+    for (name, value) in [("authorization", SENTINEL), ("x-sentinel", SENT_HDR)] {
+        assert!(
+            headers.iter().any(|(n, v)| n == name && *v == value),
+            "header {name}: {value} not byte-exact on the wire: {wire}"
+        );
+    }
     // Negative, explicit: none of the three values in any console stream or the report.
     let report_text = std::fs::read_to_string(&w.out).unwrap();
     for hay in [&run.stdout, &run.stderr, &report_text] {
@@ -1410,4 +1421,66 @@ async fn load_sentinels_against_fixture_do_not_leak_on_pass_or_fail() {
         }
         fx.shutdown().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn load_deadline_during_load_is_not_run_deadline_exceeded_workload_incomplete() {
+    let fx = Fixture::start(0).await.unwrap();
+    let w = Work::new(&load_cfg(&fx.base_url(), |v| {
+        v["load"]["request"]["path"] = json!("/broken/critical/hang");
+        v["load"]["requests"] = json!(20);
+        v["load"]["concurrency"] = json!(1);
+        v["limits"]["request_timeout_ms"] = json!(10000);
+        v["limits"]["suite_deadline_ms"] = json!(1500);
+    }));
+    let run = exec(&load_job(&w, load_env(RACE_AUTH))).await;
+    assert_eq!(run.code, 2, "stderr: {}", run.stderr);
+    let line = one_line(&run);
+    assert!(line.starts_with("load NOT_RUN "), "{line}");
+    let rep = w.report();
+    assert_load(
+        &rep,
+        "not_run",
+        json!(["deadline_exceeded", "workload_incomplete"]),
+        "incomplete",
+    );
+    let ev = &load_entry(&rep)["evidence"];
+    let (d, a) = (
+        ev["dispatched"].as_u64().unwrap(),
+        ev["attempted"].as_u64().unwrap(),
+    );
+    assert!((1..20).contains(&a), "attempted {a}, evidence: {ev}");
+    assert!(d >= a, "dispatched {d} < attempted {a}");
+    fx.shutdown().await;
+}
+
+#[test]
+fn check_without_only_message_names_all_three_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("r.json");
+    let run = support::cli::run_bin(
+        &[
+            "check",
+            "--config",
+            "/nonexistent/c.json",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(run.code, 2, "stderr: {}", run.stderr);
+    for needle in [
+        "--only brute_force",
+        "--only race",
+        "--only load",
+        "full suite available in P4",
+    ] {
+        assert!(
+            run.stderr.contains(needle),
+            "missing `{needle}`: {}",
+            run.stderr
+        );
+    }
+    assert!(!out.exists(), "out was created");
+    assert!(run.stdout.is_empty(), "stdout: {}", run.stdout);
 }
