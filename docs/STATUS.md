@@ -8,11 +8,11 @@ Rencana aktif: `docs/PLAN.md` (Small Core Proof, 9 Oktober 2026). Keputusan sete
 | P1 | Login brute-force protection check | selesai (10 Oktober 2026) | Phase gate PASS; 18 dari 18 AC terpenuhi; 185 test hijau |
 | P2 | Write-once race check | selesai (10 Oktober 2026) | Phase gate PASS; 25 dari 25 AC terpenuhi; 303 test hijau |
 | P3 | Parallel load check | selesai (10 Oktober 2026) | Phase gate PASS; 26 dari 26 AC terpenuhi; 393 test hijau |
-| P4 | Single-command proof + satu API nyata | sebagian dimajukan (10 Oktober 2026) | `check --only brute_force`, `--only race`, dan `--only load` selesai; suite lengkap (tanpa `--only`) dan checkpoint review pengguna belum. Siap: `/phase P4` |
+| P4 | Single-command proof + satu API nyata | menunggu review pengguna (10 Oktober 2026) | Phase gate PASS; fixture proof selesai (suite lengkap `check` tanpa `--only`, 416 test hijau); P4-AC7 validasi target nyata belum dilakukan |
 
 ## Fase aktif
 
-Tidak ada. P0, P1, P2, dan P3 selesai; P4 siap dimulai. Sebagian P4 sudah dimajukan: `check --only brute_force`, `--only race`, dan `--only load` bisa dicoba (lihat "Mencoba `check --only`" dan DECISIONS 2026-10-10 "Majukan sebagian P4").
+P4: **menunggu review pengguna** (checkpoint). P0–P3 selesai. Fixture proof end to end selesai; validasi target nyata belum dilakukan dan menunggu config dari pengguna (lihat "Validasi API nyata").
 
 ## Ringkasan AC P0
 
@@ -59,6 +59,18 @@ Semua P3-AC1 sampai P3-AC26 terpenuhi, dengan bukti nama test di handoff `.claud
 - Fixture: `/critical`, `/broken/critical/{slow,flaky,hang}` (flaky dan hang setiap request ke-10 berdasarkan counter); `load_requests` menghitung semua request rute load termasuk 401 (AC25).
 - CLI `check --only load` dan `validate --only load`; contoh `examples/load-only.json` (101 request, 0 ms fixed waits) (AC20, AC21, AC23, AC24).
 
+## Ringkasan AC P4
+
+Semua AC P4 terpenuhi dengan bukti nama test di handoff `.claude/work/P4-plan.md` (Log, entri phase gate), **kecuali P4-AC7: fixture proof selesai, validasi target nyata belum dilakukan.** Ringkas:
+
+- `check` tanpa `--only` menjalankan race → load → brute_force berurutan, satu deadline suite, tiga baris console, report `scope: full` (AC1, AC8).
+- Satu check FAIL/ERROR/INCONCLUSIVE tidak menghentikan yang lain; exit code sesuai PLAN §10 (matriks E1–E13): 0 hanya bila tiga PASS complete, 1 bila ada FAIL tanpa kondisi exit-2, 2 untuk sisanya, 130 untuk cancel (AC2, AC3).
+- Cancel/deadline: check yang belum jalan menjadi `not_run` tanpa request; cancel sebelum check pertama kini 130 (AC3.4, AC3.5).
+- Ulang tanpa reset tidak pernah PASS palsu (race `initial_counter_not_zero`, brute_force `account_already_locked`, exit 2); setelah reset hasil sama dengan run pertama (AC4).
+- Report ditulis atomic (inode berubah, tanpa file temp), timestamp tanpa pecahan detik; gagal tulis → `report NOT WRITTEN: <path>` di stdout, exit 2/130, isi lama utuh (AC5.1, AC5.2, AC5.4).
+- Sentinel secret tidak muncul di stdout, stderr, report; terbukti terkirim di wire lewat listener TCP mentah (AC5.3).
+- `examples/core-checks-broken.json`, README untuk suite lengkap, daftar input API nyata (PLAN §14), `docs/fixture.md` (AC1.4, AC6, AC9).
+
 ## Cara mencoba
 
 Semua command dijalankan dari root repo.
@@ -67,7 +79,7 @@ Semua command dijalankan dari root repo.
 # Gate kualitas
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets            # 393 test, tanpa env var dan tanpa fixture berjalan
+cargo test --all-targets            # 416 test, tanpa env var dan tanpa fixture berjalan
 
 # Fixture healthy (terminal 1); reset dan detail ada di docs/fixture.md
 cargo run --example fixture         # http://127.0.0.1:8080, Ctrl-C untuk berhenti
@@ -84,16 +96,24 @@ cargo test --test check_only_cli        # 21 test end-to-end CLI `check --only`,
 cargo test --test race_fixture          # 12 test check race terhadap fixture, port acak
 cargo test --test load_fixture          # 13 test check load terhadap fixture, port acak
 
+# BUKTI FIXTURE PROOF (satu perintah): suite lengkap, healthy dan broken, biner nyata, fixture di port acak
+cargo test --test fixture_proof         # 12 test, tanpa env var dan tanpa fixture berjalan
+
 # Varian rusak untuk dicoba manual (fixture berjalan): POST /broken/login/unprotected,
 # POST /broken/login/accepts-invalid, GET /__admin/stats (detail di docs/fixture.md)
 
-# `check` tanpa `--only` ditolak sampai P4: exit 2, config tidak dibaca, nol request
-cargo run -q -- check --config examples/core-checks.json --out /tmp/result.json; echo $?
+# Suite lengkap manual (fixture berjalan, env di atas ada; reset sebelum tiap suite)
+curl -X POST http://127.0.0.1:8080/__admin/reset
+cargo run -q -- check --config examples/core-checks.json --out /tmp/result.json; echo $?          # healthy: 3 PASS, exit 0
+curl -X POST http://127.0.0.1:8080/__admin/reset
+cargo run -q -- check --config examples/core-checks-broken.json --out /tmp/result.json; echo $?   # rusak: 3 FAIL, exit 1
+# stdout (healthy): race PASS ... reasons=single_side_effect / load PASS ... reasons=thresholds_met / brute_force PASS ... reasons=protection_observed
+# stdout (rusak):   duplicate_side_effect / error_rate_exceeded / protection_policy_not_met
 ```
 
 ## Mencoba `check --only` (majukan sebagian P4)
 
-Menjalankan satu check ke fixture lokal dan menulis report JSON. Saat ini `brute_force`, `race`, dan `load`; `--only load` aktif sejak P3. Tanpa `--only`, `check` menolak dengan pesan `full suite available in P4` (pesan CLI berbahasa Inggris, sesuai DECISIONS P0 S9).
+Menjalankan satu check ke fixture lokal dan menulis report JSON. Saat ini `brute_force`, `race`, dan `load`; `--only load` aktif sejak P3. Tanpa `--only`, `check` menjalankan suite lengkap (lihat "Cara mencoba").
 
 **Exit code run `--only` tidak pernah 0**: FAIL yang selesai = 1, PASS dan semua hasil lain (inconclusive, error, not_run, incomplete) = 2, cancel (Ctrl-C) = 130. PASS dibaca dari baris console dan dari `checks[].verdict` di report, bukan dari exit code. Report ditandai `"scope": "partial"`; check yang tidak dipilih tercatat `not_run` dengan reason `excluded_by_only`.
 
@@ -189,13 +209,12 @@ Verifier tetap `GET /actions/{id}`. Detail rute dan titik sinkronisasi ada di `d
 
 ## Known limitations
 
-- `check` hanya bisa `--only brute_force` atau `--only race`; suite lengkap (tanpa `--only`) datang di P4 dan `check` tanpa `--only` ditolak. Keputusan nasib `--only` setelah P4 diambil di P4. Penulis report atomic sudah ada tetapi belum dipanggil CLI.
+- `check` tanpa `--only` menjalankan suite lengkap (P4); `--only brute_force|race|load` tetap ada sebagai run parsial (DECISIONS P4).
 - Fixture: healthy dan dua varian login rusak (P1). Varian racy dan idempotent ada sejak P2; varian load slow, flaky, dan hang sejak P3. Prelocked dibuat dari state healthy.
 - Placeholder `${ENV:X}` di key `query` atau key objek body JSON masih dikirim sebagai literal (diam-diam); test `placeholder_in_query_or_json_key_is_accepted_known_limitation` mencatatnya dan harus dibalik saat diperbaiki.
 - Jalur error key `json_equals` mencantumkan key tersebut (teks config milik pengguna, bukan nilai env).
-- Cancel sebelum ada check akan exit 2, bukan 130; P4 harus menyisipkan check dengan reason `cancelled`. Check `fail` yang membawa reason pass menghasilkan exit 1 (bisa diperketat).
+- Check `fail` yang membawa reason pass menghasilkan exit 1 (bisa diperketat). Cancel sebelum check pertama kini exit 130 (check tetap tercatat `not_run [cancelled]`).
 - `tls_failed` belum pernah dihasilkan (kegagalan TLS tercatat sebagai `connect_failed`); connect timeout dilaporkan sebagai `timeout`; drop/RST/respons sampah sebagai `other`.
-- Timestamp report: presisi subsecond bisa bervariasi; potong ke detik di P4 bila perlu bentuk stabil.
 - Tidak ada fsync direktori setelah rename report; mode file mengikuti umask (report tidak berisi secret).
 - Aturan overlap `status_in` konservatif: irisan apa pun antar success/rejection/protection ditolak saat validasi.
 
@@ -219,14 +238,30 @@ Verifier tetap `GET /actions/{id}`. Detail rute dan titik sinkronisasi ada di `d
 - P3: test e2e deadline load (`load_deadline_during_load_is_not_run_deadline_exceeded_workload_incomplete`) bergantung pada preflight dan 8 request cepat selesai dalam 1,5 s; di mesin sangat sibuk hasilnya merah, bukan PASS palsu. PASS e2e CLI memakai `max_p95_ms` 500 dari contoh (p95 nyata ± 3 ms).
 
 - `check --only`: Ctrl-C yang datang sebelum handler SIGINT terdaftar (beberapa milidetik saat config dibaca) mematikan proses tanpa report; belum ada request yang terkirim saat itu.
-- `check --only`: bila report gagal ditulis, baris console tetap mencetak verdict (mis. `PASS`); penandanya hanya di stderr dan exit 2. P4 dapat menambah penanda di console.
+- Bila report gagal ditulis, baris console tetap mencetak verdict; stdout menambah `report NOT WRITTEN: <path>`, stderr memuat error, exit 2 (130 bila cancel).
 - `check --only`: precheck `--out` membandingkan path dengan `canonicalize`, jadi hardlink ke file config tidak terdeteksi; aman karena report ditulis lewat rename.
 - `check --only`: cancel sebelum dispatch, cancel setelah check selesai, dan FAIL lalu deadline dibuktikan lewat unit test dan verifikasi manual reviewer, bukan test end-to-end otomatis (bergantung timing).
 
+- P4: Ctrl-C sebelum handler terdaftar mematikan proses tanpa report (shell tetap melihat status 130); Ctrl-C setelah check terakhir selesai mengikuti verdict, bukan 130.
+- P4: console dicetak setelah seluruh suite selesai (tidak ada output sampai selesai pada suite nyata yang lama; catatan `ponytail:` di `src/cli.rs`).
+- P4: load yang dibatalkan sebelum preflight dijawab hanya `not_run [cancelled]` (tanpa `workload_incomplete`); brute_force yang sudah FAIL lalu dibatalkan tetap FAIL + `cancelled`, `incomplete` (exit 130).
+- P4: jalur `build_report` gagal + cancel tidak punya test; test SIGINT binary (`seen_at_sigint == 1`) bergantung pada urutan race → load → brute_force; cek atomic lewat inode hanya di unix.
+- P4: `examples/api-checks.json` (untracked, brute_force saja ke `127.0.0.1:3000`) bukan bagian P4 dan tidak dipakai.
+
 ## Validasi API nyata
 
-Belum dilakukan. Menunggu konfigurasi target dari pengguna setelah P4.
+**P4-AC7: fixture proof selesai, validasi target nyata belum dilakukan.** Belum ada report dari target nyata; jangan dianggap selesai sebelum pengguna menjalankan satu run nyata dan melaporkan hasilnya.
+
+Yang harus pengguna sediakan (PLAN §14; detail dan peringatan efek samping di `README.md`, bagian "Menjalankan terhadap API nyata"):
+
+- base URL target;
+- login: request baseline (kredensial valid) dan probe (kredensial salah), serta policy (`success_match`, `rejection_match`, `protection_match`, `attempts`, `protect_by_attempt`, `protected_tail_count`, `interval_ms`) dan akun uji yang boleh terkunci;
+- resource write-once yang segar (belum pernah dieksekusi) dengan request action, request verifier, dan JSON pointer counter (awal harus 0);
+- endpoint load, `requests`, `concurrency`, `max_error_rate`, `max_p95_ms`, dan `response_match` untuk preflight;
+- nama env untuk semua secret (`${ENV:NAME}`).
+
+Jangan mengarang target atau kredensial. Brute-force bisa mengunci akun, race mengubah state sekali, load mengirim 1+N request tanpa retry.
 
 ## Riwayat review pengguna
 
-Belum ada.
+Belum ada. Menunggu review checkpoint P4 (fixture proof) dan satu run target nyata.

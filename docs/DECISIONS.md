@@ -229,3 +229,25 @@ Detail: `.claude/work/P3-plan.md` (Log, entri phase gate). Terdampak: PLAN §3 (
 - Kerja tambahan di gate: test `check_without_only_message_names_all_three_checks`, penguatan test sentinel (needle unik per kanal, request line dan nilai header di wire dibandingkan persis), dan test e2e deadline dengan reasons persis.
 - Belum dikerjakan, tidak memblokir: PASS e2e CLI memakai `max_p95_ms` 500 dari contoh (p95 nyata ± 3 ms), bukan 5000.
 
+
+## 2026-10-10 — Pilihan teknis P4
+
+Detail dan slice: `.claude/work/P4-plan.md`. Terdampak: PLAN §3 (kalimat "Sampai P4, `check` wajib memakai `--only`" diganti), §8, §9, §10, §11 (P4).
+
+- `check` tanpa `--only` menjalankan suite lengkap berurutan race → load → brute_force (brute_force terakhir karena bisa mengunci akun). `--only` tetap sebagai run parsial dengan kontrak lama (`scope: partial`, tidak pernah exit 0).
+- FAIL, ERROR, atau INCONCLUSIVE satu check tidak menghentikan check berikutnya; hanya cancel/deadline yang menghentikan. Satu `Transport`, satu sinyal stop (`watch`), satu timer `suite_deadline_ms` untuk seluruh suite.
+- Check yang belum jalan saat cancel/deadline tetap dipanggil dan langsung `not_run` tanpa request, sehingga report selalu memuat tiga entri. Akibatnya cancel sebelum check pertama kini exit 130 (sebelumnya 2).
+- Exit code memakai `report::exit_code` apa adanya (PLAN §10): 0 hanya bila tiga check `pass` + `complete` + reason pass; matriks E1–E13 dikunci test.
+- Timestamp report dipotong ke detik untuk kedua scope.
+- Console dicetak setelah seluruh suite selesai (catatan `ponytail:` di `src/cli.rs`). Bila report gagal dibangun/ditulis, stdout menambah baris `report NOT WRITTEN: <path>`; exit 2 (130 bila cancel); isi `--out` lama utuh.
+- Bukti fixture: `examples/core-checks-broken.json` (login unprotected, race apply-racy, load flaky: FAIL deterministik) dan `cargo test --test fixture_proof` (12 test, biner nyata, fixture di port acak, tanpa env var).
+- Tidak ada dependency baru, `ReasonCode` baru, atau perubahan `report_version`.
+
+## 2026-10-10 — Penutupan P4 (checkpoint pengguna)
+
+Detail: `.claude/work/P4-plan.md` (Log, entri phase gate). Phase gate reviewer PASS (416 test). Terdampak: PLAN §3.
+
+- Entri "Majukan sebagian P4" dan catatan lama yang menyebut `check` tanpa `--only` ditolak tidak berlaku lagi.
+- **P4-AC7 (validasi target nyata) belum dilakukan**: fixture proof selesai, menunggu config target dari pengguna. Checkpoint pengguna terbuka; jangan ditandai selesai tanpa report dari run nyata.
+- Keterbatasan baru: Ctrl-C sebelum handler terdaftar mematikan proses tanpa report; Ctrl-C setelah check terakhir selesai mengikuti verdict (bukan 130); load yang dibatalkan sebelum preflight dijawab hanya `not_run [cancelled]` tanpa `workload_incomplete`; brute_force yang sudah FAIL lalu dibatalkan tetap FAIL + `cancelled`/`incomplete` (exit 130); jalur `build_report` gagal + cancel tanpa test; test SIGINT `seen_at_sigint == 1` bergantung pada urutan race → load → brute_force; cek atomic (inode) hanya di unix.
+- `examples/api-checks.json` (untracked, brute_force saja ke `127.0.0.1:3000`) bukan bagian P4; keputusan di-commit atau di-`.gitignore` menunggu pengguna.

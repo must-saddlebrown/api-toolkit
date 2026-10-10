@@ -155,3 +155,20 @@ Worker bersama mengambil nomor request berikutnya dengan `fetch_add(1)`; jumlah 
 
 ### Alat bantu test P3
 `Box<dyn Fn(u32) -> Step>` sebagai skrip respons; closure pengirim bertipe `Pin<Box<dyn Future + 'a>>`; `std::future::pending()` / `ready(())` sebagai future cancel yang tak pernah/langsung selesai; `std::mem::forget` menjaga sender `watch` tetap hidup; struct update syntax `..facts(&s)`; `std::panic::catch_unwind` membuktikan kontrol positif benar-benar panic; `u64::is_multiple_of` di fixture untuk "setiap request ke-10". Lihat `src/checks/load.rs` (`mod tests`), `tests/load_fixture.rs`, `tests/support/fixture.rs`.
+
+## Catatan P4 (suite lengkap)
+
+### `Vec` enum diiterasi dengan `await` per elemen
+`Prepared.selected` kini `Vec<Selected>` (urutan race, load, brute_force). `run_check` melakukan `for selected in ...` di dalam satu blok `async` dan `await` tiap check, jadi check berjalan berurutan tanpa `spawn`. Lihat `src/cli.rs` (`run_check`, loop sekitar baris 278).
+
+### Satu sinyal, banyak pembaca: `watch::Receiver::clone`
+Setiap check mendapat `stop_rx.clone()` dari satu channel `watch`. Karena nilainya sudah `Stop` bila cancel/deadline terjadi sebelumnya, check berikutnya langsung melihatnya dan menjadi `not_run` tanpa request. Lihat `src/cli.rs`, `run_check`.
+
+### `Option::take` untuk memindahkan nilai keluar
+`check_args` memakai `take()` agar bagian config (race/load/brute_force) dipindahkan keluar dari struct tanpa `clone` dan tanpa membiarkan field setengah kosong; `Option` menjadi `None` setelahnya. Lihat `src/cli.rs`, `check_args`.
+
+### `Vec::swap_remove`
+Mengambil elemen berdasarkan posisi dalam O(1) dengan menukarnya dengan elemen terakhir; urutan sisa vektor berubah, jadi cocok hanya bila urutan akhir diatur ulang di tempat lain. Dipakai saat menyusun report di `build_report` (`src/cli.rs`).
+
+### Cek atomic lewat inode: `MetadataExt` dan `#[cfg(unix)]`
+`std::os::unix::fs::MetadataExt::ino` memberi nomor inode. Rename menghasilkan inode baru, sedangkan tulis di tempat mempertahankannya, jadi test membuktikan penulisan atomic. `#[cfg(unix)]` membuat kode itu hanya dikompilasi di Unix. Lihat `tests/fixture_proof.rs` (`inode`, test `out_with_old_content_is_replaced_by_valid_json_and_no_temp_file_remains`).
