@@ -1,7 +1,10 @@
 //! Local fixture API (healthy plus broken login variants). A development tool, NOT a product mock server.
 //!
 //! Binds 127.0.0.1 only. Never logs or echoes request headers or bodies.
-//! Behaviour is documented in `docs/fixture.md`. Race variants (racy, idempotent) live here; the broken load variant arrives in P3.
+//! Behaviour is documented in `docs/fixture.md`. Race variants (racy, idempotent) live here.
+//! Load variants: `/critical` (healthy), `/broken/critical/{slow,flaky,hang}`. All four count every request
+//! in `load_requests` (also 401). Flaky and hang decide by that counter (every `FLAKY_EVERY`th request),
+//! never by timing; slow and hang only give a lower bound on latency.
 #![allow(dead_code)] // each user (tests, example) only uses part of this module
 
 use std::collections::HashMap;
@@ -34,6 +37,12 @@ pub const TEST_AUTHORIZATION: &str = "Bearer fixture-token";
 pub const ACCESS_TOKEN: &str = "fixture-access-token";
 /// Failed login number at which protection (429) starts.
 pub const PROTECT_BY_ATTEMPT: u32 = 6;
+/// Slow load route: fixed server delay before every 200.
+pub const SLOW_DELAY: Duration = Duration::from_millis(300);
+/// Flaky load route: every Nth load request (counter, not timing) answers 500. Hang: every Nth sleeps.
+pub const FLAKY_EVERY: u64 = 10;
+/// Hang load route: the sleep of every `FLAKY_EVERY`th request (longer than any test timeout).
+pub const HANG_DELAY: Duration = Duration::from_secs(3);
 /// Racy apply: how many requests must have read counter 0 before any of them may increment.
 const RACY_GATE: u32 = 2;
 /// Racy apply: longest wait for the gate. A sequential client times out here and the delta stays 1.
@@ -116,6 +125,9 @@ fn router(state: Shared) -> Router {
         .route("/idempotent/actions/{id}/apply", post(apply_idempotent))
         .route("/actions/{id}", get(read_action))
         .route("/critical", get(critical))
+        .route("/broken/critical/slow", get(critical_slow))
+        .route("/broken/critical/flaky", get(critical_flaky))
+        .route("/broken/critical/hang", get(critical_hang))
         .route("/__admin/reset", post(reset))
         .route("/__admin/stats", get(stats))
         .fallback(not_found)
@@ -297,13 +309,58 @@ async fn read_action(
     reply(StatusCode::OK, json!({"id": id, "execution_count": count}))
 }
 
+/// Counts a load request (also a 401 one) and returns its 1-based number.
+fn count_load(state: &Shared) -> u64 {
+    let mut s = lock(state);
+    s.load_requests += 1;
+    s.load_requests
+}
+
+fn ok_reply() -> Reply {
+    reply(StatusCode::OK, json!({"ok": true}))
+}
+
 async fn critical(State(state): State<Shared>, headers: HeaderMap) -> Reply {
+    count_load(&state);
     if !is_authorized(&headers) {
         return unauthorized();
     }
-    let mut s = lock(&state);
-    s.load_requests += 1;
-    reply(StatusCode::OK, json!({"ok": true}))
+    ok_reply()
+}
+
+/// Broken variant: every answer is 200 but only after `SLOW_DELAY`.
+async fn critical_slow(State(state): State<Shared>, headers: HeaderMap) -> Reply {
+    count_load(&state);
+    if !is_authorized(&headers) {
+        return unauthorized();
+    }
+    tokio::time::sleep(SLOW_DELAY).await;
+    ok_reply()
+}
+
+/// Broken variant: every `FLAKY_EVERY`th load request (by counter) is 500, the rest 200.
+async fn critical_flaky(State(state): State<Shared>, headers: HeaderMap) -> Reply {
+    let n = count_load(&state);
+    if !is_authorized(&headers) {
+        return unauthorized();
+    }
+    if n.is_multiple_of(FLAKY_EVERY) {
+        reply(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "flaky"}))
+    } else {
+        ok_reply()
+    }
+}
+
+/// Broken variant: every `FLAKY_EVERY`th load request sleeps `HANG_DELAY` (a client timeout fires first), the rest 200 at once.
+async fn critical_hang(State(state): State<Shared>, headers: HeaderMap) -> Reply {
+    let n = count_load(&state);
+    if !is_authorized(&headers) {
+        return unauthorized();
+    }
+    if n.is_multiple_of(FLAKY_EVERY) {
+        tokio::time::sleep(HANG_DELAY).await;
+    }
+    ok_reply()
 }
 
 /// Dev tool only: restores the initial state.

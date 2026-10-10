@@ -303,3 +303,74 @@ async fn racy_route_duplicates_when_concurrent_and_idempotent_applies_once() {
     assert_eq!(count(&c, &url).await, 0);
     fx.shutdown().await;
 }
+
+async fn get_load(c: &reqwest::Client, url: &str, path: &str, auth: bool) -> u16 {
+    let mut req = c.get(format!("{url}{path}"));
+    if auth {
+        req = req.header("Authorization", TEST_AUTHORIZATION);
+    }
+    req.send().await.unwrap().status().as_u16()
+}
+
+#[tokio::test]
+async fn flaky_route_fails_every_tenth_request_by_counter() {
+    let fx = Fixture::start(0).await.unwrap();
+    let (c, url) = (client(), fx.base_url());
+    let path = "/broken/critical/flaky";
+    for n in 1..=FLAKY_EVERY - 1 {
+        assert_eq!(get_load(&c, &url, path, true).await, 200, "request {n}");
+    }
+    assert_eq!(get_load(&c, &url, path, true).await, 500);
+    assert_eq!(get_load(&c, &url, path, true).await, 200);
+    assert_eq!(get_stats(&c, &url).await["load_requests"], FLAKY_EVERY + 1);
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn slow_route_answers_200_after_at_least_slow_delay() {
+    let fx = Fixture::start(0).await.unwrap();
+    let (c, url) = (client(), fx.base_url());
+    let t = std::time::Instant::now();
+    assert_eq!(get_load(&c, &url, "/broken/critical/slow", true).await, 200);
+    assert!(t.elapsed() >= SLOW_DELAY);
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn hang_route_first_request_is_fast() {
+    let fx = Fixture::start(0).await.unwrap();
+    let (c, url) = (client(), fx.base_url());
+    let t = std::time::Instant::now();
+    assert_eq!(get_load(&c, &url, "/broken/critical/hang", true).await, 200);
+    assert!(t.elapsed() < HANG_DELAY);
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn load_requests_count_401_on_all_load_routes_and_reset_zeroes() {
+    let fx = Fixture::start(0).await.unwrap();
+    let (c, url) = (client(), fx.base_url());
+    for path in [
+        "/critical",
+        "/broken/critical/slow",
+        "/broken/critical/flaky",
+        "/broken/critical/hang",
+    ] {
+        assert_eq!(get_load(&c, &url, path, false).await, 401, "{path}");
+    }
+    assert_eq!(get_stats(&c, &url).await["load_requests"], 4);
+    // Reset also restarts the flaky counter: request 1 after reset is 200 again.
+    for _ in 0..FLAKY_EVERY - 1 {
+        get_load(&c, &url, "/broken/critical/flaky", true).await;
+    }
+    c.post(format!("{url}/__admin/reset")).send().await.unwrap();
+    assert_eq!(get_stats(&c, &url).await["load_requests"], 0);
+    for n in 1..=FLAKY_EVERY {
+        let want = if n == FLAKY_EVERY { 500 } else { 200 };
+        assert_eq!(
+            get_load(&c, &url, "/broken/critical/flaky", true).await,
+            want
+        );
+    }
+    fx.shutdown().await;
+}
