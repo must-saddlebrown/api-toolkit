@@ -100,20 +100,28 @@ fn validate_never_sends_requests() {
         let r = validate(&write_cfg(&dir, &text), env);
         assert_eq!(r.code, want, "case {name}: stderr {}", r.stderr);
     }
-    // `check` must not connect either, and must not create --out.
-    let cfg = write_cfg(&dir, &valid);
+    // `check` (full suite) must not connect either on invalid input, and must not create
+    // --out: a missing env and a missing section, both against the live listener.
     let out = dir.path().join("report.json");
-    let r = run_bin(
-        &[
-            "check",
-            "--config",
-            cfg.to_str().unwrap(),
-            "--out",
-            out.to_str().unwrap(),
-        ],
-        &DEV_ENV,
-    );
-    assert_eq!(r.code, 2);
+    let cfg = write_cfg(&dir, &valid);
+    let out_s = out.to_str().unwrap();
+    let check = |cfg: &PathBuf, env: &[(&str, &str)]| {
+        run_bin(
+            &["check", "--config", cfg.to_str().unwrap(), "--out", out_s],
+            env,
+        )
+    };
+    let r = check(&cfg, &[]);
+    assert_eq!(r.code, 2, "missing env: {}", r.stderr);
+    assert!(!out.exists());
+    let no_load = {
+        let mut v: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        v.as_object_mut().unwrap().remove("load");
+        v.to_string()
+    };
+    let r = check(&write_cfg(&dir, &no_load), &DEV_ENV);
+    assert_eq!(r.code, 2, "missing section: {}", r.stderr);
+    assert!(r.stderr.contains("load"), "{}", r.stderr);
     assert!(!out.exists());
 
     // Positive control: the listener really counts connections.
@@ -122,11 +130,12 @@ fn validate_never_sends_requests() {
 }
 
 #[test]
-fn check_stub_never_zero_and_keeps_existing_out() {
+fn check_full_invalid_input_is_2_and_keeps_existing_out() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = write_cfg(&dir, &example_text());
     let out = dir.path().join("report.json");
     std::fs::write(&out, "OLD CONTENT").unwrap();
+    // No env: rejected before any request (the example points at 127.0.0.1:8080).
     let r = run_bin(
         &[
             "check",
@@ -135,26 +144,31 @@ fn check_stub_never_zero_and_keeps_existing_out() {
             "--out",
             out.to_str().unwrap(),
         ],
-        &DEV_ENV,
+        &[],
     );
     assert_eq!(r.code, 2);
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "OLD CONTENT");
-    assert!(r.stderr.contains("not implemented"), "{}", r.stderr);
+    assert!(r.stderr.contains("LOGIN_USER"), "{}", r.stderr);
 
-    // Also without env, and with a nonexistent --out: still 2, nothing created.
-    let new_out = dir.path().join("new.json");
+    // Nonexistent --out parent: still 2, nothing created.
+    // base_url points at a counting listener so a broken precheck cannot hit :8080.
+    let listener = CountingListener::start();
+    let cfg2 = write_cfg(&dir, &with_base_url(&example_text(), &listener.base_url()));
+    let new_out = dir.path().join("nope").join("new.json");
     let r = run_bin(
         &[
             "check",
             "--config",
-            cfg.to_str().unwrap(),
+            cfg2.to_str().unwrap(),
             "--out",
             new_out.to_str().unwrap(),
         ],
-        &[],
+        &DEV_ENV,
     );
     assert_eq!(r.code, 2);
     assert!(!new_out.exists());
+    assert!(r.stderr.contains("parent directory"), "{}", r.stderr);
+    assert_eq!(listener.finish(), 0, "precheck must not send requests");
 }
 
 #[test]
@@ -234,7 +248,7 @@ fn sentinel_never_printed() {
     assert_eq!(r.code, 2);
     assert_no_sentinel(&r);
 
-    // check stub.
+    // check (full suite), rejected before any request: a missing env with the sentinel set.
     let out = dir.path().join("o.json");
     let r = run_bin(
         &[
@@ -244,9 +258,10 @@ fn sentinel_never_printed() {
             "--out",
             out.to_str().unwrap(),
         ],
-        &full,
+        &[("SENTINEL_VAR", SENTINEL)],
     );
     assert_eq!(r.code, 2);
+    assert!(!out.exists());
     assert_no_sentinel(&r);
 }
 

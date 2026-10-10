@@ -507,7 +507,7 @@ fn rejected_cases(base: &str) -> Vec<Case> {
         out
     };
     vec![
-        plain("no --only", None, "available in P4"),
+        plain("no --only", None, "invalid config at `race`"),
         plain("bogus", Some("bogus"), "unknown check"),
         plain("loadx", Some("loadx"), "unknown check"),
         Case {
@@ -1455,7 +1455,8 @@ async fn load_deadline_during_load_is_not_run_deadline_exceeded_workload_incompl
 }
 
 #[test]
-fn check_without_only_message_names_all_three_checks() {
+fn check_without_only_on_unreadable_config_is_2_and_creates_nothing() {
+    // Full suite is the default now: a missing config is an ordinary config error.
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("r.json");
     let run = support::cli::run_bin(
@@ -1469,18 +1470,12 @@ fn check_without_only_message_names_all_three_checks() {
         &[],
     );
     assert_eq!(run.code, 2, "stderr: {}", run.stderr);
-    for needle in [
-        "--only brute_force",
-        "--only race",
-        "--only load",
-        "full suite available in P4",
-    ] {
-        assert!(
-            run.stderr.contains(needle),
-            "missing `{needle}`: {}",
-            run.stderr
-        );
-    }
+    assert!(run.stderr.contains("/nonexistent/c.json"), "{}", run.stderr);
+    assert!(
+        !run.stderr.contains("full suite available in P4"),
+        "{}",
+        run.stderr
+    );
     assert!(!out.exists(), "out was created");
     assert!(run.stdout.is_empty(), "stdout: {}", run.stdout);
 }
