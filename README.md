@@ -10,11 +10,12 @@ Dokumen ini hanya membahas **check brute-force login** (fase P1).
 | --- | --- |
 | Logika check brute-force (`checks::brute_force::run`) | Selesai, teruji (unit dan integrasi terhadap fixture) |
 | `api-toolkit validate --config ...` | Berfungsi, memvalidasi config termasuk bagian `brute_force` |
-| `api-toolkit check ...` | **Masih stub**: selalu exit 2, tidak mengirim request, tidak menulis report. Penyambungan ke CLI dan penulisan report datang di P4 |
+| `api-toolkit check --config ... --out ... --only brute_force` | Berfungsi terhadap fixture lokal: menjalankan check, mencetak satu baris console, menulis report JSON (`scope: partial`). **Exit code tidak pernah 0** (FAIL → 1, selain itu → 2, Ctrl-C → 130) |
+| `api-toolkit check` tanpa `--only` | Ditolak (exit 2, nol request) sampai suite lengkap tersedia di P4 |
 | Check race dan load | Belum (P2, P3) |
 | Dijalankan terhadap API nyata | Belum. Hanya fixture lokal yang sudah dibuktikan |
 
-Artinya saat ini check brute-force dijalankan lewat test, bukan lewat perintah `check`.
+Check brute-force bisa dijalankan lewat perintah `check --only brute_force` (lihat "Mencobanya") dan lewat test.
 
 ## Apa yang dibuktikan check ini
 
@@ -132,6 +133,19 @@ brute_force PASS first_protected=6 tail=3/2 attempts=8/8
 
 ## Mencobanya
 
+Config minimal: [examples/brute-force-only.json](examples/brute-force-only.json) (hanya `config_version`, `base_url`, `limits`, dan `brute_force`). Panduan langkah demi langkah, termasuk varian rusak dan Ctrl-C, ada di [docs/STATUS.md](docs/STATUS.md) bagian "Mencoba `check --only`".
+
+```sh
+cargo run --example fixture                          # terminal 1
+# terminal 2, dari root repo:
+export LOGIN_USER=demo LOGIN_VALID_PASSWORD=demo-pass LOGIN_INVALID_PASSWORD=wrong-pass
+cargo run -q -- check --config examples/brute-force-only.json --out /tmp/result.json --only brute_force; echo $?
+# stdout: brute_force PASS first_protected=6 tail=3/2 attempts=8/8 reasons=protection_observed
+# exit 2: run parsial tidak pernah 0; baca verdict dari console atau /tmp/result.json
+curl -X POST http://127.0.0.1:8080/__admin/reset     # reset sebelum mengulang
+```
+
+
 Semua dari root repo. Satu-satunya jaringan yang dipakai adalah fixture di `127.0.0.1`.
 
 ```sh
@@ -179,7 +193,7 @@ Login benar **tidak** mereset hitungan gagal pada fixture healthy. Menjalankan c
 
 ## Menjalankan terhadap API nyata
 
-Belum dilakukan dan belum bisa lewat CLI (menunggu P4). Bila nanti dijalankan, ingat:
+Belum dilakukan. `check --only brute_force` secara teknis bisa diarahkan ke target lain, tetapi validasi API nyata baru dilakukan setelah P4 dengan config dari pengguna. Bila nanti dijalankan, ingat:
 
 - Check ini **sengaja memicu lockout** pada akun yang dipakai. Pakai akun uji khusus, jangan akun orang lain.
 - Kredensial berasal dari env var pengguna; tool tidak mengarang endpoint atau kredensial.

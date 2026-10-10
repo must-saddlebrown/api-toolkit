@@ -86,3 +86,20 @@ State bersama satu thread untuk mencatat panggilan di test double; `Pin<Box<dyn 
 
 ### Server TCP mentah di test
 `tokio::net::TcpListener` plus `AsyncReadExt`/`AsyncWriteExt` untuk server skrip yang sengaja menggantung (timeout). Lihat `scripted_server` di `tests/brute_force_fixture.rs`.
+
+## Catatan `check --only`
+
+### Runtime tokio manual dan sinyal
+`main` tidak async. `check_blocking` membangun runtime (`tokio::runtime::Builder`), mendaftarkan SIGINT (`tokio::signal::unix::signal`) sebelum request pertama, lalu `block_on(run_check(..))`. Fungsi inti `run_check` menerima future `cancel` lewat parameter `impl Future<Output = ()>`, sehingga test memberi future biasa, tanpa sinyal nyata. Lihat `src/cli.rs`.
+
+### `select!` `biased` dengan guard `if`, `pin!`, `watch::send_replace`
+Cancel dan deadline berlomba dengan check. `tokio::pin!` mem-pin future agar bisa di-poll berulang di loop; guard `if stop_sent.is_none()` membuat tiap sumber stop hanya mengirim sekali; `watch::Sender::send_replace` menyimpan stop pertama. `std::future::ready` dan `pending` dipakai sebagai cancel di test. Lihat `run_check`.
+
+### Bagian config opsional: `Option<T>` di serde, `Selection`, `transpose`
+`brute_force`, `race`, `load` menjadi `Option`; `Selection::{All, Only(CheckName)}` (enum `Copy` dengan data dan method `includes`) menentukan bagian mana yang divalidasi dan di-resolve. `Option::transpose` membalik `Option<Result<..>>` menjadi `Result<Option<..>>`, `Option::map_or` memberi default. Lihat `src/config.rs`, `src/config/validate.rs`, `src/cli.rs`.
+
+### Let chain dan `canonicalize`
+`if let (Ok(a), Ok(b)) = (..) && a == b` (edisi 2024) membandingkan path setelah `std::fs::canonicalize`, sehingga symlink ke config terdeteksi. Lihat `precheck_out`.
+
+### Test end-to-end dengan binary nyata
+`env!("CARGO_BIN_EXE_api-toolkit")` memberi path binary; `Command::env_clear().envs(..)` membuat env hanya berlaku untuk proses anak; `tokio::task::spawn_blocking` memanggil proses dari test async; `impl Drop` pada struct pembantu (`Hang`) membatalkan task server; `#[cfg(unix)]` untuk `kill -INT`. Lihat `tests/check_only_cli.rs`.

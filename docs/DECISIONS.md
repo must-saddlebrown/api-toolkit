@@ -162,3 +162,13 @@ Keputusan pengguna. Detail, AC (PA-AC1–PA-AC22), matriks, dan slice: `.claude/
 - Contoh config parsial: `examples/brute-force-only.json` (bagian brute_force PLAN §9, base_url fixture), dikunci test (9 request, 700 ms fixed waits).
 - Urutan checkpoint: bagian P4 ini dikerjakan sebelum P2, jadi menyimpang dari urutan PLAN §11 dan CLAUDE.md ("checkpoint utama setelah P4"). Yang TIDAK berubah: checkpoint review pengguna utama tetap setelah P4 fixture proof (ketiga check), validasi API nyata tetap setelah P4 dengan config dari pengguna, scope v0.1 (PLAN §2) tetap, P2/P3 tetap berikutnya. Mencoba `--only` terhadap fixture bukan checkpoint dan bukan validasi target nyata.
 - P4 memperluas command ini menjadi suite lengkap sebagai default (bukan membuat ulang parser, report, atau jalur cancel/deadline). Usulan: `--only` tetap ada sebagai mode parsial opsional dengan kontrak yang sama; diputuskan final di P4.
+
+## 2026-10-10 — Penutupan `check --only`
+
+Detail: `.claude/work/only-flag-plan.md` (Log, entri phase gate). Terdampak: PLAN §10 (sudah disamakan). Phase gate reviewer PASS (PA-AC1–PA-AC22, 229 test).
+
+- Pesan penolakan tanpa `--only` berbahasa Inggris (`full suite available in P4`), mengikuti keputusan pesan CLI P0 S9; frasa Indonesia "suite lengkap tersedia di P4" ada di STATUS dan README. Mengubah bahasa pesan CLI = keputusan baru.
+- Keterbatasan yang diterima: SIGINT sebelum handler terdaftar mematikan proses tanpa report (belum ada request); baris console tetap mencetak verdict bila report gagal ditulis (penanda hanya stderr dan exit 2); precheck `--out` tidak mendeteksi hardlink ke config (aman karena report ditulis lewat rename); nasib `--only` setelah P4 diputuskan di P4.
+- Cakupan manual, bukan end-to-end otomatis: cancel sebelum dispatch (unit `run_check_cancel_before_dispatch_is_130_with_report`), cancel setelah check selesai, FAIL lalu deadline, cancel + direktori read-only. Alasan: bergantung timing; exit dihitung dari report yang sama dengan baris console.
+- Test unit `run_check_cancel_while_request_hangs_is_130` sempat flaky (cancel dengan tebakan 150 ms datang sebelum koneksi diterima). Diperbaiki dengan menunggu koneksi pertama teramati. Pelajaran: test yang butuh "request sedang berjalan" menunggu kondisi teramati, bukan sleep.
+- Saran test tidak memblokir, belum dikerjakan: perketat kata kunci `brute_force` di `tests/check_only_cli.rs` ke pesan lengkap; kill proses anak sebelum assert pada kasus cancel yang gagal; port bebas yang di-bind lalu di-drop bisa dipakai ulang test paralel (gagal merah, bukan false PASS).
