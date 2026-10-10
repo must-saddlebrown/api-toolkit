@@ -466,6 +466,7 @@ fn assert_no_leak(r: &CheckResult, forbidden: &[&str]) {
         t,
         t,
         r.completion,
+        Scope::Full,
         vec![r.clone()],
     )
     .unwrap();

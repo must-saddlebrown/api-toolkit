@@ -130,6 +130,25 @@ impl Completion {
     }
 }
 
+/// Whether the report covers the full suite or a partial `--only` run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    Full,
+    Partial,
+}
+
+impl Scope {
+    pub const ALL: [Scope; 2] = [Scope::Full, Scope::Partial];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Full => "full",
+            Scope::Partial => "partial",
+        }
+    }
+}
+
 /// Why a check got its verdict. Adding a variant is additive; renaming or removing one
 /// is a report contract change (bump `REPORT_VERSION`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -168,10 +187,12 @@ pub enum ReasonCode {
     WorkloadIncomplete,
     PreflightFailed,
     RunnerError,
+    // partial run (`--only`)
+    ExcludedByOnly,
 }
 
 impl ReasonCode {
-    pub const ALL: [ReasonCode; 29] = [
+    pub const ALL: [ReasonCode; 30] = [
         ReasonCode::ConfigInvalid,
         ReasonCode::DeadlineExceeded,
         ReasonCode::Cancelled,
@@ -201,6 +222,7 @@ impl ReasonCode {
         ReasonCode::WorkloadIncomplete,
         ReasonCode::PreflightFailed,
         ReasonCode::RunnerError,
+        ReasonCode::ExcludedByOnly,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -234,6 +256,7 @@ impl ReasonCode {
             ReasonCode::WorkloadIncomplete => "workload_incomplete",
             ReasonCode::PreflightFailed => "preflight_failed",
             ReasonCode::RunnerError => "runner_error",
+            ReasonCode::ExcludedByOnly => "excluded_by_only",
         }
     }
 }
@@ -317,6 +340,7 @@ pub struct Report {
     pub started_at: String,
     pub finished_at: String,
     pub completion: Completion,
+    pub scope: Scope,
     pub checks: Vec<CheckResult>,
 }
 
@@ -328,6 +352,7 @@ impl Report {
         started_at: OffsetDateTime,
         finished_at: OffsetDateTime,
         completion: Completion,
+        scope: Scope,
         checks: Vec<CheckResult>,
     ) -> Result<Report, ReportError> {
         Ok(Report {
@@ -338,6 +363,7 @@ impl Report {
             started_at: rfc3339(started_at)?,
             finished_at: rfc3339(finished_at)?,
             completion,
+            scope,
             checks,
         })
     }
@@ -396,6 +422,8 @@ fn is_pass_reason(r: ReasonCode) -> bool {
 /// Cancel is checked FIRST, before the structure check, so a cancelled run is 130 even
 /// if the check list is malformed. Exit 0 requires exactly one check per `CheckName`,
 /// each `pass` with only pass reasons and `complete`, and a complete suite (no false PASS).
+/// A partial run (`Scope::Partial`) never returns 0: FAIL that completed -> 1, the rest -> 2.
+/// `excluded_by_only` is ignored in the partial precedence; in a full report it is malformed (2).
 pub fn exit_code(report: &Report) -> i32 {
     let cancelled = report
         .checks
@@ -408,6 +436,16 @@ pub fn exit_code(report: &Report) -> i32 {
         && CheckName::ALL
             .iter()
             .all(|name| report.checks.iter().filter(|c| c.check == *name).count() == 1);
+    let has_excluded_reason = report
+        .checks
+        .iter()
+        .any(|c| c.reasons.contains(&ReasonCode::ExcludedByOnly));
+    if report.scope == Scope::Partial {
+        return partial_exit_code(report, exactly_one_each);
+    }
+    if has_excluded_reason {
+        return 2;
+    }
     let not_conclusive = report.completion == Completion::Incomplete
         || report.checks.iter().any(|c| {
             c.completion == Completion::Incomplete
@@ -424,6 +462,37 @@ pub fn exit_code(report: &Report) -> i32 {
         return 1;
     }
     0
+}
+
+/// Partial run: only the selected (non-excluded) checks count. Never 0.
+fn partial_exit_code(report: &Report, exactly_one_each: bool) -> i32 {
+    let is_excluded =
+        |c: &CheckResult| c.verdict == Verdict::NotRun && c.reasons == [ReasonCode::ExcludedByOnly];
+    // `excluded_by_only` on anything but a clean excluded entry is malformed.
+    let malformed = report
+        .checks
+        .iter()
+        .any(|c| c.reasons.contains(&ReasonCode::ExcludedByOnly) && !is_excluded(c));
+    let selected: Vec<&CheckResult> = report.checks.iter().filter(|c| !is_excluded(c)).collect();
+    if !exactly_one_each || malformed || selected.is_empty() {
+        return 2;
+    }
+    let not_conclusive = report.completion == Completion::Incomplete
+        || selected.iter().any(|c| {
+            c.completion == Completion::Incomplete
+                || matches!(
+                    c.verdict,
+                    Verdict::Error | Verdict::Inconclusive | Verdict::NotRun
+                )
+                || (c.verdict == Verdict::Pass && !c.reasons.iter().all(|r| is_pass_reason(*r)))
+        });
+    if not_conclusive {
+        return 2;
+    }
+    if selected.iter().any(|c| c.verdict == Verdict::Fail) {
+        return 1;
+    }
+    2
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -569,6 +638,13 @@ mod tests {
             ReasonCode::WorkloadIncomplete => "workload_incomplete",
             ReasonCode::PreflightFailed => "preflight_failed",
             ReasonCode::RunnerError => "runner_error",
+            ReasonCode::ExcludedByOnly => "excluded_by_only",
+        }
+    }
+    fn scope_literal(v: Scope) -> &'static str {
+        match v {
+            Scope::Full => "full",
+            Scope::Partial => "partial",
         }
     }
 
@@ -605,7 +681,12 @@ mod tests {
             assert_eq!(v.to_string(), transport_literal(v));
             assert_eq!(json_of(&v), format!("\"{}\"", transport_literal(v)));
         }
-        assert_eq!(ReasonCode::ALL.len(), 29);
+        assert_eq!(Scope::ALL.len(), 2);
+        for v in Scope::ALL {
+            assert_eq!(v.as_str(), scope_literal(v));
+            assert_eq!(json_of(&v), format!("\"{}\"", scope_literal(v)));
+        }
+        assert_eq!(ReasonCode::ALL.len(), 30);
         for v in ReasonCode::ALL {
             assert_eq!(v.as_str(), reason_literal(v));
             assert_eq!(json_of(&v), format!("\"{}\"", reason_literal(v)));
@@ -623,6 +704,7 @@ mod tests {
             at(1_791_633_600),
             at(1_791_633_605),
             Completion::Complete,
+            Scope::Full,
             vec![
                 CheckResult {
                     check: CheckName::BruteForce,
@@ -661,6 +743,7 @@ mod tests {
   "started_at": "2026-10-10T12:00:00Z",
   "finished_at": "2026-10-10T12:00:05Z",
   "completion": "complete",
+  "scope": "full",
   "checks": [
     {{
       "check": "brute_force",
@@ -931,6 +1014,83 @@ mod tests {
     }
 
     #[test]
+    fn exit_code_partial_table() {
+        use CheckName::*;
+        use Completion::{Complete, Incomplete};
+        use Verdict::*;
+        let none: &[ReasonCode] = &[];
+        let excl: &[ReasonCode] = &[ReasonCode::ExcludedByOnly];
+        let cancel: &[ReasonCode] = &[ReasonCode::Cancelled];
+        let deadline: &[ReasonCode] = &[ReasonCode::DeadlineExceeded];
+        let pass_reason: &[ReasonCode] = &[ReasonCode::ProtectionObserved];
+        let partial = |bf: (Verdict, Completion, &[ReasonCode])| {
+            let mut r = report_with(&[
+                (Race, NotRun, Incomplete, excl),
+                (Load, NotRun, Incomplete, excl),
+                (BruteForce, bf.0, bf.1, bf.2),
+            ]);
+            r.scope = Scope::Partial;
+            r
+        };
+        // never 0, even for a clean pass
+        assert_eq!(exit_code(&partial((Pass, Complete, pass_reason))), 2);
+        assert_eq!(exit_code(&partial((Pass, Complete, none))), 2);
+        assert_eq!(exit_code(&partial((Fail, Complete, none))), 1);
+        assert_eq!(exit_code(&partial((Inconclusive, Complete, none))), 2);
+        assert_eq!(exit_code(&partial((Error, Complete, none))), 2);
+        assert_eq!(exit_code(&partial((NotRun, Incomplete, deadline))), 2);
+        // fail + incomplete (deadline) -> 2
+        assert_eq!(exit_code(&partial((Fail, Incomplete, deadline))), 2);
+        // incomplete suite with a completed fail -> 2
+        let mut inc_suite = partial((Fail, Complete, none));
+        inc_suite.completion = Incomplete;
+        assert_eq!(exit_code(&inc_suite), 2);
+        // cancel -> 130, with or without fail
+        assert_eq!(exit_code(&partial((NotRun, Incomplete, cancel))), 130);
+        assert_eq!(exit_code(&partial((Fail, Incomplete, cancel))), 130);
+        // no selected check -> 2
+        let mut no_selected = report_with(&[
+            (Race, NotRun, Incomplete, excl),
+            (Load, NotRun, Incomplete, excl),
+            (BruteForce, NotRun, Incomplete, excl),
+        ]);
+        no_selected.scope = Scope::Partial;
+        assert_eq!(exit_code(&no_selected), 2);
+        // excluded_by_only on a non-not_run check -> 2 (even next to a fail)
+        let mut bad_verdict = partial((Fail, Complete, none));
+        bad_verdict.checks[0] = CheckResult {
+            check: Race,
+            verdict: Pass,
+            reasons: excl.to_vec(),
+            completion: Complete,
+            evidence: None,
+        };
+        assert_eq!(exit_code(&bad_verdict), 2);
+        // excluded_by_only mixed with another reason -> 2
+        let mut mixed = partial((Fail, Complete, none));
+        mixed.checks[0].reasons = vec![ReasonCode::ExcludedByOnly, ReasonCode::NotStarted];
+        assert_eq!(exit_code(&mixed), 2);
+        // duplicate / missing entries -> 2
+        let mut dup = report_with(&[
+            (Race, NotRun, Incomplete, excl),
+            (BruteForce, Fail, Complete, none),
+            (BruteForce, Fail, Complete, none),
+        ]);
+        dup.scope = Scope::Partial;
+        assert_eq!(exit_code(&dup), 2);
+        let mut missing = report_with(&[(BruteForce, Fail, Complete, none)]);
+        missing.scope = Scope::Partial;
+        assert_eq!(exit_code(&missing), 2);
+        // full scope: excluded_by_only is never accepted
+        let mut full = partial((Fail, Complete, none));
+        full.scope = Scope::Full;
+        assert_eq!(exit_code(&full), 2);
+        let mut full_pass = partial((Pass, Complete, pass_reason));
+        full_pass.scope = Scope::Full;
+        assert_eq!(exit_code(&full_pass), 2);
+    }
+
+    #[test]
     fn exit_code_pass_reasons_table() {
         use CheckName::*;
         use Completion::Complete;
@@ -968,7 +1128,7 @@ mod tests {
         report.completion = Completion::Incomplete;
         write_report_atomic(&path, &report).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"completion\": \"incomplete\",\n  \"checks\""));
+        assert!(text.contains("\"completion\": \"incomplete\",\n  \"scope\""));
         // only the report remains in the directory (no temp file)
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }

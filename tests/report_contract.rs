@@ -47,6 +47,7 @@ fn report(completion: Completion, checks: Vec<CheckResult>) -> Report {
         t,
         t,
         completion,
+        Scope::Full,
         checks,
     )
     .unwrap()
@@ -119,6 +120,7 @@ fn enums_serialize_to_stable_snake_case() {
         "workload_incomplete",
         "preflight_failed",
         "runner_error",
+        "excluded_by_only",
     ];
     let mut got: Vec<String> = ReasonCode::ALL.iter().map(|r| to_str(*r)).collect();
     for (r, s) in ReasonCode::ALL.iter().zip(&got) {
@@ -193,6 +195,7 @@ fn written_report_has_contract_keys_and_no_secret_fields() {
             "finished_at",
             "report_version",
             "run_id",
+            "scope",
             "started_at",
             "tool_version"
         ]
