@@ -19,6 +19,7 @@ fn check(name: CheckName, verdict: Verdict, reasons: &[ReasonCode]) -> CheckResu
         verdict,
         reasons: reasons.to_vec(),
         completion: Completion::Complete,
+        evidence: None,
     }
 }
 

@@ -269,13 +269,42 @@ impl Outcome {
     }
 }
 
-/// Result of one check inside the report. Per-check evidence fields are added in P1-P3.
+/// One brute-force attempt. Numbers, enums and nulls only: no body, header or token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttemptEvidence {
+    /// 0 = baseline, 1.. = probe.
+    pub attempt: u32,
+    pub outcome: Outcome,
+    pub status: Option<u16>,
+    pub error: Option<TransportErrorCode>,
+    pub offset_ms: u64,
+    pub elapsed_ms: u64,
+}
+
+/// Evidence of the brute-force check (PLAN §10), including the configured thresholds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BruteForceEvidence {
+    pub attempts_planned: u32,
+    pub attempts_dispatched: u32,
+    pub interval_ms: u64,
+    pub protect_by_attempt: u32,
+    pub protected_tail_count: u32,
+    pub first_protected_attempt: Option<u32>,
+    pub protected_tail_observed: u32,
+    pub baseline: Option<AttemptEvidence>,
+    pub attempts: Vec<AttemptEvidence>,
+}
+
+/// Result of one check inside the report.
+// ponytail: P2 turns `evidence` into an `#[serde(untagged)]` enum (race/load); JSON stays the same.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CheckResult {
     pub check: CheckName,
     pub verdict: Verdict,
     pub reasons: Vec<ReasonCode>,
     pub completion: Completion,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<BruteForceEvidence>,
 }
 
 /// Report v1. Field order here is the field order in the JSON file.
@@ -600,18 +629,21 @@ mod tests {
                     verdict: Verdict::Pass,
                     reasons: vec![ReasonCode::ProtectionObserved],
                     completion: Completion::Complete,
+                    evidence: None,
                 },
                 CheckResult {
                     check: CheckName::Race,
                     verdict: Verdict::Fail,
                     reasons: vec![ReasonCode::DuplicateSideEffect],
                     completion: Completion::Complete,
+                    evidence: None,
                 },
                 CheckResult {
                     check: CheckName::Load,
                     verdict: Verdict::NotRun,
                     reasons: vec![],
                     completion: Completion::Incomplete,
+                    evidence: None,
                 },
             ],
         )
@@ -666,6 +698,115 @@ mod tests {
         assert_eq!(json, golden_json());
     }
 
+    fn evidence_check() -> CheckResult {
+        let attempt = |n, outcome, status, error, offset_ms, elapsed_ms| AttemptEvidence {
+            attempt: n,
+            outcome,
+            status,
+            error,
+            offset_ms,
+            elapsed_ms,
+        };
+        CheckResult {
+            check: CheckName::BruteForce,
+            verdict: Verdict::Error,
+            reasons: vec![ReasonCode::ProbeUnclassifiable, ReasonCode::TransportError],
+            completion: Completion::Complete,
+            evidence: Some(BruteForceEvidence {
+                attempts_planned: 8,
+                attempts_dispatched: 3,
+                interval_ms: 100,
+                protect_by_attempt: 6,
+                protected_tail_count: 2,
+                first_protected_attempt: None,
+                protected_tail_observed: 0,
+                baseline: Some(attempt(0, Outcome::Success, Some(200), None, 0, 12)),
+                attempts: vec![
+                    attempt(1, Outcome::NormalRejection, Some(401), None, 12, 8),
+                    attempt(
+                        2,
+                        Outcome::TransportError,
+                        None,
+                        Some(TransportErrorCode::Timeout),
+                        120,
+                        5000,
+                    ),
+                ],
+            }),
+        }
+    }
+
+    #[test]
+    fn evidence_json_matches_golden() {
+        let golden = r#"{
+  "check": "brute_force",
+  "verdict": "error",
+  "reasons": [
+    "probe_unclassifiable",
+    "transport_error"
+  ],
+  "completion": "complete",
+  "evidence": {
+    "attempts_planned": 8,
+    "attempts_dispatched": 3,
+    "interval_ms": 100,
+    "protect_by_attempt": 6,
+    "protected_tail_count": 2,
+    "first_protected_attempt": null,
+    "protected_tail_observed": 0,
+    "baseline": {
+      "attempt": 0,
+      "outcome": "success",
+      "status": 200,
+      "error": null,
+      "offset_ms": 0,
+      "elapsed_ms": 12
+    },
+    "attempts": [
+      {
+        "attempt": 1,
+        "outcome": "normal_rejection",
+        "status": 401,
+        "error": null,
+        "offset_ms": 12,
+        "elapsed_ms": 8
+      },
+      {
+        "attempt": 2,
+        "outcome": "transport_error",
+        "status": null,
+        "error": "timeout",
+        "offset_ms": 120,
+        "elapsed_ms": 5000
+      }
+    ]
+  }
+}"#;
+        assert_eq!(
+            serde_json::to_string_pretty(&evidence_check()).unwrap(),
+            golden
+        );
+    }
+
+    #[test]
+    fn no_evidence_means_no_field() {
+        let json = serde_json::to_string(&sample_report()).unwrap();
+        assert!(!json.contains("evidence"));
+    }
+
+    #[test]
+    fn exit_code_ignores_evidence() {
+        let mut with = sample_report();
+        let mut without = sample_report();
+        with.checks[0] = evidence_check();
+        without.checks[0] = CheckResult {
+            evidence: None,
+            ..evidence_check()
+        };
+        assert_eq!(exit_code(&with), exit_code(&without));
+        assert_eq!(exit_code(&with), 2);
+    }
+
     #[test]
     fn config_hash_and_run_id() {
         assert_eq!(
@@ -698,6 +839,7 @@ mod tests {
                 verdict: *verdict,
                 reasons: reasons.to_vec(),
                 completion: *completion,
+                evidence: None,
             })
             .collect();
         r
