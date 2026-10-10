@@ -398,8 +398,10 @@ pub fn console_line(result: &CheckResult) -> String {
                 e.protected_tail_observed, e.protected_tail_count, e.attempts_planned
             )
         }
-        // Race evidence has its own console line (race::console_line, P2.S4).
-        Some(Evidence::Race(_)) | None => format!("{head} reasons={reasons}"),
+        // Race and load evidence have their own console lines.
+        Some(Evidence::Race(_)) | Some(Evidence::Load(_)) | None => {
+            format!("{head} reasons={reasons}")
+        }
     }
 }
 

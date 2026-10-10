@@ -1,6 +1,7 @@
 //! Report model, enum contract (report v1), exit code and atomic writer (PLAN §4, §10).
 //! The report has no field for bodies, headers or secrets, so none can leak into it.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -16,7 +17,7 @@ pub const REPORT_VERSION: u32 = 1;
 
 /// Sanitized reason a request produced no usable response. It never carries a URL,
 /// header value or library message (PLAN §10). Serialized as stable snake_case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportErrorCode {
     Timeout,
@@ -355,17 +356,45 @@ pub struct RaceEvidence {
     pub actions: Vec<ActionEvidence>,
 }
 
+/// Evidence of the load check (PLAN §7, §10): configured thresholds plus aggregate counts and
+/// timings. Numbers, enums and nulls only. `f64` fields make this type `PartialEq` but not `Eq`.
+// ponytail: aggregates only; add a per-request list if debugging a real target needs it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LoadEvidence {
+    pub requests: u32,
+    pub concurrency: u32,
+    pub max_error_rate: f64,
+    pub max_p95_ms: u64,
+    pub preflight: Option<VerifyEvidence>,
+    pub dispatched: u32,
+    pub attempted: u32,
+    pub succeeded: u32,
+    pub failed: u32,
+    pub timed_out: u32,
+    pub error_rate: Option<f64>,
+    pub p50_ms: Option<u64>,
+    pub p95_ms: Option<u64>,
+    pub max_ms: Option<u64>,
+    pub max_in_flight: u32,
+    pub load_elapsed_ms: u64,
+    pub throughput_rps: Option<f64>,
+    /// HTTP responses only (success and mismatch). JSON keys are the status as a string.
+    pub status_counts: BTreeMap<u16, u32>,
+    /// Transport errors only.
+    pub error_counts: BTreeMap<TransportErrorCode, u32>,
+}
+
 /// Per-check evidence. `untagged`: no variant name in the JSON, so brute_force stays as before.
-// ponytail: load evidence (P3) is a third variant here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Evidence {
     BruteForce(BruteForceEvidence),
     Race(RaceEvidence),
+    Load(LoadEvidence),
 }
 
 /// Result of one check inside the report.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CheckResult {
     pub check: CheckName,
     pub verdict: Verdict,
@@ -376,7 +405,7 @@ pub struct CheckResult {
 }
 
 /// Report v1. Field order here is the field order in the JSON file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Report {
     pub report_version: u32,
     pub run_id: String,
@@ -1009,6 +1038,91 @@ mod tests {
         "elapsed_ms": 5000
       }
     ]
+  }
+}"#;
+        assert_eq!(serde_json::to_string_pretty(&check).unwrap(), golden);
+        // evidence never changes the exit code
+        let mut with = sample_report();
+        let mut without = sample_report();
+        with.checks[1] = check.clone();
+        without.checks[1] = CheckResult {
+            evidence: None,
+            ..check
+        };
+        assert_eq!(exit_code(&with), exit_code(&without));
+    }
+
+    #[test]
+    fn load_evidence_json_matches_golden() {
+        let check = CheckResult {
+            check: CheckName::Load,
+            verdict: Verdict::Fail,
+            reasons: vec![ReasonCode::ErrorRateExceeded],
+            completion: Completion::Complete,
+            evidence: Some(Evidence::Load(LoadEvidence {
+                requests: 10,
+                concurrency: 5,
+                max_error_rate: 0.01,
+                max_p95_ms: 500,
+                preflight: Some(VerifyEvidence {
+                    status: Some(200),
+                    error: None,
+                    offset_ms: 0,
+                    elapsed_ms: 3,
+                }),
+                dispatched: 10,
+                attempted: 10,
+                succeeded: 9,
+                failed: 1,
+                timed_out: 1,
+                error_rate: Some(0.1),
+                p50_ms: Some(4),
+                p95_ms: Some(5000),
+                max_ms: Some(5000),
+                max_in_flight: 5,
+                load_elapsed_ms: 5010,
+                throughput_rps: None,
+                status_counts: BTreeMap::from([(500, 1), (200, 9)]),
+                error_counts: BTreeMap::from([(TransportErrorCode::Timeout, 1)]),
+            })),
+        };
+        let golden = r#"{
+  "check": "load",
+  "verdict": "fail",
+  "reasons": [
+    "error_rate_exceeded"
+  ],
+  "completion": "complete",
+  "evidence": {
+    "requests": 10,
+    "concurrency": 5,
+    "max_error_rate": 0.01,
+    "max_p95_ms": 500,
+    "preflight": {
+      "status": 200,
+      "error": null,
+      "offset_ms": 0,
+      "elapsed_ms": 3
+    },
+    "dispatched": 10,
+    "attempted": 10,
+    "succeeded": 9,
+    "failed": 1,
+    "timed_out": 1,
+    "error_rate": 0.1,
+    "p50_ms": 4,
+    "p95_ms": 5000,
+    "max_ms": 5000,
+    "max_in_flight": 5,
+    "load_elapsed_ms": 5010,
+    "throughput_rps": null,
+    "status_counts": {
+      "200": 9,
+      "500": 1
+    },
+    "error_counts": {
+      "timeout": 1
+    }
   }
 }"#;
         assert_eq!(serde_json::to_string_pretty(&check).unwrap(), golden);
