@@ -85,3 +85,15 @@ Detail: `.claude/work/P0-plan.md`. Terdampak: PLAN §4, §10. Reviewer PASS di r
 - `exit_code(&Report)` mengikuti PLAN §10 (cancel → error/inconclusive/incomplete/not_run → fail → pass). Exit 0 hanya bila tepat tiga check (satu per `CheckName`), semuanya `pass` + `complete`, alasan kosong atau hanya `protection_observed`/`single_side_effect`/`thresholds_met`, dan suite `complete`. Selain itu 2 (daftar kosong/parsial/duplikat, alasan non-pass, dll). Cancel = ada check dengan `ReasonCode::Cancelled` (tanpa flag suite) → 130, diperiksa lebih dulu.
 - Untuk P4: cancel sebelum ada check harus tetap menyisipkan check yang membawa `cancelled`, atau exit code jatuh ke 2 bukan 130. Check `fail` yang membawa alasan pass (kontradiktif) menghasilkan 1; bisa diperketat.
 - `write_report_atomic`: temp `.<nama>.tmp-<pid>-<counter>` (counter `AtomicU64`) di direktori yang sama, dibuka `create_new` (tidak mengikuti symlink), fsync, lalu rename; retry maksimal 8 saat `AlreadyExists`; cleanup hanya menghapus temp milik panggilan itu. `ReportError::Io` hanya memuat path dan `io::ErrorKind` (tanpa pesan OS, tanpa isi report). Belum: fsync direktori setelah rename; mode file mengikuti umask (report tidak berisi secret).
+
+## 2026-10-10 — Fixture healthy (P0 S8)
+
+Detail: `.claude/work/P0-plan.md`, `docs/fixture.md`. Terdampak: PLAN §9, §11 (P0). Reviewer PASS (plus satu ronde perbaikan kecil).
+
+- Fixture = alat pengembangan, bukan produk: kode di `tests/support/fixture.rs` (axum 0.8, dev-dependency; `cargo tree -e normal` tidak memuat axum), dipakai test lewat `mod support;` dan `examples/fixture.rs` lewat `#[path]`. Bind hanya `127.0.0.1` (default port 8080, `--port`). `tokio` dev-dependency mendapat feature `signal` (Ctrl-C di example).
+- Healthy login: kredensial salah → 401 untuk kegagalan ke-1..5, 429 mulai kegagalan ke-6; kredensial benar → 200 `{"access_token"}` selama hitungan gagal < 6, lalu 429. Login benar TIDAK mereset hitungan; hanya `POST /__admin/reset`. Run kedua tanpa reset membuat baseline 429 → brute force INCONCLUSIVE `account_already_locked` (sesuai PLAN §5).
+- Action write-once: apply pertama → 200 dan counter +1, berikutnya → 409 tanpa increment; keputusan atomik (lock dipegang melewati cek+increment, tanpa `.await`). Id dibuat otomatis dengan count 0 saat pertama diakses. `GET /actions/{id}` → `{id, execution_count}`. `/critical` → 200. Authorization wajib untuk action dan critical.
+- Reset (`/__admin/reset`) mencakup hitungan gagal login, semua counter action, counter load. Reset hanyalah alat dev; `api-toolkit` tidak memanggilnya.
+- Respons fixture berisi JSON tetap dan tidak pernah memantulkan body/header request (body login yang salah bentuk → 400 `{"error":"bad_request"}`). Fixture tidak mencatat request.
+- Varian broken/idempotent/slow/prelocked ditambahkan di P1–P3 saat dibutuhkan. Counter `load_requests` dihitung tetapi belum dibaca (dipakai P3).
+- Catatan untuk S10 dan seterusnya: test konkurensi memakai `flavor = "multi_thread"`; client test memakai `.no_proxy()`.

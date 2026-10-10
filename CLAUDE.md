@@ -18,12 +18,12 @@ Code, identifiers, code comments, commit messages: English. Handoff docs, STATUS
 
 ## Commands
 
-Filled in during P0; keep this list current.
+Keep this list current.
 
 - Format check: `cargo fmt --all -- --check`
 - Lint: `cargo clippy --all-targets --all-features -- -D warnings`
 - Test: `cargo test --all-targets`
-- Fixture start/reset: (defined in P0)
+- Fixture start: `cargo run --example fixture` (127.0.0.1:8080; `-- --port <n>`; Ctrl-C stops). Reset: `curl -X POST http://127.0.0.1:8080/__admin/reset` or restart. Details: `docs/fixture.md`.
 
 "Done" means format, lint, and tests pass AND every AC in scope has evidence (test name or command output). Compiling is not done.
 

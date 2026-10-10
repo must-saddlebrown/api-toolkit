@@ -27,4 +27,4 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "ne
 [dev-dependencies]
 axum = "0.8"
 tempfile = "3"
-tokio = { version = "1.53", features = ["test-util"] }
+tokio = { version = "1.53", features = ["test-util", "signal"] }
