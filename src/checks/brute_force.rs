@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep};
 
-use crate::checks::Stop;
+use crate::checks::{Stop, current_stop, wait_stop};
 use crate::config::{BruteForce, MatcherSpec};
 use crate::http::request::ResolvedRequest;
 use crate::http::{Transport, TransportError, TransportResponse, send};
@@ -236,24 +236,6 @@ pub fn evaluate(
 pub enum Kind {
     Baseline,
     Probe,
-}
-
-/// The stop signal now, if any. `Stop` is `Copy`, so the borrow ends right away.
-fn current_stop(rx: &watch::Receiver<Option<Stop>>) -> Option<Stop> {
-    *rx.borrow()
-}
-
-/// Wait until a stop is signalled. If the sender is dropped, no stop can ever come,
-/// so wait forever (the other `select!` branch then decides).
-async fn wait_stop(rx: &mut watch::Receiver<Option<Stop>>) -> Stop {
-    loop {
-        if let Some(s) = current_stop(rx) {
-            return s;
-        }
-        if rx.changed().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    }
 }
 
 fn millis(d: Duration) -> u64 {

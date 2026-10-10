@@ -218,6 +218,13 @@ fn check_race(r: &Race) -> Result<(), ConfigError> {
         return Err(invalid("race.concurrency", "must be at least 2"));
     }
     check_statuses("race.expected_action_statuses", &r.expected_action_statuses)?;
+    // A 202 only says "accepted": the side effect may not have happened yet (PLAN §6).
+    if r.expected_action_statuses.contains(&202) {
+        return Err(invalid(
+            "race.expected_action_statuses",
+            "202 accepted/pending cannot prove a completed side effect (PLAN §6)",
+        ));
+    }
     check_positive("race.max_dispatch_skew_ms", r.max_dispatch_skew_ms)?;
     check_positive("race.settle_ms", r.settle_ms)
 }
@@ -650,6 +657,11 @@ mod tests {
             (
                 "status 600",
                 |c| race(c).expected_action_statuses = vec![600],
+                "race.expected_action_statuses",
+            ),
+            (
+                "status 202 in expected_action_statuses",
+                |c| race(c).expected_action_statuses = vec![200, 202],
                 "race.expected_action_statuses",
             ),
             (
