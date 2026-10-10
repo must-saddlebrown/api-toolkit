@@ -518,7 +518,7 @@ fn rejected_cases(base: &str) -> Vec<Case> {
                 v.as_object_mut().unwrap().remove("brute_force");
             }),
             env: healthy_env(),
-            needle: "brute_force",
+            needle: "invalid config at `brute_force`",
         },
         Case {
             name: "env missing",
@@ -695,7 +695,7 @@ async fn sigint_while_request_hangs_is_exit_130_cancelled_without_new_connection
     let h = Hang::start().await;
     let w = Work::new(&cfg_text(&h.base_url(), |_| {})); // request_timeout 5000, deadline 120000
     let job = w.job(sentinel_env());
-    let child = command(&job)
+    let mut child = command(&job)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -705,7 +705,11 @@ async fn sigint_while_request_hangs_is_exit_130_cancelled_without_new_connection
     // SIGINT handler (registered before the first request) is installed.
     let mut waited = 0;
     while h.seen() == 0 {
-        assert!(waited < 10_000, "the binary never connected");
+        if waited >= 10_000 {
+            let _ = child.kill(); // do not leak the child when the assertion below fails
+            let _ = child.wait();
+            panic!("the binary never connected");
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
         waited += 10;
     }
@@ -713,7 +717,11 @@ async fn sigint_while_request_hangs_is_exit_130_cancelled_without_new_connection
         .args(["-INT", &pid.to_string()])
         .status()
         .unwrap();
-    assert!(st.success());
+    if !st.success() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("kill -INT failed");
+    }
     let out = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
         .await
         .unwrap();

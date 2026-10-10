@@ -79,7 +79,9 @@ async fn run_cfg(cfg: &Value) -> CheckResult {
     validate(&parsed, Selection::All).unwrap();
     let resolved = resolve(&parsed, Selection::All, &lookup).unwrap();
     let bf_reqs = resolved.brute_force.as_ref().unwrap();
-    assert!(!format!("{resolved:?}").contains(SENTINEL));
+    let dbg = format!("{resolved:?}");
+    assert!(!dbg.contains(SENTINEL));
+    assert!(!dbg.contains(SENTINEL_PW));
     let transport = Transport::new(&parsed.limits).unwrap();
     let (_tx, rx) = watch::channel(None);
     run(
@@ -177,6 +179,7 @@ async fn m3_accepts_invalid_fails() {
     }
     let r = run_cfg(&cfg).await;
     assert_verdict(&r, Verdict::Fail, &[ReasonCode::InvalidCredentialsAccepted]);
+    assert_eq!(evidence(&r).attempts.len(), 8);
     assert!(
         evidence(&r)
             .attempts
@@ -323,12 +326,18 @@ async fn m12_late_protection_fails() {
 /// protected run (tail 4, only attempts 6..8 protected) must FAIL, tail 3 passes.
 #[tokio::test(flavor = "multi_thread")]
 async fn tail_longer_than_protection_fails() {
-    for (tail, want) in [(3, Verdict::Pass), (4, Verdict::Fail)] {
+    let cases: [(u32, Verdict, &[ReasonCode]); 2] = [
+        (3, Verdict::Pass, &[ReasonCode::ProtectionObserved]),
+        (4, Verdict::Fail, &[ReasonCode::ProtectionPolicyNotMet]),
+    ];
+    for (tail, want, reasons) in cases {
         let fx = Fixture::start(0).await.unwrap();
         let mut cfg = base_config(&fx.base_url());
         cfg["brute_force"]["protected_tail_count"] = json!(tail);
         let r = run_cfg(&cfg).await;
         assert_eq!(r.verdict, want, "tail={tail}: {}", console_line(&r));
+        assert_eq!(r.reasons, reasons, "tail={tail}: {}", console_line(&r));
+        assert_eq!(r.completion, Completion::Complete, "tail={tail}");
         fx.shutdown().await;
     }
 }
@@ -346,11 +355,12 @@ async fn interval_lower_bound_between_probes() {
     assert_eq!(e.interval_ms, 50);
     for w in e.attempts.windows(2) {
         assert!(
-            w[1].offset_ms - w[0].offset_ms >= 50,
-            "attempt {} -> {}: {} ms",
+            w[1].offset_ms >= w[0].offset_ms + w[0].elapsed_ms + 50,
+            "attempt {} -> {}: {} ms (previous elapsed {} ms)",
             w[0].attempt,
             w[1].attempt,
-            w[1].offset_ms - w[0].offset_ms
+            w[1].offset_ms - w[0].offset_ms,
+            w[0].elapsed_ms
         );
     }
     assert!(e.attempts[7].offset_ms >= 7 * 50);
