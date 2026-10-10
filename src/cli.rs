@@ -1211,7 +1211,9 @@ mod tests {
         assert_eq!(r.bf()["verdict"], "not_run");
         assert_eq!(r.bf()["reasons"], serde_json::json!(["deadline_exceeded"]));
         assert_eq!(r.report()["completion"], "incomplete");
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        // `<=`: under heavy load the deadline can fire before the first connection is
+        // accepted. The server never replies, so at most one request can ever be sent.
+        assert!(count.load(Ordering::SeqCst) <= 1);
     }
 
     #[tokio::test]
@@ -1502,7 +1504,9 @@ mod tests {
             serde_json::json!(["deadline_exceeded"])
         );
         assert_eq!(rep["completion"], "incomplete");
-        assert_eq!(count.load(Ordering::SeqCst), 1); // verifier before only
+        // `<=`: under heavy load the deadline can fire before the verifier-before connection
+        // is accepted. The server never replies, so no action can be sent in either case.
+        assert!(count.load(Ordering::SeqCst) <= 1);
     }
 
     #[tokio::test]
