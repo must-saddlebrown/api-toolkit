@@ -25,3 +25,16 @@ Semua 9 mutan (6 missed + 3 timeout) diperbaiki dengan test lewat slice M1 dan M
 244 mutan: 224 caught, 0 missed, 20 unviable, 0 timeout (exit 0). Daftar equivalent: kosong.
 
 Catatan: 20 mutan unviable (tidak terkompilasi) tidak diuji dan tidak dibuktikan apa pun tentang test.
+
+## Tambahan: `src/config/validate.rs` (di luar cakupan bawaan)
+
+Diminta pengguna karena validasi config bisa menjadi pintu PASS palsu. Dijalankan dengan `scripts/verify.sh mutants --file 'src/config/validate.rs'`. Cakupan bawaan di `scripts/verify.sh` belum diubah (skrip itu hanya boleh diedit pengguna), jadi berkas ini harus diberikan lewat `--file` setiap kali.
+
+| | Caught | Missed | Unviable | Timeout | Total |
+| --- | --- | --- | --- | --- | --- |
+| Sebelum | 82 | 1 | 3 | 0 | 86 |
+| Sesudah M3 | 83 | 0 | 3 | 0 | 86 |
+
+| Mutan | Keputusan |
+| --- | --- |
+| `src/config/validate.rs:379:45` `\|\|`→`&&` di `check_path` | Diperbaiki (M3): test `malformed_placeholder_is_rejected_with_its_own_message` untuk `{}` dan `{x{y}`. Bukan equivalent: path `/a/{}` dengan `path_params` berkunci kosong akan lolos validasi |

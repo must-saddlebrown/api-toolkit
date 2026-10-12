@@ -963,6 +963,27 @@ mod tests {
     }
 
     #[test]
+    fn malformed_placeholder_is_rejected_with_its_own_message() {
+        // (path, path_params): the empty-key case must not make `{}` match.
+        let cases: Vec<(&str, Option<BTreeMap<String, String>>)> = vec![
+            ("/a/{}", None),
+            ("/a/{}", map(&[("", "x")])),
+            ("/a/{x{y}", None),
+            ("/a/{x{y}", map(&[("x", "1"), ("y", "2")])),
+        ];
+        for (path, params) in cases {
+            let mut cfg = base();
+            load(&mut cfg).request.path = path.into();
+            load(&mut cfg).request.path_params = params;
+            let msg = validate(&cfg, Selection::All).unwrap_err().to_string();
+            assert!(
+                msg.contains("malformed `{name}` placeholder"),
+                "{path}: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn errors_name_no_values() {
         let sentinel = "SENTINEL-SECRET-VALUE";
         let mut cfg = base();

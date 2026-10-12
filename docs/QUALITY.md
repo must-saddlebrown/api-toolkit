@@ -54,6 +54,8 @@ cargo-mutants 27.1.0, cakupan bawaan (`src/checks/**`, `src/matchers*`, `src/rep
 
 Sembilan mutan yang lolos diperbaiki dengan unit test saja; kode produksi tidak berubah. Tidak ada mutan yang dinyatakan equivalent (`docs/mutation-triage.md`). Dua test M1 memakai `std::process::exit(101)` karena mutan batas worker membuat loop sibuk tanpa menyerahkan giliran sehingga timeout biasa tidak sempat jalan; pada kode benar cabang itu tidak pernah dieksekusi.
 
+Tambahan di luar cakupan bawaan: `src/config/validate.rs` (86 mutan) diukur atas permintaan pengguna. Sebelum: 82 caught, 1 missed, 3 unviable. Sesudah slice M3: 83 caught, 0 missed, 3 unviable, 0 timeout. Berkas ini belum masuk cakupan bawaan `scripts/verify.sh`; jalankan `scripts/verify.sh mutants --file 'src/config/validate.rs'`.
+
 ## Cakupan AC
 
 `docs/ac-trace.md`: 114 baris AC (P0–P4).
@@ -70,7 +72,7 @@ Sembilan mutan yang lolos diperbaiki dengan unit test saja; kode produksi tidak 
 - Gate bersifat lokal. Manusia tetap bisa melewati hook git (`--no-verify`, mengubah `core.hooksPath`); CI belum ada sampai server git tersedia.
 - Reviewer adalah LLM. Verdict-nya bisa keliru; gate mekanis (fmt, clippy, test, jejak AC, mutasi) membatasi kerusakan tetapi tidak menggantikan penilaian.
 - `ac-trace.sh` membuktikan bahwa test yang dirujuk ada, tidak di-ignore, dan lulus. Ia tidak membuktikan bahwa test itu memang menguji AC yang dituju; itu tugas reviewer.
-- Mutasi hanya mencakup `checks`, `matchers`, `report`. `config`, `http`, dan `cli` tidak diukur. Mutan unviable (20) tidak membuktikan apa-apa.
+- Mutasi bawaan hanya mencakup `checks`, `matchers`, `report`; `config/validate.rs` diukur terpisah. `config/resolve.rs`, `http`, dan `cli` tidak diukur. Mutan unviable (20) tidak membuktikan apa-apa.
 - Kebenaran oracle (aturan verdict di `docs/PLAN.md`) bergantung pada rencana dan pengguna. Test yang lulus membuktikan kode sesuai rencana, bukan bahwa rencana benar.
 - Semua bukti berasal dari fixture lokal. **P4-AC7 (validasi terhadap API nyata) terbuka**: belum ada laporan run nyata, jadi barisnya sengaja tidak ada di `docs/ac-trace.md`.
 
