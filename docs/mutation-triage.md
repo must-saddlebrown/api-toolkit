@@ -1,6 +1,6 @@
 # Triase mutasi
 
-Perintah: `scripts/verify.sh mutants` (cargo-mutants 27.1.0; cakupan bawaan: `src/checks/**`, `src/matchers*`, `src/report*`).
+Perintah: `scripts/verify.sh mutants` (cargo-mutants 27.1.0; cakupan bawaan: `src/checks/**`, `src/matchers*`, `src/report*`, `src/config/validate.rs`).
 
 Aturan triase: setiap mutan yang lolos (missed) atau timeout diperbaiki dengan test, atau dicatat di bawah sebagai equivalent dengan satu baris alasan. Mutan yang bisa mengubah non-PASS menjadi PASS tidak pernah diterima sebagai equivalent.
 
@@ -26,9 +26,9 @@ Semua 9 mutan (6 missed + 3 timeout) diperbaiki dengan test lewat slice M1 dan M
 
 Catatan: 20 mutan unviable (tidak terkompilasi) tidak diuji dan tidak dibuktikan apa pun tentang test.
 
-## Tambahan: `src/config/validate.rs` (di luar cakupan bawaan)
+## `src/config/validate.rs`
 
-Diminta pengguna karena validasi config bisa menjadi pintu PASS palsu. Dijalankan dengan `scripts/verify.sh mutants --file 'src/config/validate.rs'`. Cakupan bawaan di `scripts/verify.sh` belum diubah (skrip itu hanya boleh diedit pengguna), jadi berkas ini harus diberikan lewat `--file` setiap kali.
+Diminta pengguna karena validasi config bisa menjadi pintu PASS palsu. Dijalankan dengan `scripts/verify.sh mutants --file 'src/config/validate.rs'`. Pengguna lalu menambahkan berkas ini ke cakupan bawaan `scripts/verify.sh`.
 
 | | Caught | Missed | Unviable | Timeout | Total |
 | --- | --- | --- | --- | --- | --- |
@@ -38,3 +38,7 @@ Diminta pengguna karena validasi config bisa menjadi pintu PASS palsu. Dijalanka
 | Mutan | Keputusan |
 | --- | --- |
 | `src/config/validate.rs:379:45` `\|\|`→`&&` di `check_path` | Diperbaiki (M3): test `malformed_placeholder_is_rejected_with_its_own_message` untuk `{}` dan `{x{y}`. Bukan equivalent: path `/a/{}` dengan `path_params` berkunci kosong akan lolos validasi |
+
+## Run bawaan penuh (cakupan terbaru)
+
+330 mutan: 307 caught, 0 missed, 23 unviable, 0 timeout (exit 0). Daftar equivalent: kosong.

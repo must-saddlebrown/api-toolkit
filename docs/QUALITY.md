@@ -46,7 +46,9 @@ Catatan: Q1 adalah pekerjaan kualitas di luar plan (slice M1–M3, perbaikan mut
 
 ## Mutasi
 
-cargo-mutants 27.1.0, cakupan bawaan (`src/checks/**`, `src/matchers*`, `src/report*`):
+cargo-mutants 27.1.0. Cakupan bawaan `scripts/verify.sh mutants` (tanpa argumen): `src/checks/**`, `src/matchers*`, `src/report*`, dan `src/config/validate.rs` (ditambahkan pengguna karena config yang lolos validasi tetapi membuat check hampa adalah jalur PASS palsu). Hasil dilaporkan per kelompok berkas karena diukur pada waktu berbeda:
+
+`checks`, `matchers`, `report` (run penuh sebelum `validate.rs` masuk cakupan):
 
 | | Caught | Missed | Unviable | Timeout | Total |
 | --- | --- | --- | --- | --- | --- |
@@ -55,7 +57,20 @@ cargo-mutants 27.1.0, cakupan bawaan (`src/checks/**`, `src/matchers*`, `src/rep
 
 Sembilan mutan yang lolos diperbaiki dengan unit test saja; kode produksi tidak berubah. Tidak ada mutan yang dinyatakan equivalent (`docs/mutation-triage.md`). Dua test M1 memakai `std::process::exit(101)` karena mutan batas worker membuat loop sibuk tanpa menyerahkan giliran sehingga timeout biasa tidak sempat jalan; pada kode benar cabang itu tidak pernah dieksekusi.
 
-Tambahan di luar cakupan bawaan: `src/config/validate.rs` (86 mutan) diukur atas permintaan pengguna. Sebelum: 82 caught, 1 missed, 3 unviable. Sesudah slice M3: 83 caught, 0 missed, 3 unviable, 0 timeout. Berkas ini belum masuk cakupan bawaan `scripts/verify.sh`; jalankan `scripts/verify.sh mutants --file 'src/config/validate.rs'`.
+`src/config/validate.rs` (`scripts/verify.sh mutants --file 'src/config/validate.rs'`, 86 mutan):
+
+| | Caught | Missed | Unviable | Timeout | Total |
+| --- | --- | --- | --- | --- | --- |
+| Sebelum | 82 | 1 | 3 | 0 | 86 |
+| Sesudah slice M3 | 83 | 0 | 3 | 0 | 86 |
+
+Run bawaan gabungan (`scripts/verify.sh mutants` tanpa argumen, cakupan terbaru, ±13 menit):
+
+| | Caught | Missed | Unviable | Timeout | Total |
+| --- | --- | --- | --- | --- | --- |
+| Sesudah M1–M3 | 307 | 0 | 23 | 0 | 330 |
+
+Exit 0. Angka ini sama dengan jumlah kedua kelompok di atas (224 + 83 caught, 20 + 3 unviable).
 
 ## Cakupan AC
 
@@ -73,7 +88,7 @@ Tambahan di luar cakupan bawaan: `src/config/validate.rs` (86 mutan) diukur atas
 - Gate bersifat lokal. Manusia tetap bisa melewati hook git (`--no-verify`, mengubah `core.hooksPath`); CI belum ada sampai server git tersedia.
 - Reviewer adalah LLM. Verdict-nya bisa keliru; gate mekanis (fmt, clippy, test, jejak AC, mutasi) membatasi kerusakan tetapi tidak menggantikan penilaian.
 - `ac-trace.sh` membuktikan bahwa test yang dirujuk ada, tidak di-ignore, dan lulus. Ia tidak membuktikan bahwa test itu memang menguji AC yang dituju; itu tugas reviewer.
-- Mutasi bawaan hanya mencakup `checks`, `matchers`, `report`; `config/validate.rs` diukur terpisah. `config/resolve.rs`, `http`, dan `cli` tidak diukur. Mutan unviable (20) tidak membuktikan apa-apa.
+- Mutasi bawaan hanya mencakup `checks`, `matchers`, `report`, dan `config/validate.rs`. `config/resolve.rs`, `config` selain validate, `http`, dan `cli` tidak diukur. Mutan unviable (23 di run bawaan) tidak membuktikan apa-apa.
 - Kebenaran oracle (aturan verdict di `docs/PLAN.md`) bergantung pada rencana dan pengguna. Test yang lulus membuktikan kode sesuai rencana, bukan bahwa rencana benar.
 - Semua bukti berasal dari fixture lokal. **P4-AC7 (validasi terhadap API nyata) terbuka**: belum ada laporan run nyata, jadi barisnya sengaja tidak ada di `docs/ac-trace.md`.
 

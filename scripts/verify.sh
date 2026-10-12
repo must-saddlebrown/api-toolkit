@@ -51,10 +51,12 @@ case "$MODE" in
       echo "cargo-mutants is not installed: cargo install --locked cargo-mutants" >&2
       exit 1
     fi
-    # Default scope: code that decides verdicts. Pass extra args to narrow it,
+    # Default scope: code that decides verdicts, plus config validation (a config that
+    # validates but makes a check vacuous is a false-PASS path). Pass args to narrow it,
     # e.g. scripts/verify.sh mutants --file 'src/checks/race*'
     if [ "$#" -eq 0 ]; then
-      set -- --file 'src/checks/**' --file 'src/matchers*' --file 'src/report*' --file 'src/report/**'
+      set -- --file 'src/checks/**' --file 'src/matchers*' --file 'src/report*' --file 'src/report/**' \
+             --file 'src/config/validate.rs'
     fi
     cargo mutants --output "$OUT_DIR" "$@"
     code=$?
