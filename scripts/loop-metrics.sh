@@ -5,6 +5,7 @@
 #   - 2026-10-10 | P1 | S3 | round 1 | FIX | short reason
 # Phase-gate rounds use the slice id GATE. Blocked slices use verdict BLOCKED.
 # Escaped defects (found after a phase was closed, e.g. on the real API) use slice ESCAPED.
+# Work outside the plan phases (e.g. mutation fixes) uses its own phase id such as Q1, not P<n>.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,7 +16,7 @@ files=(docs/loop-history/*.md)
 [ "${#files[@]}" -gt 0 ] || { echo "no files in docs/loop-history/"; exit 1; }
 TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
 
-grep -hE '^- [0-9]{4}-[0-9]{2}-[0-9]{2} \| P[0-9]+ \| [A-Z0-9]+ \| round [0-9]+ \| (PASS|FIX|REANALYZE|BLOCKED) \|' "${files[@]}" \
+grep -hE '^- [0-9]{4}-[0-9]{2}-[0-9]{2} \| [A-Z][A-Z0-9]* \| [A-Z0-9]+ \| round [0-9]+ \| (PASS|FIX|REANALYZE|BLOCKED) \|' "${files[@]}" \
 | awk -F' \\| ' '
   {
     ph=$2; sl=$3; rd=$4; v=$5; sub(/^round /, "", rd)

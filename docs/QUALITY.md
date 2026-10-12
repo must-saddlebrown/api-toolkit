@@ -38,10 +38,11 @@ Keluaran `scripts/loop-metrics.sh` (dari `docs/loop-history/*.md`):
 | P1 | 5 | 4/5 (80%) | 1 | 0 | 0 | 0 | 0 |
 | P2 | 8 | 8/8 (100%) | 0 | 0 | 0 | 0 | 0 |
 | P3 | 8 | 4/8 (50%) | 4 | 0 | 0 | 0 | 0 |
-| P4 | 8 | 3/8 (38%) | 5 | 0 | 0 | 0 | 0 |
-| **Total** | 39 | 27/39 (69%) | 12 | 0 | 0 | 0 | 0 |
+| P4 | 6 | 1/6 (17%) | 5 | 0 | 0 | 0 | 0 |
+| Q1 | 3 | 3/3 (100%) | 0 | 0 | 0 | 0 | 0 |
+| **Total** | 40 | 28/40 (70%) | 12 | 0 | 0 | 0 | 0 |
 
-Catatan: P4 mencakup slice S1–S6 dan M1–M2. Riwayat P0–P4 disusun ulang dari Log handoff (`docs/loop-history/raw/`), bukan dicatat saat kejadian. Perbaikan kecil sesudah PASS di P0 (S3–S6, S8) tidak dihitung sebagai putaran karena tidak ada verdict FIX; angka "PASS putaran 1" P0 karenanya agak optimistis. Slice S11 P0 (tolak `race.concurrency < 2`) diusulkan phase gate P0 tetapi tidak pernah dikerjakan, jadi tidak tercatat.
+Catatan: Q1 adalah pekerjaan kualitas di luar plan (slice M1–M3, perbaikan mutan). Riwayat P0–P4 disusun ulang dari Log handoff (`docs/loop-history/raw/`), bukan dicatat saat kejadian. Perbaikan kecil sesudah PASS di P0 (S3–S6, S8) tidak dihitung sebagai putaran karena tidak ada verdict FIX; angka "PASS putaran 1" P0 karenanya agak optimistis. Slice S11 P0 (tolak `race.concurrency < 2`) diusulkan phase gate P0 tetapi tidak pernah dikerjakan, jadi tidak tercatat.
 
 ## Mutasi
 
