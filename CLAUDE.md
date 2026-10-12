@@ -26,7 +26,10 @@ Keep this list current.
 - Fixture proof (end-to-end, real binary vs fixture on a random port, no env vars): `cargo test --test fixture_proof`
 - Fixture start: `cargo run --example fixture` (127.0.0.1:8080; `-- --port <n>`; Ctrl-C stops). Reset: `curl -X POST http://127.0.0.1:8080/__admin/reset` or restart. Details: `docs/fixture.md`.
 
-"Done" means format, lint, and tests pass AND every AC in scope has evidence (test name or command output). Compiling is not done.
+- Gate (fmt, clippy, tests, AC trace): `scripts/verify.sh fast`
+- Mutation testing (phase gate; default scope checks, matchers, report): `scripts/verify.sh mutants [cargo-mutants args]`
+
+"Done" means `scripts/verify.sh fast` exits 0 (fmt, clippy, tests, AC trace) AND every AC in scope has a row in `docs/ac-trace.md`. Compiling is not done.
 
 Routine commands (cargo, rustup, git status/diff/log/add/commit) run without asking. Never `git push`, `cargo publish`, create remote repositories, or publish anything.
 
@@ -46,6 +49,7 @@ v0.1 is the CLI core proof only (plan §2). Do not add TUI, OpenAPI parsing, flo
 
 ## Rules every agent follows
 
+- Never bypass git hooks. Never edit `scripts/verify.sh`, `scripts/ac-trace.sh`, `scripts/loop-metrics.sh`, `.githooks/`, `.claude/hooks/`, or `.claude/settings.json`. If a gate itself seems wrong, stop and report to the user.
 - No false PASS. Every path that cannot prove the oracle (timeout, incomplete workload, bad precondition, unclassifiable response, cancel) must end in INCONCLUSIVE, ERROR, or NOT_RUN per plan §4–7. Tests must cover these paths, not only the happy path.
 - Network: tests and manual runs use the local fixture on `127.0.0.1` only. Never send requests to an external API. Never invent endpoints, credentials, or business counters for a real target; the user supplies the real config (plan §14).
 - No automatic retry anywhere. No redirect following. TLS verification stays on.

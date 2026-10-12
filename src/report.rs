@@ -1416,6 +1416,104 @@ mod tests {
         assert_eq!(exit_code(&full_pass), 2);
     }
 
+    fn partial_report(checks: &[(CheckName, Verdict, Completion, &[ReasonCode])]) -> Report {
+        let mut r = report_with(checks);
+        r.scope = Scope::Partial;
+        r
+    }
+
+    #[test]
+    fn partial_exit_code_malformed_excluded_alone_is_2() {
+        use CheckName::*;
+        use Completion::Complete;
+        use Verdict::*;
+        let none: &[ReasonCode] = &[];
+        let excl: &[ReasonCode] = &[ReasonCode::ExcludedByOnly];
+        // A completed fail carrying only `excluded_by_only` is malformed. Without the
+        // malformed guard it would look like a plain fail (1).
+        let r = partial_report(&[
+            (Race, Fail, Complete, excl),
+            (Load, NotRun, Completion::Incomplete, excl),
+            (BruteForce, Fail, Complete, none),
+        ]);
+        assert_eq!(exit_code(&r), 2);
+        let r = partial_report(&[
+            (Race, Fail, Complete, excl),
+            (Load, Fail, Complete, none),
+            (BruteForce, Fail, Complete, none),
+        ]);
+        assert_eq!(exit_code(&r), 2);
+    }
+
+    #[test]
+    fn partial_exit_code_fail_with_non_conclusive_sibling_is_2() {
+        use CheckName::*;
+        use Completion::{Complete, Incomplete};
+        use Verdict::*;
+        let none: &[ReasonCode] = &[];
+        let deadline: &[ReasonCode] = &[ReasonCode::DeadlineExceeded];
+        let excl: &[ReasonCode] = &[ReasonCode::ExcludedByOnly];
+        let with_sibling = |v, c, reasons| {
+            partial_report(&[
+                (Race, Fail, Complete, none),
+                (Load, v, c, reasons),
+                (BruteForce, NotRun, Incomplete, excl),
+            ])
+        };
+        assert_eq!(exit_code(&with_sibling(Fail, Complete, none)), 1);
+        assert_eq!(exit_code(&with_sibling(Error, Complete, none)), 2);
+        assert_eq!(exit_code(&with_sibling(Inconclusive, Complete, none)), 2);
+        assert_eq!(exit_code(&with_sibling(NotRun, Incomplete, deadline)), 2);
+        assert_eq!(exit_code(&with_sibling(Fail, Incomplete, deadline)), 2);
+        assert_eq!(exit_code(&with_sibling(Pass, Incomplete, none)), 2);
+    }
+
+    #[test]
+    fn partial_exit_code_fail_with_pass_sibling_depends_on_pass_reasons() {
+        use CheckName::*;
+        use Completion::{Complete, Incomplete};
+        use Verdict::*;
+        let none: &[ReasonCode] = &[];
+        let excl: &[ReasonCode] = &[ReasonCode::ExcludedByOnly];
+        let with_pass = |reasons| {
+            partial_report(&[
+                (Race, Fail, Complete, none),
+                (Load, Pass, Complete, reasons),
+                (BruteForce, NotRun, Incomplete, excl),
+            ])
+        };
+        assert_eq!(exit_code(&with_pass(&[ReasonCode::ProtectionObserved])), 1);
+        assert_eq!(exit_code(&with_pass(none)), 1);
+        assert_eq!(exit_code(&with_pass(&[ReasonCode::TransportError])), 2);
+        assert_eq!(
+            exit_code(&with_pass(&[
+                ReasonCode::ProtectionObserved,
+                ReasonCode::TransportError
+            ])),
+            2
+        );
+    }
+
+    #[test]
+    fn atomic_write_non_already_exists_error_is_returned_without_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-dir").join("report.json");
+        let mut calls = 0;
+        let err = write_report_atomic_with(&path, &sample_report(), || {
+            calls += 1;
+            calls
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ReportError::Io {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            }
+        ));
+        assert_eq!(calls, 1);
+    }
+
     #[test]
     fn exit_code_pass_reasons_table() {
         use CheckName::*;

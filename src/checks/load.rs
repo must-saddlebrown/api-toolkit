@@ -1570,4 +1570,48 @@ mod tests {
             "load INCONCLUSIVE error_rate=none/0.01 p95=none/500ms attempted=0/100 samples=0 max_in_flight=0/10 timeouts=0 status=none errors=none reasons=target_not_ready"
         );
     }
+
+    #[test]
+    fn nearest_rank_pct_out_of_range_is_clamped_to_the_ends() {
+        let d = [ms(30), ms(10), ms(20)];
+        assert_eq!(nearest_rank_ms(&d, 200), Some(30));
+        assert_eq!(nearest_rank_ms(&d, 0), Some(10));
+        assert_eq!(nearest_rank_ms(&[ms(7)], 1000), Some(7));
+    }
+
+    /// The sender exits the process on a number above `requests`, so a broken bound fails fast.
+    #[tokio::test(start_paused = true)]
+    async fn worker_never_takes_a_number_above_requests() {
+        for (requests, concurrency) in [(3, 10), (5, 5), (7, 2), (1, 1)] {
+            let taken = std::cell::RefCell::new(Vec::new());
+            let send = |kind: Kind| {
+                if let Kind::Load(n) = kind {
+                    if n > requests {
+                        // A broken bound makes every other test spin forever, so a panic is
+                        // not enough: end the whole test process at once.
+                        let _ = std::io::Write::write_fmt(
+                            &mut std::io::stderr(),
+                            format_args!(
+                                "worker_never_takes_a_number_above_requests: number {n} above requests {requests}\n"
+                            ),
+                        );
+                        std::process::exit(101);
+                    }
+                    taken.borrow_mut().push(n);
+                }
+                async { resp(200, None) }
+            };
+            let (_tx, rx) = no_stop();
+            let r = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_with(send, &cfg(requests, concurrency), rx),
+            )
+            .await
+            .expect("run must finish");
+            let mut got = taken.borrow().clone();
+            got.sort_unstable();
+            assert_eq!(got, (1..=requests).collect::<Vec<u32>>());
+            assert_eq!(r.verdict, Verdict::Pass);
+        }
+    }
 }

@@ -44,8 +44,10 @@ For each slice in order:
 1. Mark it `in_progress` in the handoff doc.
 2. `implementer`: handoff path + slice id. It implements the slice, inline unit tests included, and runs format, lint, and tests.
 3. `reviewer`: handoff path + slice id. It checks the slice's AC ids and verdict-matrix rows with evidence, looks for false PASS paths, and may delegate integration tests to `tester`. Verdict PASS / FIX / REANALYZE, handled per the user-level loop (max 2 rounds).
-4. On PASS: mark the slice `done`, commit with message `$0.<slice>: <summary>`, continue.
-5. After 2 rounds without PASS: mark the slice `blocked`, write the current state in the handoff Log, stop, and report to the user.
+4. After every reviewer verdict, append one line to `docs/loop-history/$0.md` in exactly this format (phase-gate rounds use `GATE` as the slice id):
+   `- YYYY-MM-DD | P<n> | S<k> | round <r> | PASS|FIX|REANALYZE|BLOCKED | <short reason>`
+5. On PASS: the reviewer adds or updates the slice's rows in `docs/ac-trace.md` (test names exactly as `cargo test --all-targets -- --list` prints them, or `manual:<path>` to a committed evidence file). Then mark the slice `done`, commit with message `$0.<slice>: <summary>`, continue.
+6. After 2 rounds without PASS: mark the slice `blocked`, write the current state in the handoff Log, stop, and report to the user.
 
 Do not narrate each step to the user; the handoff doc and commits are the progress record.
 
@@ -56,6 +58,7 @@ When all slices are `done`, delegate to `reviewer` with phase scope:
 - Run format, lint, and the full test suite (it may use `tester` for the run and for missing integration tests).
 - Produce an AC table: each `$0-ACn` → met / not met, with evidence (test name, command, or output excerpt).
 - Confirm every verdict-matrix row has a passing test.
+- Run `scripts/verify.sh mutants --file '<phase modules>'`. Every missed mutant is either fixed with a test (new slice, normal loop) or recorded in `docs/mutation-triage.md` as equivalent with a one-line reason. A missed mutant that could turn a non-PASS into PASS is never accepted as equivalent.
 - Run the secret sentinel check over console output and the JSON report for this phase's checks.
 - List known limitations and any behavior that differs from the plan.
 - List the new Rust concepts used in this phase, each with a file/function where it appears.
@@ -67,7 +70,7 @@ FIX or REANALYZE at the gate goes back through step 3 as a new slice. Same 2-rou
 1. Update `docs/STATUS.md`: phase state, AC summary, how to try it (exact commands, including fixture start/reset), known limitations.
 2. Update `docs/DECISIONS.md` with any decisions made during the phase.
 3. Append to `docs/rust-notes.md`: a short Indonesian section per new Rust concept (what it is, why it was used here, where in the code).
-4. Commit `$0: close-out`.
+4. Commit `$0: close-out`, including `docs/loop-history/` and `docs/ac-trace.md`.
 5. Report to the user in Indonesian: what works, checks run, known limitations, how to try it.
 
 ## 6. After the phase

@@ -11,13 +11,41 @@
       "Bash(git log *)",
       "Bash(git show *)",
       "Bash(git add *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(scripts/verify.sh *)",
+      "Bash(./scripts/verify.sh *)",
+      "Bash(scripts/ac-trace.sh)",
+      "Bash(scripts/loop-metrics.sh)",
+      "Bash(cargo mutants *)"
     ],
     "deny": [
       "Bash(cargo publish *)",
       "Bash(cargo login *)",
       "Bash(git push *)",
-      "Read(./.env)"
+      "Read(./.env)",
+      "Bash(* --no-verify*)",
+      "Bash(git commit -n*)",
+      "Bash(* core.hooksPath*)",
+      "Edit(/scripts/verify.sh)",
+      "Edit(/scripts/ac-trace.sh)",
+      "Edit(/scripts/loop-metrics.sh)",
+      "Edit(/.githooks/**)",
+      "Edit(/.claude/hooks/**)",
+      "Edit(/.claude/settings.json)"
+    ]
+  },
+  "hooks": {
+    "SubagentStop": [
+      {
+        "matcher": "implementer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/implementer-stop-gate.sh",
+            "timeout": 900
+          }
+        ]
+      }
     ]
   }
 }
