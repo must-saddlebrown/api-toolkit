@@ -180,6 +180,8 @@ pub enum ReasonCode {
     ActionOutcomeAmbiguous,
     VerifierFailed,
     CounterInvalid,
+    BaselineUnreadable,
+    CounterNotAvailable,
     // load
     ThresholdsMet,
     ErrorRateExceeded,
@@ -193,7 +195,7 @@ pub enum ReasonCode {
 }
 
 impl ReasonCode {
-    pub const ALL: [ReasonCode; 30] = [
+    pub const ALL: [ReasonCode; 32] = [
         ReasonCode::ConfigInvalid,
         ReasonCode::DeadlineExceeded,
         ReasonCode::Cancelled,
@@ -216,6 +218,8 @@ impl ReasonCode {
         ReasonCode::ActionOutcomeAmbiguous,
         ReasonCode::VerifierFailed,
         ReasonCode::CounterInvalid,
+        ReasonCode::BaselineUnreadable,
+        ReasonCode::CounterNotAvailable,
         ReasonCode::ThresholdsMet,
         ReasonCode::ErrorRateExceeded,
         ReasonCode::LatencyExceeded,
@@ -250,6 +254,8 @@ impl ReasonCode {
             ReasonCode::ActionOutcomeAmbiguous => "action_outcome_ambiguous",
             ReasonCode::VerifierFailed => "verifier_failed",
             ReasonCode::CounterInvalid => "counter_invalid",
+            ReasonCode::BaselineUnreadable => "baseline_unreadable",
+            ReasonCode::CounterNotAvailable => "counter_not_available",
             ReasonCode::ThresholdsMet => "thresholds_met",
             ReasonCode::ErrorRateExceeded => "error_rate_exceeded",
             ReasonCode::LatencyExceeded => "latency_exceeded",
@@ -705,6 +711,8 @@ mod tests {
             ReasonCode::ActionOutcomeAmbiguous => "action_outcome_ambiguous",
             ReasonCode::VerifierFailed => "verifier_failed",
             ReasonCode::CounterInvalid => "counter_invalid",
+            ReasonCode::BaselineUnreadable => "baseline_unreadable",
+            ReasonCode::CounterNotAvailable => "counter_not_available",
             ReasonCode::ThresholdsMet => "thresholds_met",
             ReasonCode::ErrorRateExceeded => "error_rate_exceeded",
             ReasonCode::LatencyExceeded => "latency_exceeded",
@@ -760,7 +768,7 @@ mod tests {
             assert_eq!(v.as_str(), scope_literal(v));
             assert_eq!(json_of(&v), format!("\"{}\"", scope_literal(v)));
         }
-        assert_eq!(ReasonCode::ALL.len(), 30);
+        assert_eq!(ReasonCode::ALL.len(), 32);
         for v in ReasonCode::ALL {
             assert_eq!(v.as_str(), reason_literal(v));
             assert_eq!(json_of(&v), format!("\"{}\"", reason_literal(v)));
@@ -1337,6 +1345,34 @@ mod tests {
         // E10: a complete fail carrying excluded_by_only is never 1
         let excl: &[ReasonCode] = &[ReasonCode::ExcludedByOnly];
         assert_eq!(exit_code(&suite((Fail, Complete, excl), p, p)), 2);
+    }
+
+    #[test]
+    fn exit_code_new_race_inconclusive_reasons_are_2() {
+        use CheckName::*;
+        use Completion::{Complete, Incomplete};
+        use Verdict::*;
+        let excl: &[ReasonCode] = &[ReasonCode::ExcludedByOnly];
+        let pass: &[ReasonCode] = &[ReasonCode::ProtectionObserved];
+        for reason in [
+            ReasonCode::BaselineUnreadable,
+            ReasonCode::CounterNotAvailable,
+        ] {
+            let rs: &[ReasonCode] = &[reason];
+            let full = report_with(&[
+                (BruteForce, Pass, Complete, pass),
+                (Race, Inconclusive, Complete, rs),
+                (Load, Pass, Complete, &[ReasonCode::ThresholdsMet]),
+            ]);
+            assert_eq!(exit_code(&full), 2, "{reason:?}");
+            let mut only = report_with(&[
+                (BruteForce, NotRun, Incomplete, excl),
+                (Race, Inconclusive, Complete, rs),
+                (Load, NotRun, Incomplete, excl),
+            ]);
+            only.scope = Scope::Partial;
+            assert_eq!(exit_code(&only), 2, "{reason:?}");
+        }
     }
 
     #[test]

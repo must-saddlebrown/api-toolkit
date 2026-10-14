@@ -113,6 +113,8 @@ fn enums_serialize_to_stable_snake_case() {
         "action_outcome_ambiguous",
         "verifier_failed",
         "counter_invalid",
+        "baseline_unreadable",
+        "counter_not_available",
         "thresholds_met",
         "error_rate_exceeded",
         "latency_exceeded",

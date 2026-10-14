@@ -251,3 +251,13 @@ Detail: `.claude/work/P4-plan.md` (Log, entri phase gate). Phase gate reviewer P
 - **P4-AC7 (validasi target nyata) belum dilakukan**: fixture proof selesai, menunggu config target dari pengguna. Checkpoint pengguna terbuka; jangan ditandai selesai tanpa report dari run nyata.
 - Keterbatasan baru: Ctrl-C sebelum handler terdaftar mematikan proses tanpa report; Ctrl-C setelah check terakhir selesai mengikuti verdict (bukan 130); load yang dibatalkan sebelum preflight dijawab hanya `not_run [cancelled]` tanpa `workload_incomplete`; brute_force yang sudah FAIL lalu dibatalkan tetap FAIL + `cancelled`/`incomplete` (exit 130); jalur `build_report` gagal + cancel tanpa test; test SIGINT `seen_at_sigint == 1` bergantung pada urutan race → load → brute_force; cek atomic (inode) hanya di unix.
 - `examples/api-checks.json` (untracked, brute_force saja ke `127.0.0.1:3000`) bukan bagian P4; keputusan di-commit atau di-`.gitignore` menunggu pengguna.
+
+## 2026-10-14 — Q2: batas ERROR/INCONCLUSIVE race
+
+Detail: `.claude/work/Q2-Q3-plan.md`, `docs/findings.md` F-001. Terdampak: PLAN §4, §6, §10 (README).
+
+- Verifier before dipisah menjadi empat kelas (tabel V1–V7 di PLAN §6). Mismatch `verify_match` → INCONCLUSIVE `baseline_unreadable`; pointer absent → INCONCLUSIVE `counter_not_available`. Transport error, body bukan JSON, dan nilai bukan integer >= 0 (termasuk `null`) tetap ERROR. V2 mendahului V3.
+- Verifier after TIDAK berubah (ERROR). Alasan: action sudah terkirim, "oracle belum tersedia" tidak berlaku.
+- Kontrak report: `ReasonCode` +2 (`baseline_unreadable`, `counter_not_available`), total 32. Aditif; `report_version` tetap 1. Tidak ada file schema atau dokumen kontrak terpisah; yang ikut berubah: `ReasonCode::ALL` dan dua `as_str` exhaustive di `src/report.rs`, daftar string di `tests/report_contract.rs`, tabel reason di README. Input yang sama kini ERROR → INCONCLUSIVE (exit code tetap 2). Bila ada konsumen eksternal yang mem-parse `counter_invalid`/`verifier_failed`, naikkan `report_version` ke 2 (menunggu konfirmasi pengguna).
+- Tidak ada jalur baru menuju PASS (kedua kelas baru berhenti sebelum action; dikunci test exhaustif).
+- Fixture: 4 rute verifier rusak `GET /broken/actions/{id}/verify-{denied,not-json,no-counter,bad-counter}`.

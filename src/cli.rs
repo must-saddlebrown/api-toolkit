@@ -2159,8 +2159,12 @@ mod tests {
         let rep = r.report();
         assert_full_report_shape(&rep);
         let checks = rep["checks"].as_array().unwrap();
-        assert_eq!(checks[0]["verdict"], "error", "{}", checks[0]);
-        assert!(checks[0]["reasons"].to_string().contains("counter_invalid"));
+        assert_eq!(checks[0]["verdict"], "inconclusive", "{}", checks[0]);
+        assert!(
+            checks[0]["reasons"]
+                .to_string()
+                .contains("counter_not_available")
+        );
         assert_eq!(checks[0]["completion"], "complete", "{}", checks[0]);
         assert_eq!(checks[1]["verdict"], "not_run", "{}", checks[1]);
         assert!(checks[1]["reasons"].to_string().contains("cancelled"));
@@ -2183,8 +2187,12 @@ mod tests {
         let rep = r.report();
         assert_full_report_shape(&rep);
         let checks = rep["checks"].as_array().unwrap();
-        assert_eq!(checks[0]["verdict"], "error", "{}", checks[0]);
-        assert!(checks[0]["reasons"].to_string().contains("counter_invalid"));
+        assert_eq!(checks[0]["verdict"], "inconclusive", "{}", checks[0]);
+        assert!(
+            checks[0]["reasons"]
+                .to_string()
+                .contains("counter_not_available")
+        );
         assert_eq!(checks[0]["completion"], "complete", "{}", checks[0]);
         assert_eq!(checks[1]["verdict"], "not_run", "{}", checks[1]);
         assert_eq!(checks[1]["reasons"][0], "deadline_exceeded");

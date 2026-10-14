@@ -24,7 +24,9 @@ pub enum VerifyRead {
     Transport(TransportErrorCode),
     /// The response did not satisfy `verify_match`.
     Mismatch,
-    /// Pointer missing, or the value is not an integer >= 0.
+    /// Body is JSON but `counter_pointer` points at nothing (absent; `null` is not absent).
+    CounterMissing,
+    /// Body is not JSON / empty, or the value is not an integer >= 0.
     CounterInvalid,
     Counter(u64),
 }
@@ -45,12 +47,16 @@ pub fn read_verifier(
     if !verify_match.matches(response.status, body) {
         return VerifyRead::Mismatch;
     }
-    match body
-        .and_then(|b| b.pointer(pointer))
-        .and_then(|v| v.as_u64())
-    {
-        Some(n) => VerifyRead::Counter(n),
-        None => VerifyRead::CounterInvalid,
+    let Some(body) = body else {
+        return VerifyRead::CounterInvalid;
+    };
+    // `pointer` gives None for absent but Some(Null) for an explicit null.
+    match body.pointer(pointer) {
+        None => VerifyRead::CounterMissing,
+        Some(v) => match v.as_u64() {
+            Some(n) => VerifyRead::Counter(n),
+            None => VerifyRead::CounterInvalid,
+        },
     }
 }
 
@@ -96,14 +102,31 @@ pub struct Evaluation {
     pub delta: Option<u64>,
 }
 
-/// Reasons for a verifier that gave no counter. `None` means it did give one.
+/// Verifier AFTER the actions that gave no counter (always ERROR). `None` means it gave one.
 fn verifier_problem(read: VerifyRead) -> Option<Vec<ReasonCode>> {
     match read {
         VerifyRead::Transport(_) => {
             Some(vec![ReasonCode::VerifierFailed, ReasonCode::TransportError])
         }
         VerifyRead::Mismatch => Some(vec![ReasonCode::VerifierFailed]),
-        VerifyRead::CounterInvalid => Some(vec![ReasonCode::CounterInvalid]),
+        VerifyRead::CounterMissing | VerifyRead::CounterInvalid => {
+            Some(vec![ReasonCode::CounterInvalid])
+        }
+        VerifyRead::Counter(_) => None,
+    }
+}
+
+/// Verifier BEFORE the actions (PLAN §6 V1-V5). `None` means a usable counter.
+/// Mismatch and a missing counter mean the oracle is not ready yet: INCONCLUSIVE.
+fn before_problem(read: VerifyRead) -> Option<(Verdict, Vec<ReasonCode>)> {
+    match read {
+        VerifyRead::Mismatch => Some((Verdict::Inconclusive, vec![ReasonCode::BaselineUnreadable])),
+        VerifyRead::CounterMissing => {
+            Some((Verdict::Inconclusive, vec![ReasonCode::CounterNotAvailable]))
+        }
+        VerifyRead::Transport(_) | VerifyRead::CounterInvalid => {
+            verifier_problem(read).map(|r| (Verdict::Error, r))
+        }
         VerifyRead::Counter(_) => None,
     }
 }
@@ -153,8 +176,8 @@ pub fn evaluate(
     };
 
     // 2. Before is not a usable counter: no action was sent.
-    if let Some(reasons) = verifier_problem(before) {
-        return make(Verdict::Error, reasons, Completion::Complete, delta);
+    if let Some((verdict, reasons)) = before_problem(before) {
+        return make(verdict, reasons, Completion::Complete, delta);
     }
     if counter_before != Some(0) {
         return make(
@@ -522,7 +545,11 @@ mod tests {
             Mismatch
         );
         assert_eq!(read(None), CounterInvalid);
-        assert_eq!(read(Some(json!({"other": 1}))), CounterInvalid);
+        assert_eq!(read(Some(json!({"other": 1}))), CounterMissing);
+        // explicit null is present, so not CounterMissing
+        assert_eq!(read(Some(json!({"execution_count": null}))), CounterInvalid);
+        // a whole-body JSON null: pointer "/x" is absent
+        assert_eq!(read(Some(json!(null))), CounterMissing);
         let cases: [(Value, VerifyRead); 9] = [
             (json!("1"), CounterInvalid),
             (json!(1.5), CounterInvalid),
@@ -805,9 +832,171 @@ mod tests {
     }
 
     #[test]
-    fn r19_before_mismatch_is_error() {
+    fn r19_before_mismatch_is_inconclusive_baseline_unreadable() {
         let e = evaluate(Some(VerifyRead::Mismatch), None, &[], None, None, T);
-        check(e, Error, &[R::VerifierFailed], Complete, None);
+        check(e, Inconclusive, &[R::BaselineUnreadable], Complete, None);
+    }
+
+    #[test]
+    fn q2_v1_before_transport_error_is_error_verifier_failed_transport_error() {
+        for code in [
+            TransportErrorCode::Timeout,
+            TransportErrorCode::ConnectFailed,
+        ] {
+            let e = evaluate(Some(VerifyRead::Transport(code)), None, &[], None, None, T);
+            check(
+                e,
+                Error,
+                &[R::VerifierFailed, R::TransportError],
+                Complete,
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn q2_v2_mismatch_is_inconclusive_baseline_unreadable() {
+        // read_verifier level: 401/404/500 do not satisfy verify_match.
+        for status in [401, 404, 500] {
+            let r = read_verifier(
+                &ok(status, Some(json!({"execution_count": 0}))),
+                &verify_200(),
+                "/execution_count",
+            );
+            assert_eq!(r, VerifyRead::Mismatch, "status {status}");
+        }
+        let e = evaluate(Some(VerifyRead::Mismatch), None, &[], None, None, T);
+        assert_eq!(e.counter_before, None);
+        check(e, Inconclusive, &[R::BaselineUnreadable], Complete, None);
+    }
+
+    #[test]
+    fn q2_v3_non_json_or_empty_body_is_error_counter_invalid() {
+        // status matches, body is absent (non-JSON or empty)
+        assert_eq!(read(None), VerifyRead::CounterInvalid);
+        let e = evaluate(Some(VerifyRead::CounterInvalid), None, &[], None, None, T);
+        check(e, Error, &[R::CounterInvalid], Complete, None);
+    }
+
+    #[test]
+    fn q2_v3b_mismatch_wins_over_non_json_body() {
+        // verify_match has json_exists and the body is not JSON: V2 before V3.
+        let m = MatcherSpec {
+            status_in: vec![200],
+            json_equals: None,
+            json_exists: Some(vec!["/execution_count".to_string()]),
+        };
+        let r = read_verifier(&ok(200, None), &m, "/execution_count");
+        assert_eq!(r, VerifyRead::Mismatch);
+        let e = evaluate(Some(r), None, &[], None, None, T);
+        check(e, Inconclusive, &[R::BaselineUnreadable], Complete, None);
+    }
+
+    #[test]
+    fn q2_v4_missing_counter_is_inconclusive_counter_not_available() {
+        let r = read(Some(json!({"id": "a"})));
+        assert_eq!(r, VerifyRead::CounterMissing);
+        let e = evaluate(Some(r), None, &[], None, None, T);
+        check(e, Inconclusive, &[R::CounterNotAvailable], Complete, None);
+    }
+
+    #[test]
+    fn q2_v5_present_but_not_integer_is_error_counter_invalid() {
+        for v in [json!("0"), json!(1.5), json!(true), json!(null), json!(-1)] {
+            let shown = v.to_string();
+            let r = read(Some(json!({ "execution_count": v })));
+            assert_eq!(r, VerifyRead::CounterInvalid, "value {shown}");
+            let e = evaluate(Some(r), None, &[], None, None, T);
+            check(e, Error, &[R::CounterInvalid], Complete, None);
+        }
+    }
+
+    #[test]
+    fn q2_null_counter_is_not_counter_not_available() {
+        let r = read(Some(json!({"execution_count": null})));
+        assert_ne!(r, VerifyRead::CounterMissing);
+        assert_eq!(r, VerifyRead::CounterInvalid);
+    }
+
+    #[test]
+    fn q2_after_unreadable_stays_error() {
+        let cases = [
+            (VerifyRead::Mismatch, vec![R::VerifierFailed]),
+            (VerifyRead::CounterMissing, vec![R::CounterInvalid]),
+            (VerifyRead::CounterInvalid, vec![R::CounterInvalid]),
+            (
+                VerifyRead::Transport(TransportErrorCode::Timeout),
+                vec![R::VerifierFailed, R::TransportError],
+            ),
+        ];
+        for (after, reasons) in cases {
+            let e = run(Some(after), &five(GOOD), 0);
+            check(e, Error, &reasons, Complete, None);
+        }
+        // extras are still appended
+        let e = run(Some(VerifyRead::CounterMissing), &five(AMBIGUOUS), 150);
+        check(
+            e,
+            Error,
+            &[
+                R::CounterInvalid,
+                R::ActionOutcomeAmbiguous,
+                R::DispatchSkewExceeded,
+            ],
+            Complete,
+            None,
+        );
+    }
+
+    #[test]
+    fn q2_never_pass_exhaustive() {
+        let reads = [
+            None,
+            Some(VerifyRead::Transport(TransportErrorCode::Timeout)),
+            Some(VerifyRead::Mismatch),
+            Some(VerifyRead::CounterMissing),
+            Some(VerifyRead::CounterInvalid),
+            Some(VerifyRead::Counter(0)),
+            Some(VerifyRead::Counter(1)),
+            Some(VerifyRead::Counter(2)),
+        ];
+        let stops = [None, Some(Stop::Cancelled), Some(Stop::DeadlineExceeded)];
+        let action_sets: Vec<Vec<ActionOutcome>> = vec![
+            vec![],
+            vec![GOOD; 4],
+            vec![GOOD; 5],
+            vec![GOOD; 6],
+            five(AMBIGUOUS),
+            five(TIMEOUT),
+        ];
+        let skews = [None, Some(0), Some(100), Some(101)];
+        let mut passes = 0;
+        for before in reads {
+            for after in reads {
+                for stop in stops {
+                    for actions in &action_sets {
+                        for skew in skews {
+                            let e = evaluate(before, after, actions, skew, stop, T);
+                            let expect_pass = before == Some(VerifyRead::Counter(0))
+                                && after == Some(VerifyRead::Counter(1))
+                                && actions.iter().all(|a| a.allowed)
+                                && actions.len() as u32 == T.concurrency
+                                && skew.is_some_and(|s| s <= T.max_dispatch_skew_ms)
+                                // a stop after the after-read finished keeps the verdict (r29);
+                                // before that, `after` is None and PASS is already excluded.
+                                && (stop.is_none() || after.is_some());
+                            assert_eq!(
+                                e.verdict == Pass,
+                                expect_pass,
+                                "{before:?} {after:?} {stop:?} {actions:?} {skew:?}"
+                            );
+                            passes += expect_pass as u32;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(passes > 0);
     }
 
     #[test]
@@ -1172,6 +1361,12 @@ mod tests {
             (count(1), Inconclusive, vec![R::InitialCounterNotZero]),
             (
                 Step::Reply(200, Some(json!({"other": 1}))),
+                Inconclusive,
+                vec![R::CounterNotAvailable],
+            ),
+            (Step::Reply(200, None), Error, vec![R::CounterInvalid]),
+            (
+                Step::Reply(200, Some(json!({"execution_count": null}))),
                 Error,
                 vec![R::CounterInvalid],
             ),
@@ -1185,7 +1380,11 @@ mod tests {
                 Error,
                 vec![R::VerifierFailed, R::TransportError],
             ),
-            (Step::Reply(401, None), Error, vec![R::VerifierFailed]),
+            (
+                Step::Reply(401, None),
+                Inconclusive,
+                vec![R::BaselineUnreadable],
+            ),
         ];
         for (before, verdict, reasons) in cases {
             let s = Script::new(before, vec![], count(1));

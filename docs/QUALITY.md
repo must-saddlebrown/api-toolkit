@@ -74,10 +74,10 @@ Exit 0. Angka ini sama dengan jumlah kedua kelompok di atas (224 + 83 caught, 20
 
 ## Cakupan AC
 
-`docs/ac-trace.md`: 114 baris AC (P0–P4).
+`docs/ac-trace.md`: 123 baris AC (P0–P4 ditambah 9 baris Q2 yang memakai id P2-AC26–34). Hasil mutasi Q2 (`verify.sh mutants --file src/checks/race.rs --file src/report.rs`, 2026-10-14): 110 mutan, 101 tertangkap, 9 unviable, 0 lolos.
 
-- Bukti test: 106 baris.
-- Bukti `manual:`: 8 baris (P0-AC18, P0-AC20, P1-AC18, P2-AC25, P3-AC26, P4-AC6a, P4-AC6b, P4-AC10). Ini AC tentang dokumen dan gate; bukti `manual:` hanya diperiksa keberadaan berkasnya, bukan isinya. Isi `docs/evidence/quality-gate.md` ditulis sekarang, bukan rekaman saat fase ditutup.
+- Bukti test: 114 baris.
+- Bukti `manual:`: 9 baris (P0-AC18, P0-AC20, P1-AC18, P2-AC25, P2-AC34, P3-AC26, P4-AC6a, P4-AC6b, P4-AC10). Ini AC tentang dokumen dan gate; bukti `manual:` hanya diperiksa keberadaan berkasnya, bukan isinya. Isi `docs/evidence/quality-gate.md` ditulis sekarang, bukan rekaman saat fase ditutup.
 - P4-AC1.1 … P4-AC5.4 ditulis `P4-AC1a` … `P4-AC5d` karena `ac-trace.sh` hanya mengenali id berbentuk `AC<n>[a-z]`.
 - P0-AC16 ("`check` pada P0 tidak pernah exit 0") sudah digantikan perilaku P2–P4; buktinya hanya menunjukkan `check` tidak exit 0 pada input tidak valid. Perlu ditandai digantikan.
 - Beberapa baris hanya sebagian tertutup test (mis. TLS di P0-AC11, bind loopback di P0-AC17, "mencakup connect" di P3-AC12); keterangannya ada di kolom Keterangan.

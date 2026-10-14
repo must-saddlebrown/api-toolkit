@@ -316,9 +316,39 @@ async fn slow_load_with_p95_100_is_fail_latency_exceeded() {
     fx.shutdown().await;
 }
 
-// AC2.2, AC3.3: ERROR in race does not hide load PASS or the brute_force FAIL.
+// AC2.2, AC3.3, P2-AC33: ERROR (V5, pointer `/id` is a string) in race does not hide load PASS or the brute_force FAIL.
 #[tokio::test(flavor = "multi_thread")]
 async fn race_error_does_not_hide_load_pass_or_brute_force_fail_exit_2() {
+    let fx = Fixture::start(0).await.unwrap();
+    let o = run_suite(&config(HEALTHY, &fx.base_url(), |v| {
+        v["race"]["counter_pointer"] = json!("/id");
+        set_login(v, UNPROTECTED);
+    }))
+    .await;
+    assert_eq!(o.code, 2, "{} {}", o.stdout, o.stderr);
+    assert_full_shape(&o);
+    assert_lines(&o, ["ERROR", "PASS", "FAIL"]);
+    assert_entry(&o, 0, "error", json!(["counter_invalid"]), "complete");
+    assert_entry(&o, 1, "pass", json!(["thresholds_met"]), "complete");
+    assert_entry(
+        &o,
+        2,
+        "fail",
+        json!(["protection_policy_not_met"]),
+        "complete",
+    );
+    assert!(
+        o.lines().iter().any(|l| l.starts_with("brute_force FAIL")),
+        "stdout: {}",
+        o.stdout
+    );
+    assert_eq!(o.report["completion"], "complete");
+    fx.shutdown().await;
+}
+
+// P2-AC33 (Q2): INCONCLUSIVE (V4, pointer absent) in race does not hide load PASS or the brute_force FAIL.
+#[tokio::test(flavor = "multi_thread")]
+async fn race_inconclusive_does_not_hide_load_pass_or_brute_force_fail_exit_2() {
     let fx = Fixture::start(0).await.unwrap();
     let o = run_suite(&config(HEALTHY, &fx.base_url(), |v| {
         v["race"]["counter_pointer"] = json!("/missing");
@@ -327,8 +357,14 @@ async fn race_error_does_not_hide_load_pass_or_brute_force_fail_exit_2() {
     .await;
     assert_eq!(o.code, 2, "{} {}", o.stdout, o.stderr);
     assert_full_shape(&o);
-    assert_lines(&o, ["ERROR", "PASS", "FAIL"]);
-    assert_entry(&o, 0, "error", json!(["counter_invalid"]), "complete");
+    assert_lines(&o, ["INCONCLUSIVE", "PASS", "FAIL"]);
+    assert_entry(
+        &o,
+        0,
+        "inconclusive",
+        json!(["counter_not_available"]),
+        "complete",
+    );
     assert_entry(&o, 1, "pass", json!(["thresholds_met"]), "complete");
     assert_entry(
         &o,

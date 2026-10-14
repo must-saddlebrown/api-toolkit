@@ -16,7 +16,8 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
     routing::{get, post},
 };
 use serde::Deserialize;
@@ -124,6 +125,16 @@ fn router(state: Shared) -> Router {
         .route("/broken/actions/{id}/apply-racy", post(apply_racy))
         .route("/idempotent/actions/{id}/apply", post(apply_idempotent))
         .route("/actions/{id}", get(read_action))
+        .route("/broken/actions/{id}/verify-denied", get(verify_denied))
+        .route("/broken/actions/{id}/verify-not-json", get(verify_not_json))
+        .route(
+            "/broken/actions/{id}/verify-no-counter",
+            get(verify_no_counter),
+        )
+        .route(
+            "/broken/actions/{id}/verify-bad-counter",
+            get(verify_bad_counter),
+        )
         .route("/critical", get(critical))
         .route("/broken/critical/slow", get(critical_slow))
         .route("/broken/critical/flaky", get(critical_flaky))
@@ -307,6 +318,32 @@ async fn read_action(
     let mut s = lock(&state);
     let count = *s.actions.entry(id.clone()).or_insert(0);
     reply(StatusCode::OK, json!({"id": id, "execution_count": count}))
+}
+
+// Broken verifiers: stateless, no Authorization needed, each counts only `verify_requests`.
+
+/// Always 401, regardless of headers.
+async fn verify_denied(State(state): State<Shared>) -> Reply {
+    lock(&state).verify_requests += 1;
+    unauthorized()
+}
+
+/// 200 with a non-JSON body.
+async fn verify_not_json(State(state): State<Shared>) -> impl IntoResponse {
+    lock(&state).verify_requests += 1;
+    ([(header::CONTENT_TYPE, "text/plain")], "ok")
+}
+
+/// 200 JSON without `execution_count`.
+async fn verify_no_counter(State(state): State<Shared>, Path(id): Path<String>) -> Reply {
+    lock(&state).verify_requests += 1;
+    reply(StatusCode::OK, json!({"id": id}))
+}
+
+/// 200 JSON where `execution_count` is a string, not an integer.
+async fn verify_bad_counter(State(state): State<Shared>, Path(id): Path<String>) -> Reply {
+    lock(&state).verify_requests += 1;
+    reply(StatusCode::OK, json!({"id": id, "execution_count": "0"}))
 }
 
 /// Counts a load request (also a 401 one) and returns its 1-based number.

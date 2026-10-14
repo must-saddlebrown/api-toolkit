@@ -67,6 +67,8 @@ Sebelum mengulang: reset akun login dan siapkan resource write-once baru atau re
 
 PASS/FAIL adalah hasil normal untuk konfigurasi dan target yang siap diuji. Status tambahan mencegah timeout, state yang salah, dan informasi yang hilang menjadi PASS palsu. PASS tidak menyatakan seluruh API aman, bebas race, atau memenuhi SLA di semua beban.
 
+Batas ERROR dan INCONCLUSIVE (keputusan 2026-10-14): INCONCLUSIVE berarti prasyarat oracle belum terpenuhi sebelum ada efek apa pun di target (verifier belum bisa dibaca, counter belum ada, state awal salah, akun sudah terkunci) atau bukti tidak cukup. ERROR berarti pengamatan itu sendiri rusak (transport gagal, timeout, body bukan JSON, tipe nilai melanggar kontrak) atau runner/konfigurasi salah. Tabel per check: race di §6; brute_force di §5; load di §7.
+
 Matcher awal sengaja kecil: `status_in` dan opsional `json_equals`/`json_exists`. Field matcher digabung AND, bukan expression language. JSON selector memakai JSON Pointer. Matcher wajib memiliki status criterion; overlapping success/rejection/protection rules ditolak atau, jika overlap baru diketahui runtime, menghasilkan ERROR.
 
 ## 5. Check 1 — Login brute-force protection
@@ -123,7 +125,23 @@ PASS: baseline 0, semua N action attempts selesai dengan response statuses yang 
 
 FAIL: valid evidence menunjukkan delta >1 (`duplicate_side_effect`); atau fully completed workload dengan delta 0 (`action_not_executed`). Delta 0 adalah kegagalan tujuan aksi, bukan klaim race vulnerability.
 
-INCONCLUSIVE: initial counter bukan 0, jumlah dispatch tidak lengkap, skew terlalu besar, state belum dapat dinilai konsisten, atau action outcome ambigu. ERROR: verifier/network/JSON/type error. Delta >1 tetap definite FAIL meskipun skew/action error tambahan terjadi, karena duplikasi telah terlihat; evidence tambahan tetap dicatat.
+INCONCLUSIVE: initial counter bukan 0, verifier before tidak dapat dibaca (`baseline_unreadable`), counter tidak tersedia (`counter_not_available`), jumlah dispatch tidak lengkap, skew terlalu besar, state belum dapat dinilai konsisten, atau action outcome ambigu. ERROR: transport error, body bukan JSON, atau counter ada tetapi bukan integer >= 0; serta semua kegagalan verifier after.
+
+Batas verifier before (urutan evaluasi: transport, `verify_match`, body, pointer, tipe nilai; nol action terkirim pada V1–V5):
+
+| # | Verifier before | Verdict | Reasons |
+| --- | --- | --- | --- |
+| V1 | Transport error (timeout, connect, body terlalu besar, dst.) | ERROR | `verifier_failed`, `transport_error` |
+| V2 | Respons ada tetapi tidak cocok `verify_match` (401, 404, 5xx, atau `json_*` gagal) | INCONCLUSIVE | `baseline_unreadable` |
+| V3 | Cocok `verify_match`, body bukan JSON atau kosong | ERROR | `counter_invalid` |
+| V4 | Cocok, body JSON, `counter_pointer` tidak ada (absent) | INCONCLUSIVE | `counter_not_available` |
+| V5 | Cocok, pointer ada, nilai bukan integer >= 0 (string, float, bool, `null`, negatif) | ERROR | `counter_invalid` |
+| V6 | Counter integer bukan 0 | INCONCLUSIVE | `initial_counter_not_zero` |
+| V7 | Counter 0 | lanjut ke action | |
+
+V2 mendahului V3 (401 berbadan HTML = INCONCLUSIVE). Pointer yang menunjuk `null` adalah V5, bukan V4. Verifier after tidak berubah (action sudah terkirim): transport atau mismatch → ERROR `verifier_failed`; pointer absent atau bukan integer → ERROR `counter_invalid`. Tidak ada jalur baru menuju PASS.
+
+Delta >1 tetap definite FAIL meskipun skew/action error tambahan terjadi, karena duplikasi telah terlihat; evidence tambahan tetap dicatat.
 
 Verifier harus membaca state resource/action yang sama, bebas perubahan pihak lain selama tes. Counter umum yang mencampur aktivitas pengguna lain tidak memenuhi oracle. Async/eventual consistency membutuhkan settling delay yang cukup dan batasan yang dicatat; tidak ada polling/DB connector pada v0.1.
 

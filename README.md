@@ -55,7 +55,9 @@ Reason code (snake_case, bagian dari kontrak report; `report_version` 1):
 | Check | Reason |
 | --- | --- |
 | brute_force | `protection_observed` (pass); `protection_policy_not_met`, `invalid_credentials_accepted` (fail); `account_already_locked` (inconclusive); `baseline_failed`, `probe_unclassifiable`, `overlapping_rules` (error/inconclusive) |
-| race | `single_side_effect` (pass); `duplicate_side_effect`, `action_not_executed` (fail); `initial_counter_not_zero`, `action_outcome_ambiguous`, `dispatch_incomplete`, `dispatch_skew_exceeded` (inconclusive); `verifier_failed`, `counter_invalid` (error) |
+| race | `single_side_effect` (pass); `duplicate_side_effect`, `action_not_executed` (fail); `initial_counter_not_zero`, `action_outcome_ambiguous`, `dispatch_incomplete`, `dispatch_skew_exceeded`, `baseline_unreadable`, `counter_not_available` (inconclusive); `verifier_failed`, `counter_invalid` (error) |
+
+Urutan pemeriksaan verifier sebelum action: respons yang tidak cocok `verify_match` (V2, INCONCLUSIVE `baseline_unreadable`) dievaluasi sebelum body (V3, ERROR `counter_invalid`), jadi respons 401 berbadan HTML atau matcher `json_*` dengan body non-JSON menjadi INCONCLUSIVE, bukan ERROR. Verifier setelah action tidak berubah (ERROR).
 | load | `thresholds_met` (pass); `error_rate_exceeded`, `latency_exceeded` (fail); `target_not_ready`, `workload_incomplete` (inconclusive/not_run); `preflight_failed`, `runner_error` (error) |
 | umum | `transport_error`, `not_started`, `cancelled`, `deadline_exceeded`, `excluded_by_only` |
 

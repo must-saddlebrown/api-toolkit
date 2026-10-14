@@ -252,6 +252,75 @@ paths:
               example: {id: act-1, execution_count: 1}
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /broken/actions/{id}/verify-denied:
+    get:
+      tags: [action]
+      operationId: verifyDenied
+      summary: Verifier rusak - selalu ditolak (sengaja rusak)
+      description: |
+        Selalu `401 {"error":"unauthorized"}`, apa pun headernya. Tanpa state, tanpa `Authorization`. Menaikkan `verify_requests` (bukan `action_requests`).
+      parameters:
+        - $ref: '#/components/parameters/ActionId'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /broken/actions/{id}/verify-not-json:
+    get:
+      tags: [action]
+      operationId: verifyNotJson
+      summary: Verifier rusak - body bukan JSON (sengaja rusak)
+      description: |
+        `200` `Content-Type: text/plain`, body `ok`. Tanpa state, tanpa `Authorization`. Menaikkan `verify_requests` (bukan `action_requests`).
+      parameters:
+        - $ref: '#/components/parameters/ActionId'
+      responses:
+        '200':
+          description: Body teks biasa.
+          content:
+            text/plain:
+              schema: {type: string, const: ok}
+              example: ok
+  /broken/actions/{id}/verify-no-counter:
+    get:
+      tags: [action]
+      operationId: verifyNoCounter
+      summary: Verifier rusak - tanpa execution_count (sengaja rusak)
+      description: |
+        `200 {"id": "<id>"}` tanpa `execution_count`. Tanpa state, tanpa `Authorization`. Menaikkan `verify_requests` (bukan `action_requests`).
+      parameters:
+        - $ref: '#/components/parameters/ActionId'
+      responses:
+        '200':
+          description: JSON tanpa counter.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id: {type: string}
+              example: {id: act-1}
+  /broken/actions/{id}/verify-bad-counter:
+    get:
+      tags: [action]
+      operationId: verifyBadCounter
+      summary: Verifier rusak - counter berupa string (sengaja rusak)
+      description: |
+        `200 {"id": "<id>", "execution_count": "0"}` (string, bukan integer). Tanpa state, tanpa `Authorization`. Menaikkan `verify_requests` (bukan `action_requests`).
+      parameters:
+        - $ref: '#/components/parameters/ActionId'
+      responses:
+        '200':
+          description: JSON dengan counter bertipe string.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, execution_count]
+                properties:
+                  id: {type: string}
+                  execution_count: {type: string, const: "0"}
+              example: {id: act-1, execution_count: "0"}
   /critical:
     get:
       tags: [load]
@@ -387,7 +456,7 @@ paths:
           ditolak sebelum handler dan **tidak** dihitung.
         - `load_requests` menghitung setiap `GET` ke empat rute load (`/critical`, `/broken/critical/*`), termasuk `401`.
         - `action_requests` menghitung setiap `POST` ke tiga rute apply (sehat, racy, idempotent), termasuk `401`.
-        - `verify_requests` menghitung setiap `GET /actions/{id}`, termasuk `401`. Race sehat N=5: `action_requests` 5, `verify_requests` 2.
+        - `verify_requests` menghitung setiap `GET /actions/{id}` dan empat rute `GET /broken/actions/{id}/verify-*`, termasuk `401`. Race sehat N=5: `action_requests` 5, `verify_requests` 2.
         - Request ke stats sendiri tidak dihitung.
       responses:
         '200':

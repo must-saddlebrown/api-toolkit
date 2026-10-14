@@ -201,15 +201,19 @@ async fn r4_used_resource_is_inconclusive_without_actions() {
     fx.shutdown().await;
 }
 
-/// R5, AC5: counter pointer missing from the verifier body -> ERROR, zero actions.
+/// R5, AC5 (changed by Q2, V4): counter pointer missing from the verifier body -> INCONCLUSIVE.
 #[tokio::test(flavor = "multi_thread")]
-async fn r5_missing_counter_is_error() {
+async fn r5_missing_counter_is_inconclusive() {
     let fx = Fixture::start(0).await.unwrap();
     let url = fx.base_url();
     let mut cfg = race_config(&url, APPLY);
     cfg["race"]["counter_pointer"] = json!("/nope");
     let r = run_cfg(&cfg, "r5").await;
-    assert_verdict(&r, Verdict::Error, &[ReasonCode::CounterInvalid]);
+    assert_verdict(
+        &r,
+        Verdict::Inconclusive,
+        &[ReasonCode::CounterNotAvailable],
+    );
     assert!(evidence(&r).actions.is_empty());
     assert_eq!(stats(&url).await, (0, 1));
     fx.shutdown().await;
@@ -291,9 +295,10 @@ async fn r18_closed_port_is_connect_failed() {
     assert!(e.actions.is_empty() && e.actions_dispatched == 0);
 }
 
-/// R19, AC15: verifier without Authorization gets 401 -> mismatch -> ERROR, no action sent.
+/// R19, AC15 (changed by Q2, V2): verifier without Authorization gets 401 -> mismatch before
+/// -> INCONCLUSIVE baseline_unreadable, no action sent.
 #[tokio::test(flavor = "multi_thread")]
-async fn r19_unauthorized_verifier_is_error() {
+async fn r19_unauthorized_verifier_is_inconclusive_baseline_unreadable() {
     let fx = Fixture::start(0).await.unwrap();
     let url = fx.base_url();
     let mut cfg = race_config(&url, APPLY);
@@ -302,13 +307,160 @@ async fn r19_unauthorized_verifier_is_error() {
         .unwrap()
         .remove("headers");
     let r = run_cfg(&cfg, "r19").await;
-    assert_verdict(&r, Verdict::Error, &[ReasonCode::VerifierFailed]);
+    assert_verdict(&r, Verdict::Inconclusive, &[ReasonCode::BaselineUnreadable]);
     let e = evidence(&r);
     assert_eq!(e.verify_before.as_ref().unwrap().status, Some(401));
     assert!(e.actions.is_empty());
     assert_eq!(stats(&url).await, (0, 1));
     fx.shutdown().await;
 }
+
+// ---- Q2: verifier-before boundary table (PLAN section 6, V1-V7) ----
+
+const VERIFY_DENIED: &str = "/broken/actions/{id}/verify-denied";
+const VERIFY_NOT_JSON: &str = "/broken/actions/{id}/verify-not-json";
+const VERIFY_NO_COUNTER: &str = "/broken/actions/{id}/verify-no-counter";
+const VERIFY_BAD_COUNTER: &str = "/broken/actions/{id}/verify-bad-counter";
+
+/// Config whose verifier reads `verify_path` (action still goes to the healthy apply route).
+fn verify_cfg(url: &str, verify_path: &str) -> Value {
+    let mut cfg = race_config(url, APPLY);
+    cfg["race"]["verify_request"]["path"] = json!(verify_path);
+    cfg
+}
+
+/// P2-AC31: every Q2 row sends zero actions, one verifier call, and is never PASS.
+async fn assert_q2_row(r: &CheckResult, url: &str, v: Verdict, reasons: &[ReasonCode]) {
+    assert_verdict(r, v, reasons);
+    assert_ne!(r.verdict, Verdict::Pass);
+    let e = evidence(r);
+    assert_eq!(e.actions_dispatched, 0);
+    assert!(e.actions.is_empty());
+    assert_eq!(
+        stats(url).await,
+        (0, 1),
+        "action_requests 0, verify_requests 1"
+    );
+}
+
+/// Q2 V1, P2-AC28: transport error before. Same scenario as r18 plus the P2-AC31 invariants.
+#[tokio::test(flavor = "multi_thread")]
+async fn q2_v1_closed_port_is_error_verifier_failed_transport_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let r = run_cfg(
+        &race_config(&format!("http://127.0.0.1:{port}"), APPLY),
+        "q2v1",
+    )
+    .await;
+    assert_verdict(
+        &r,
+        Verdict::Error,
+        &[ReasonCode::VerifierFailed, ReasonCode::TransportError],
+    );
+    assert_ne!(r.verdict, Verdict::Pass);
+    let e = evidence(&r);
+    assert_eq!(e.actions_dispatched, 0);
+    assert!(e.actions.is_empty());
+    // No fixture is listening, so action_requests == 0 / verify_requests == 1 is not observable;
+    // dispatched == 0 plus the connect error on verify_before is the evidence.
+    assert_eq!(
+        e.verify_before.as_ref().unwrap().error,
+        Some(TransportErrorCode::ConnectFailed)
+    );
+}
+
+/// Q2 V2, P2-AC26: 401 from the verifier -> INCONCLUSIVE baseline_unreadable.
+#[tokio::test(flavor = "multi_thread")]
+async fn q2_v2_denied_verifier_is_inconclusive_baseline_unreadable() {
+    let fx = Fixture::start(0).await.unwrap();
+    let url = fx.base_url();
+    let r = run_cfg(&verify_cfg(&url, VERIFY_DENIED), "q2v2").await;
+    assert_q2_row(
+        &r,
+        &url,
+        Verdict::Inconclusive,
+        &[ReasonCode::BaselineUnreadable],
+    )
+    .await;
+    assert_eq!(
+        evidence(&r).verify_before.as_ref().unwrap().status,
+        Some(401)
+    );
+    fx.shutdown().await;
+}
+
+/// Q2 V3, P2-AC28: matches status, body `ok` is not JSON -> ERROR counter_invalid.
+#[tokio::test(flavor = "multi_thread")]
+async fn q2_v3_not_json_body_is_error_counter_invalid() {
+    let fx = Fixture::start(0).await.unwrap();
+    let url = fx.base_url();
+    let r = run_cfg(&verify_cfg(&url, VERIFY_NOT_JSON), "q2v3").await;
+    assert_q2_row(&r, &url, Verdict::Error, &[ReasonCode::CounterInvalid]).await;
+    fx.shutdown().await;
+}
+
+/// Q2 V3b, P2-AC29: `json_exists` matcher + non-JSON body -> mismatch wins over body check.
+#[tokio::test(flavor = "multi_thread")]
+async fn q2_v3b_non_json_body_with_json_exists_matcher_is_inconclusive_baseline_unreadable() {
+    let fx = Fixture::start(0).await.unwrap();
+    let url = fx.base_url();
+    let mut cfg = verify_cfg(&url, VERIFY_NOT_JSON);
+    cfg["race"]["verify_match"] = json!({"status_in": [200], "json_exists": ["/id"]});
+    let r = run_cfg(&cfg, "q2v3b").await;
+    assert_q2_row(
+        &r,
+        &url,
+        Verdict::Inconclusive,
+        &[ReasonCode::BaselineUnreadable],
+    )
+    .await;
+    fx.shutdown().await;
+}
+
+/// Q2 V4, P2-AC27: pointer absent -> INCONCLUSIVE counter_not_available, on the broken route
+/// and on the healthy route with a wrong pointer.
+#[tokio::test(flavor = "multi_thread")]
+async fn q2_v4_missing_counter_is_inconclusive_counter_not_available() {
+    let want = [ReasonCode::CounterNotAvailable];
+    let fx = Fixture::start(0).await.unwrap();
+    let url = fx.base_url();
+    let r = run_cfg(&verify_cfg(&url, VERIFY_NO_COUNTER), "q2v4a").await;
+    assert_q2_row(&r, &url, Verdict::Inconclusive, &want).await;
+    fx.shutdown().await;
+
+    let fx = Fixture::start(0).await.unwrap();
+    let url = fx.base_url();
+    let mut cfg = race_config(&url, APPLY);
+    cfg["race"]["counter_pointer"] = json!("/nope");
+    let r = run_cfg(&cfg, "q2v4b").await;
+    assert_q2_row(&r, &url, Verdict::Inconclusive, &want).await;
+    fx.shutdown().await;
+}
+
+/// Q2 V5, P2-AC28: counter present but string -> ERROR counter_invalid (broken route, and
+/// healthy route with pointer `/id`).
+#[tokio::test(flavor = "multi_thread")]
+async fn q2_v5_string_counter_is_error_counter_invalid() {
+    let want = [ReasonCode::CounterInvalid];
+    let fx = Fixture::start(0).await.unwrap();
+    let url = fx.base_url();
+    let r = run_cfg(&verify_cfg(&url, VERIFY_BAD_COUNTER), "q2v5a").await;
+    assert_q2_row(&r, &url, Verdict::Error, &want).await;
+    fx.shutdown().await;
+
+    let fx = Fixture::start(0).await.unwrap();
+    let url = fx.base_url();
+    let mut cfg = race_config(&url, APPLY);
+    cfg["race"]["counter_pointer"] = json!("/id");
+    let r = run_cfg(&cfg, "q2v5b").await;
+    assert_q2_row(&r, &url, Verdict::Error, &want).await;
+    fx.shutdown().await;
+}
+
+// Q2 V6 (counter != 0 -> INCONCLUSIVE initial_counter_not_zero): covered by
+// `r4_used_resource_is_inconclusive_without_actions` above; no duplicate.
 
 /// Write `r` through `write_report_atomic`, read it back, and search every output for `forbidden`.
 fn assert_no_leak(r: &CheckResult, forbidden: &[&str]) {

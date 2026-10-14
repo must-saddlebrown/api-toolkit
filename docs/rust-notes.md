@@ -172,3 +172,15 @@ Mengambil elemen berdasarkan posisi dalam O(1) dengan menukarnya dengan elemen t
 
 ### Cek atomic lewat inode: `MetadataExt` dan `#[cfg(unix)]`
 `std::os::unix::fs::MetadataExt::ino` memberi nomor inode. Rename menghasilkan inode baru, sedangkan tulis di tempat mempertahankannya, jadi test membuktikan penulisan atomic. `#[cfg(unix)]` membuat kode itu hanya dikompilasi di Unix. Lihat `tests/fixture_proof.rs` (`inode`, test `out_with_old_content_is_replaced_by_valid_json_and_no_temp_file_remains`).
+
+### Menambah varian enum dan mengikuti compiler
+Menambah `ReasonCode::BaselineUnreadable` dan `CounterNotAvailable` langsung membuat setiap `match` exhaustive yang belum mencakupnya gagal compile. Daftar error compiler itu adalah daftar tempat yang harus diubah (`ALL`, dua `as_str`). Lihat `src/report.rs`.
+
+### `Option<&Value>`: `None` vs `Some(&Value::Null)`
+`Value::pointer` mengembalikan `None` bila path tidak ada dan `Some(&Null)` bila ada tetapi `null`. Perbedaan ini yang memisahkan "counter tidak tersedia" (INCONCLUSIVE) dari "counter bertipe salah" (ERROR). Pengecekan disusun bertingkat (transport, `verify_match`, body, pointer, tipe), cabang awal yang cocok menang. Lihat `read_verifier` di `src/checks/race.rs`.
+
+### Satu enum bacaan, dua fungsi pemetaan
+`VerifyRead` mendeskripsikan apa yang terbaca; verdict ditentukan fungsi terpisah untuk before dan after, sehingga input yang sama bisa berbeda verdict sesuai konteks (action sudah terkirim atau belum). Lihat `src/checks/race.rs`.
+
+### Test pengaman dengan loop atas semua kombinasi
+`q2_never_pass_exhaustive` mengiterasi semua kombinasi bacaan before/after, stop, dan hasil action, lalu menegaskan PASS hanya pada satu kombinasi sah. Ini pseudo-property test tanpa crate tambahan. Lihat `src/checks/race.rs`.

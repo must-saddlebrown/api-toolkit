@@ -9,10 +9,13 @@ Rencana aktif: `docs/PLAN.md` (Small Core Proof, 9 Oktober 2026). Keputusan sete
 | P2 | Write-once race check | selesai (10 Oktober 2026) | Phase gate PASS; 25 dari 25 AC terpenuhi; 303 test hijau |
 | P3 | Parallel load check | selesai (10 Oktober 2026) | Phase gate PASS; 26 dari 26 AC terpenuhi; 393 test hijau |
 | P4 | Single-command proof + satu API nyata | menunggu review pengguna (10 Oktober 2026) | Phase gate PASS; fixture proof selesai (suite lengkap `check` tanpa `--only`, 416 test hijau); P4-AC7 validasi target nyata belum dilakukan |
+| Q2 | Batas ERROR/INCONCLUSIVE race (verifier before) | selesai (S1–S5, gate reviewer PASS, mutasi 0 lolos) | AC P2-AC26–34 (9 baris) di `docs/ac-trace.md`; mutasi race.rs + report.rs: 110 mutan, 101 tertangkap, 9 unviable, 0 lolos |
 
 ## Fase aktif
 
 P4: **menunggu review pengguna** (checkpoint). P0–P3 selesai. Fixture proof end to end selesai; validasi target nyata belum dilakukan dan menunggu config dari pengguna (lihat "Validasi API nyata").
+
+Q2: perubahan klasifikasi verifier before di race (DECISIONS 2026-10-14, `docs/findings.md` F-001) sudah dikerjakan; gate reviewer PASS dan mutasi 0 lolos. Tidak mengubah status checkpoint P4.
 
 ## Ringkasan AC P0
 
@@ -212,6 +215,7 @@ Verifier tetap `GET /actions/{id}`. Detail rute dan titik sinkronisasi ada di `d
 - `check` tanpa `--only` menjalankan suite lengkap (P4); `--only brute_force|race|load` tetap ada sebagai run parsial (DECISIONS P4).
 - Fixture: healthy dan dua varian login rusak (P1). Varian racy dan idempotent ada sejak P2; varian load slow, flaky, dan hang sejak P3. Prelocked dibuat dari state healthy.
 - Placeholder `${ENV:X}` di key `query` atau key objek body JSON masih dikirim sebagai literal (diam-diam); test `placeholder_in_query_or_json_key_is_accepted_known_limitation` mencatatnya dan harus dibalik saat diperbaiki.
+- Race (Q2): respons verifier before yang tidak cocok `verify_match` dievaluasi sebelum body, jadi body non-JSON dengan matcher `json_*` menjadi INCONCLUSIVE `baseline_unreadable`, bukan ERROR `counter_invalid`. Verifier after tetap ERROR (action sudah terkirim). Test fixture untuk after yang rusak hanya di unit `run_with`, tidak ada rute fixture.
 - Jalur error key `json_equals` mencantumkan key tersebut (teks config milik pengguna, bukan nilai env).
 - Check `fail` yang membawa reason pass menghasilkan exit 1 (bisa diperketat). Cancel sebelum check pertama kini exit 130 (check tetap tercatat `not_run [cancelled]`).
 - `tls_failed` belum pernah dihasilkan (kegagalan TLS tercatat sebagai `connect_failed`); connect timeout dilaporkan sebagai `timeout`; drop/RST/respons sampah sebagai `other`.
@@ -265,3 +269,7 @@ Jangan mengarang target atau kredensial. Brute-force bisa mengunci akun, race me
 ## Riwayat review pengguna
 
 Belum ada. Menunggu review checkpoint P4 (fixture proof) dan satu run target nyata.
+
+## Riwayat pekerjaan
+
+- 2026-10-14: Q2 (race, batas ERROR/INCONCLUSIVE) S1–S5 dikerjakan: ReasonCode +2 (32), `read_verifier` dan pemetaan before/after dipisah, 4 rute fixture verifier rusak, test integrasi, 9 baris AC baru. Gate reviewer PASS; mutasi 0 lolos.
