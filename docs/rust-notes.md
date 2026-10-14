@@ -184,3 +184,23 @@ Menambah `ReasonCode::BaselineUnreadable` dan `CounterNotAvailable` langsung mem
 
 ### Test pengaman dengan loop atas semua kombinasi
 `q2_never_pass_exhaustive` mengiterasi semua kombinasi bacaan before/after, stop, dan hasil action, lalu menegaskan PASS hanya pada satu kombinasi sah. Ini pseudo-property test tanpa crate tambahan. Lihat `src/checks/race.rs`.
+
+## Catatan Q3 (mode burst brute_force)
+
+### `#[serde(default)]` dan `#[derive(Default)]` pada enum
+`BruteForceMode` memakai `#[derive(Default)]` di level enum dan `#[default]` di satu varian (`Sequential`) supaya `Default::default()` dan `#[serde(default)]` pada field `mode` jatuh ke varian yang sama tanpa menulisnya manual dua kali. `rename_all = "snake_case"` membuat serde menerima persis `"sequential"`/`"burst"` dan menolak nilai lain (`"parallel"`, `"BURST"`) sebelum `validate` pernah berjalan. Lihat `src/config.rs`.
+
+### `Option<T>` sebagai field bergantung mode
+Tipe tidak bisa memaksa "field ini wajib hanya di mode X" (butuh enum bertag dengan struct berbeda per varian untuk itu); jalan pintas yang dipilih di sini adalah `Option<T>` pada tiga field sequential plus validasi lintas-field manual (`require_some`/`require_none` di `src/config/validate.rs`) yang menamai field, tidak pernah nilainya. Trade-off: compiler tidak menjamin kombinasi field valid, jadi correctness pindah penuh ke test tabel (`rejected_cases`/`accepted_boundary_cases`) yang harus menutup tiap cabang wajib/larangan.
+
+### `Fn` vs `FnMut` pada closure pengirim
+Jalur sequential (`run_with`) memanggil pengirim satu per satu secara berurutan, jadi `FnMut` cukup (boleh punya state mutable di antara panggilan). Jalur burst (`run_burst_with`) membagi closure yang sama ke N future yang berjalan bersamaan lewat `join_all`, dan `join_all` meminjam closure lewat referensi bersama; itu butuh `Fn` (`&F`, bukan `&mut F`), karena Rust tidak mengizinkan banyak peminjam `&mut` sekaligus. Lihat `src/checks/brute_force.rs` (`run_with` vs `run_burst_with`).
+
+### `join_all` untuk dispatch serentak dan `select!` dengan `biased` untuk stop
+N future probe dibuat sekaligus dan dijalankan bersama `futures_util::future::join_all` dalam satu task (pola yang sama dengan action race), masing-masing mencatat offset dispatch (`Instant::elapsed()`) saat pertama kali di-poll, bukan saat selesai. `tokio::select! { biased; .. }` memberi prioritas pada sinyal stop dibanding request yang sedang berjalan, sehingga request in-flight saat stop tidak pernah tercatat di `attempts` meski tetap terhitung di `attempts_dispatched`. Lihat `run_burst_with` di `src/checks/brute_force.rs`.
+
+### Varian baru pada enum `#[serde(untagged)]`
+`Evidence::BruteForceBurst(BurstEvidence)` ditambah sebagai varian baru di enum `Evidence` yang sudah `#[serde(untagged)]`; karena untagged memilih varian lewat bentuk struct yang cocok (bukan tag eksplisit), menambah varian tidak mengubah satu byte pun JSON yang sudah ada untuk `BruteForceEvidence` lama (golden test `evidence_json_matches_golden` tetap lolos tanpa ubah). Golden terpisah (`burst_evidence_json_matches_golden`) mengunci bentuk JSON varian baru. Lihat `src/report.rs`.
+
+### Fungsi murni berparameter array untuk tabel verdict tanpa jam
+`evaluate_burst(baseline, probes: &[Classified], spread_ms: Option<u64>, stop, thresholds)` menerima hasil klasifikasi dan offset sebagai array/opsi biasa, bukan lewat jaringan atau clock nyata, sehingga seluruh tabel verdict (`b1`-`b17`) bisa diuji sinkron tanpa `tokio::test` atau waktu virtual. Lihat `src/checks/brute_force.rs`.

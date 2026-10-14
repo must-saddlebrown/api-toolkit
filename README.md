@@ -54,7 +54,7 @@ Reason code (snake_case, bagian dari kontrak report; `report_version` 1):
 
 | Check | Reason |
 | --- | --- |
-| brute_force | `protection_observed` (pass); `protection_policy_not_met`, `invalid_credentials_accepted` (fail); `account_already_locked` (inconclusive); `baseline_failed`, `probe_unclassifiable`, `overlapping_rules` (error/inconclusive) |
+| brute_force | `protection_observed` (pass); `protection_policy_not_met`, `invalid_credentials_accepted` (fail); `account_already_locked` (inconclusive); `baseline_failed`, `probe_unclassifiable`, `overlapping_rules` (error/inconclusive); mode burst (Q3) memakai ulang reason yang sama, plus `dispatch_incomplete`/`dispatch_skew_exceeded` (inconclusive) |
 | race | `single_side_effect` (pass); `duplicate_side_effect`, `action_not_executed` (fail); `initial_counter_not_zero`, `action_outcome_ambiguous`, `dispatch_incomplete`, `dispatch_skew_exceeded`, `baseline_unreadable`, `counter_not_available` (inconclusive); `verifier_failed`, `counter_invalid` (error) |
 
 Urutan pemeriksaan verifier sebelum action: respons yang tidak cocok `verify_match` (V2, INCONCLUSIVE `baseline_unreadable`) dievaluasi sebelum body (V3, ERROR `counter_invalid`), jadi respons 401 berbadan HTML atau matcher `json_*` dengan body non-JSON menjadi INCONCLUSIVE, bukan ERROR. Verifier setelah action tidak berubah (ERROR).
@@ -111,7 +111,7 @@ Seluruh objek `limits` opsional, dan tiap field punya default: `connect_timeout_
 
 ### Threshold brute_force
 
-Alur: satu login **baseline** dengan kredensial benar (harus sukses), lalu `attempts` login **probe** dengan password salah (selalu semuanya dikirim) dengan jeda `interval_ms`.
+Alur (mode `sequential`, default): satu login **baseline** dengan kredensial benar (harus sukses), lalu `attempts` login **probe** dengan password salah (selalu semuanya dikirim) dengan jeda `interval_ms`.
 
 | Field | Arti |
 | --- | --- |
@@ -119,12 +119,20 @@ Alur: satu login **baseline** dengan kredensial benar (harus sukses), lalu `atte
 | `success_match` | Respons login berhasil. Pada probe berarti kredensial salah diterima: FAIL |
 | `rejection_match` | Penolakan biasa (belum ada proteksi) |
 | `protection_match` | Respons proteksi (rate limit atau lockout). `status_in` ketiga matcher tidak boleh beririsan |
-| `attempts` | Jumlah probe, 2..=100 |
-| `interval_ms` | Jeda antar probe |
-| `protect_by_attempt` | Proteksi harus muncul paling lambat di attempt ini (2..=`attempts`) |
-| `protected_tail_count` | Minimal sekian attempt terakhir harus protected, berurutan (1..=`attempts`-1) |
+| `mode` | `"sequential"` (default) atau `"burst"` (Q3). Menentukan field mana di bawah yang wajib/dilarang |
+| `attempts` | Jumlah probe. Sequential: 2..=100. Burst: 2..=32 |
+| `interval_ms` | Jeda antar probe. **Wajib di sequential, ditolak di burst** |
+| `protect_by_attempt` | Proteksi harus muncul paling lambat di attempt ini (2..=`attempts`). **Wajib di sequential, ditolak di burst** |
+| `protected_tail_count` | Minimal sekian attempt terakhir harus protected, berurutan (1..=`attempts`-1). **Wajib di sequential, ditolak di burst** |
+| `window_ms` | Burst saja, wajib > 0: anggaran maksimum selisih waktu dispatch client antara probe pertama dan terakhir. **Ditolak di sequential** |
 
 Baseline sudah protected atau probe 1 sudah protected = INCONCLUSIVE `account_already_locked` (reset/ganti akun). Baseline ditolak = INCONCLUSIVE `baseline_failed`.
+
+**Peringatan (Q3): FAIL sequential belum berarti tidak ada proteksi.** `interval_ms` hanya mengukur jeda antara selesainya probe dan mulainya probe berikutnya, bukan laju login gagal yang sesungguhnya diterima target (latency geser laju efektif turun jauh di bawah `1000/interval_ms`). Limiter berbasis waktu (mis. N login gagal per jendela waktu) bisa saja ada tetapi tidak pernah terjangkau oleh pacing sequential, sehingga check melaporkan FAIL `protection_policy_not_met` padahal yang benar adalah "kebijakan terkonfigurasi tidak terlihat pada pacing ini", bukan "API tanpa proteksi".
+
+Mode `"burst"` mengirim seluruh `attempts` probe **serentak** (tanpa jeda, satu baseline tetap dikirim lebih dulu) supaya limiter berbasis waktu punya kesempatan terpicu; verdict dihitung dari jumlah probe protected (P) dari N probe, bukan urutannya: `1 <= P <= N-1` PASS `protection_observed`, `P == 0` FAIL `protection_policy_not_met`, `P == N` INCONCLUSIVE `account_already_locked`. Spread dispatch di atas `window_ms` (juga bila ada protection) selalu INCONCLUSIVE `dispatch_skew_exceeded`. Contoh: [examples/brute-force-burst.json](examples/brute-force-burst.json). **FAIL burst juga belum berarti tidak ada proteksi**: limiter dengan ambang di atas `attempts` (maksimum 32) tidak akan terpicu.
+
+**Peringatan lockout: burst bisa mengunci akun uji lebih cepat.** Karena semua probe dikirim sekaligus, hingga 32 login gagal bisa diterima target dalam hitungan milidetik, jauh lebih cepat daripada mode sequential. Pakai akun uji khusus dan siapkan reset sebelum menjalankan ulang.
 
 ### Threshold race
 

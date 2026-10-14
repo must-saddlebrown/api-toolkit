@@ -97,7 +97,27 @@ FAIL: invalid credential diterima; atau seluruh probe dapat diklasifikasi tetapi
 
 INCONCLUSIVE: baseline menunjukkan akun sudah locked/rate-limited atau tidak memenuhi state awal. ERROR: baseline gagal karena respons tak sesuai/transport, probe tidak dapat diklasifikasi, atau oracle malformed. Bukti acceptance invalid credential tetap dilaporkan sebagai FAIL walaupun ada error lain; report menyimpan error tambahan.
 
-Contoh policy: 8 probe, interval 100 ms, proteksi harus mulai pada attempt 6 atau sebelumnya, last 2 protected. Ini parameter demonstrasi, bukan standar keamanan universal.
+### Mode burst (keputusan 2026-10-14, fase Q3)
+
+`brute_force.mode` = `"sequential"` (default; algoritma di atas tidak berubah) atau `"burst"`. Catatan: FAIL `protection_policy_not_met` pada sequential berarti "kebijakan terkonfigurasi tidak terlihat pada pacing ini", bukan "API tanpa proteksi" — limiter berbasis waktu bisa tidak terjangkau karena `interval_ms` hanya menjeda setelah probe selesai, sehingga jarak mulai antar probe jauh lebih besar dari `interval_ms` saat latency tinggi (lihat `docs/findings.md` F-002).
+
+Burst: baseline dikirim sekali (aturan baseline sama dengan sequential), lalu N = `attempts` probe dikirim serentak (satu batch `join_all`, tanpa retry, tanpa jeda tetap). `window_ms` (field baru, wajib dan > 0 di mode burst, ditolak di sequential) adalah anggaran maksimum selisih waktu dispatch client antara probe pertama dan terakhir, dibulatkan ke atas ke ms; ini anggaran dispatch client, bukan durasi limiter server. `attempts` di mode burst dibatasi 2..=32. Field sequential `interval_ms`, `protect_by_attempt`, `protected_tail_count` DITOLAK di mode burst (tidak ada nilai yang diabaikan diam-diam); config lama tanpa `mode` tetap sequential dan perilakunya tidak berubah.
+
+Verdict burst (P = jumlah probe yang terklasifikasi protected, N = jumlah probe; dihitung bukan diurutkan), presedensi dari atas ke bawah:
+1. Stop (cancel/deadline) sebelum baseline selesai → NOT_RUN.
+2. Baseline tidak sukses → hasil sama seperti sequential (INCONCLUSIVE/ERROR sesuai state baseline), nol probe dikirim.
+3. Ada probe dengan invalid credential diterima sebagai success → FAIL `invalid_credentials_accepted`.
+4. Jumlah probe yang tercatat != N (dibatalkan/deadline di tengah burst) → NOT_RUN.
+5. Ada probe dengan outcome tak terklasifikasi (transport error, status tak dikenal) → ERROR `probe_unclassifiable`.
+6. Spread dispatch kosong (tidak terukur) → INCONCLUSIVE `dispatch_incomplete`.
+7. Spread dispatch > `window_ms` → INCONCLUSIVE `dispatch_skew_exceeded` (berlaku juga bila ada probe protected; window yang gagal tercapai tidak membuktikan apa pun).
+8. `P == N` (semua probe protected) → INCONCLUSIVE `account_already_locked`.
+9. `P == 0` (tidak ada probe protected) → FAIL `protection_policy_not_met`.
+10. `1 <= P <= N-1` → PASS `protection_observed`.
+
+FAIL burst dengan `P == 0` bukan bukti "API tanpa proteksi" — limiter dengan ambang di atas N tidak akan terpicu pada burst ini. Burst dapat mengunci akun uji sekaligus (sampai `attempts` login gagal dalam satu batch); pengguna harus menyiapkan akun yang boleh terkunci, sama seperti mode sequential.
+
+Contoh policy sequential: 8 probe, interval 100 ms, proteksi harus mulai pada attempt 6 atau sebelumnya, last 2 protected. Ini parameter demonstrasi, bukan standar keamanan universal.
 
 Normal 401 saja tidak membuktikan anti-brute-force. HTTP 429 atau error body tertentu hanya dianggap proteksi sesuai matcher eksplisit. Metode ini memeriksa respons proteksi pada pola terbatas, belum membuktikan lockout enforcement dengan seluruh mekanisme atau kekuatan password. Basis pengujian login gagal/lockout: [OWASP Weak Lock Out Mechanism](https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/04-Authentication/03-Weak_Lock_Out_Mechanism/).
 
@@ -180,7 +200,7 @@ Konfigurasi memakai satu target origin. Semua path action/verifier/load/login re
 
 Default: connect timeout 3 detik, total request timeout 5 detik, body limit 1 MiB, suite deadline 120 detik. Semua dapat dikonfigurasi. Hitung jumlah request dan fixed waits check yang dijalankan (ketiganya, atau check terpilih pada `--only`) sebelum run; konfigurasi yang fixed waits-nya saja melampaui deadline ditolak. Estimasi worst-case berbasis timeout dilaporkan sebagai budget, bukan jaminan API merespons tepat waktu.
 
-v0.1 menerima probe count ≤100, race concurrency ≤32, load count ≤1000, load concurrency ≤32, dan seluruh angka harus positif dalam batas tersebut. Ini batas implementasi pertama, bukan kapasitas API. Extension limits dilakukan sengaja melalui revisi versi.
+v0.1 menerima probe count ≤100, race concurrency ≤32, load count ≤1000, load concurrency ≤32, brute_force burst `attempts` 2..=32, dan seluruh angka harus positif dalam batas tersebut. Ini batas implementasi pertama, bukan kapasitas API. Extension limits dilakukan sengaja melalui revisi versi.
 
 Task pool bounded; race barrier berbeda dari load worker pool. Cancel menghentikan dispatch baru dan active waits, lalu menyimpan hasil parsial. Server side effect yang sudah terjadi tetap mungkin selesai. Tidak ada generic cleanup flow: fixture reset/resource preparation dilakukan di luar runner.
 
@@ -248,6 +268,21 @@ Contoh untuk fixture lokal; semua paths/field names adalah contoh, bukan tebakan
 }
 ```
 
+Mode default `brute_force.mode` adalah `sequential` (contoh di atas tidak memuat field itu secara eksplisit tetapi berlaku sebagai sequential). Mode burst (keputusan 2026-10-14, fase Q3) memakai bentuk berikut, tanpa `interval_ms`/`protect_by_attempt`/`protected_tail_count`:
+
+```json
+  "brute_force": {
+    "mode": "burst",
+    "baseline_request": { "...": "sama seperti contoh sequential" },
+    "probe_request": { "...": "sama seperti contoh sequential" },
+    "success_match": { "status_in": [200], "json_exists": ["/access_token"] },
+    "rejection_match": { "status_in": [401] },
+    "protection_match": { "status_in": [429] },
+    "attempts": 8,
+    "window_ms": 1000
+  }
+```
+
 `TEST_AUTHORIZATION` berisi header lengkap, misalnya `Bearer <token>`. Substitusi hanya whole-string `${ENV:NAME}`, tanpa string interpolation/expression. Env values menjadi strings; angka/boolean tetap literal JSON. Missing env, unknown fields, invalid selector/threshold/version memblokir run sebelum dispatch.
 
 Suite lengkap (`check` tanpa `--only`, `validate` tanpa `--only`) mewajibkan ketiga bagian check. Mode `--only <check>` hanya mewajibkan `config_version`, `base_url`, `limits` (opsional), dan bagian check terpilih. Bagian lain yang ada tetap harus berbentuk benar (field tak dikenal dan tipe salah ditolak) tetapi tidak divalidasi semantik, tidak di-resolve (env-nya tidak wajib), dan tidak dihitung dalam budget. Tidak ada skip flag yang membuat command tampil sukses: run parsial tidak pernah exit 0 dan report-nya ditandai `scope: partial`. Template fixture dapat diganti method/path/body/matchers untuk target pengguna; resource state dan policy target tetap eksplisit.
@@ -255,6 +290,8 @@ Suite lengkap (`check` tanpa `--only`, `validate` tanpa `--only`) mewajibkan ket
 ## 10. Reporting dan exit code
 
 Console menampilkan satu baris per check: verdict, evidence utama, threshold, dan reason. Contoh healthy fixture: race PASS delta=1; load PASS error_rate=0/p95=120ms; brute_force PASS first_protected=6 tail=3/2 attempts=8/8 (tail = jumlah protected berurutan yang teramati / `protected_tail_count`; attempts = probe yang selesai dan tercatat / direncanakan). Angka latency merupakan ilustrasi.
+
+Contoh console mode burst (keputusan 2026-10-14, fase Q3): `brute_force PASS mode=burst protected=3/8 rejected=5 window=1/100ms attempts=8/8 reasons=protection_observed` (window = spread dispatch client teramati / anggaran `window_ms`).
 
 JSON report memuat report_version=1, run ID, tool version, config hash nonsecret, timestamps UTC, configured workloads/thresholds, counts/timings/status distribution, before/after counter, per-check verdict/reasons, dan completion status. Request body/header values, raw response bodies, token/password, serta resolved secret path/query tidak dipersist.
 

@@ -261,3 +261,16 @@ Detail: `.claude/work/Q2-Q3-plan.md`, `docs/findings.md` F-001. Terdampak: PLAN 
 - Kontrak report: `ReasonCode` +2 (`baseline_unreadable`, `counter_not_available`), total 32. Aditif; `report_version` tetap 1. Tidak ada file schema atau dokumen kontrak terpisah; yang ikut berubah: `ReasonCode::ALL` dan dua `as_str` exhaustive di `src/report.rs`, daftar string di `tests/report_contract.rs`, tabel reason di README. Input yang sama kini ERROR → INCONCLUSIVE (exit code tetap 2). Bila ada konsumen eksternal yang mem-parse `counter_invalid`/`verifier_failed`, naikkan `report_version` ke 2 (menunggu konfirmasi pengguna).
 - Tidak ada jalur baru menuju PASS (kedua kelas baru berhenti sebelum action; dikunci test exhaustif).
 - Fixture: 4 rute verifier rusak `GET /broken/actions/{id}/verify-{denied,not-json,no-counter,bad-counter}`.
+
+## 2026-10-14 — Q3: mode burst brute_force
+
+Detail: `.claude/work/Q2-Q3-plan.md`, `docs/findings.md` F-002. Terdampak: PLAN §5, §8, §9, §10.
+
+- `brute_force.mode` `sequential` (default, tak berubah) | `burst`; kode sequential tidak disentuh; burst = fungsi baru terpisah.
+- `window_ms`: field baru, anggaran spread dispatch client; wajib > 0 di burst, ditolak di sequential. N = `attempts`, 2..=32. Baseline tetap dipakai sekali sebelum burst.
+- `interval_ms`, `protect_by_attempt`, `protected_tail_count` jadi `Option`: wajib di sequential, ditolak di burst (tidak ada nilai yang diabaikan diam-diam).
+- "Sebagian": `1 <= P <= N-1` PASS; `P == 0` FAIL `protection_policy_not_met`; `P == N` INCONCLUSIVE `account_already_locked`. Tanpa `min_protected` yang bisa dikonfigurasi (YAGNI); bisa ditambah kemudian bila dibutuhkan.
+- Window tidak tercapai: spread > `window_ms` → INCONCLUSIVE `dispatch_skew_exceeded` (juga bila ada protection); spread kosong → INCONCLUSIVE `dispatch_incomplete`.
+- Kontrak report: tanpa `ReasonCode` baru; varian evidence baru untuk hasil burst; JSON sequential tidak berubah; `report_version` tetap 1 (tidak ada konsumen eksternal yang diketahui untuk kasus Q2 atau Q3; default tidak menaikkan versi, menunggu konfirmasi pengguna bila ternyata ada).
+- Keterbatasan: spread diukur client dalam satu task, bukan kedatangan server; FAIL burst bukan bukti tanpa proteksi; burst dapat mengunci akun sekaligus.
+- Fixture: endpoint login berlimiter waktu dan endpoint login yang selalu protected, untuk membuktikan setiap baris verdict.

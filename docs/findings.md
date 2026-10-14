@@ -20,7 +20,7 @@ Status: diputuskan, dikerjakan di fase Q2.
 
 ## F-002 Brute force: limiter berbasis waktu tidak terjangkau mode sequential
 
-Status: diputuskan, dikerjakan di fase Q3 (setelah Q2).
+Status: ditangani (Q3). `brute_force.mode = "burst"` mengirim N probe serentak (`join_all`) dalam anggaran `window_ms`, membedakan "limiter tidak terpicu pada pacing sequential" dari "tidak ada proteksi"; fixture `/windowed/login` membuktikan reproduksinya (sequential dengan `interval_ms` >= 150 selalu FAIL, burst dengan 8 probe dalam < 300 ms menjadi PASS pada limiter yang sama).
 
 | Report | attempts | interval_ms | elapsed probe | jarak mulai antar probe | Respons probe | Verdict |
 | --- | --- | --- | --- | --- | --- | --- |

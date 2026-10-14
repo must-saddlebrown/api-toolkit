@@ -134,6 +134,30 @@ fn evidence(r: &CheckResult) -> &BruteForceEvidence {
     }
 }
 
+fn burst_evidence(r: &CheckResult) -> &BurstEvidence {
+    match r.evidence.as_ref() {
+        Some(Evidence::BruteForceBurst(e)) => e,
+        _ => panic!("expected burst evidence: {}", console_line(r)),
+    }
+}
+
+/// `base_config` turned into a burst config: drops the three sequential-only fields, adds
+/// `mode`/`window_ms`, and points both requests at `path`.
+fn burst_config(url: &str, path: &str, attempts: u32, window_ms: u64) -> Value {
+    let mut cfg = base_config(url);
+    let bf = cfg["brute_force"].as_object_mut().unwrap();
+    bf.remove("interval_ms");
+    bf.remove("protect_by_attempt");
+    bf.remove("protected_tail_count");
+    bf.insert("mode".into(), json!("burst"));
+    bf.insert("window_ms".into(), json!(window_ms));
+    bf.insert("attempts".into(), json!(attempts));
+    for k in ["baseline_request", "probe_request"] {
+        cfg["brute_force"][k]["path"] = json!(path);
+    }
+    cfg
+}
+
 /// M1, AC1, AC7, AC9, AC12: healthy -> PASS, exactly 1 + 8 requests on the wire.
 #[tokio::test(flavor = "multi_thread")]
 async fn m1_healthy_passes_with_nine_requests() {
@@ -538,4 +562,265 @@ async fn secrets_do_not_leak_failing_run() {
     assert_eq!(r.verdict, Verdict::Fail);
     assert_no_leak(&r, &[SENTINEL_PW, ACCESS_TOKEN, LOGIN_VALID_PASSWORD]);
     fx.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Q3-S5: mode burst against the real fixture. `/windowed/login` and
+// `/broken/login/always-protected` are burst-only routes (docs/fixture.md).
+// ---------------------------------------------------------------------------
+
+/// P1-AC19/AC20: mode absent (sequential default); `interval_ms >= 150` never collects
+/// 5 failures inside the fixture's 300 ms window (docs/fixture.md), so this reproduces
+/// Finding B deterministically: FAIL, never flaky.
+#[tokio::test(flavor = "multi_thread")]
+async fn b20_windowed_sequential_is_fail_protection_policy_not_met() {
+    let fx = Fixture::start(0).await.unwrap();
+    let (c, url) = (client(), fx.base_url());
+    let mut cfg = base_config(&url);
+    for k in ["baseline_request", "probe_request"] {
+        cfg["brute_force"][k]["path"] = json!("/windowed/login");
+    }
+    cfg["brute_force"]["interval_ms"] = json!(150);
+    let r = run_cfg(&cfg).await;
+    assert_verdict(&r, Verdict::Fail, &[ReasonCode::ProtectionPolicyNotMet]);
+    assert_eq!(login_requests(&c, &url).await, 9);
+    fx.shutdown().await;
+}
+
+/// P1-AC23, AC31: the same route and `interval_ms`'s probe count via burst (all dispatched
+/// together) must cross the 300 ms/5 limiter -> PASS, some protected, some rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn b21_windowed_burst_is_pass_protection_observed() {
+    let fx = Fixture::start(0).await.unwrap();
+    let (c, url) = (client(), fx.base_url());
+    let cfg = burst_config(&url, "/windowed/login", 8, 1000);
+    let r = run_cfg(&cfg).await;
+    assert_verdict(&r, Verdict::Pass, &[ReasonCode::ProtectionObserved]);
+    let e = burst_evidence(&r);
+    assert!(
+        e.protected_count >= 1,
+        "protected_count={}",
+        e.protected_count
+    );
+    assert!(e.rejected_count >= 1, "rejected_count={}", e.rejected_count);
+    assert_eq!(login_requests(&c, &url).await, 9);
+    fx.shutdown().await;
+}
+
+/// P1-AC24: `P == 0` -> FAIL, same as sequential.
+#[tokio::test(flavor = "multi_thread")]
+async fn b22_unprotected_burst_is_fail() {
+    let fx = Fixture::start(0).await.unwrap();
+    let url = fx.base_url();
+    let cfg = burst_config(&url, "/broken/login/unprotected", 8, 1000);
+    let r = run_cfg(&cfg).await;
+    assert_verdict(&r, Verdict::Fail, &[ReasonCode::ProtectionPolicyNotMet]);
+    fx.shutdown().await;
+}
+
+/// P1-AC24: a probe success beats everything else, also in burst.
+#[tokio::test(flavor = "multi_thread")]
+async fn b23_accepts_invalid_burst_is_fail_invalid_credentials_accepted() {
+    let fx = Fixture::start(0).await.unwrap();
+    let url = fx.base_url();
+    let cfg = burst_config(&url, "/broken/login/accepts-invalid", 8, 1000);
+    let r = run_cfg(&cfg).await;
+    assert_verdict(&r, Verdict::Fail, &[ReasonCode::InvalidCredentialsAccepted]);
+    fx.shutdown().await;
+}
+
+/// P1-AC25: `P == N` (always-protected route) -> INCONCLUSIVE, never PASS.
+#[tokio::test(flavor = "multi_thread")]
+async fn b24_always_protected_burst_is_inconclusive_account_already_locked() {
+    let fx = Fixture::start(0).await.unwrap();
+    let url = fx.base_url();
+    let cfg = burst_config(&url, "/broken/login/always-protected", 8, 1000);
+    let r = run_cfg(&cfg).await;
+    assert_verdict(
+        &r,
+        Verdict::Inconclusive,
+        &[ReasonCode::AccountAlreadyLocked],
+    );
+    let e = burst_evidence(&r);
+    assert_eq!(e.protected_count, e.attempts_planned);
+    fx.shutdown().await;
+}
+
+/// P1-AC25: baseline not success -> sequential outcome, zero probes. Second run on the
+/// healthy (count-based) `/login` without a reset: the account is already locked by the
+/// first run's burst, so the baseline itself is protected and no probe is sent at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn b25_prelocked_baseline_burst_is_inconclusive_with_zero_probes() {
+    let fx = Fixture::start(0).await.unwrap();
+    let (c, url) = (client(), fx.base_url());
+    let cfg = burst_config(&url, "/login", 8, 1000);
+    run_cfg(&cfg).await; // locks the account (shared count-based limiter on /login)
+    let after_first = login_requests(&c, &url).await;
+    let second = run_cfg(&cfg).await;
+    assert_verdict(
+        &second,
+        Verdict::Inconclusive,
+        &[ReasonCode::AccountAlreadyLocked],
+    );
+    assert!(burst_evidence(&second).attempts.is_empty());
+    assert_eq!(
+        login_requests(&c, &url).await,
+        after_first + 1,
+        "baseline only"
+    );
+    fx.shutdown().await;
+}
+
+/// P1-AC26: a `rejection_match` that does not match the real response makes every probe
+/// `unexpected` -> ERROR `probe_unclassifiable`, beating the window entirely.
+#[tokio::test(flavor = "multi_thread")]
+async fn b26_burst_bad_rejection_matcher_is_error_probe_unclassifiable() {
+    let fx = Fixture::start(0).await.unwrap();
+    let url = fx.base_url();
+    let mut cfg = burst_config(&url, "/broken/login/unprotected", 8, 1000);
+    cfg["brute_force"]["rejection_match"]["status_in"] = json!([400]);
+    let r = run_cfg(&cfg).await;
+    assert_verdict(&r, Verdict::Error, &[ReasonCode::ProbeUnclassifiable]);
+    fx.shutdown().await;
+}
+
+/// P1-AC26/AC28: nothing listens on the port -> ERROR on the baseline, same reasons as
+/// sequential (M7), zero probes sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn b27_closed_port_burst_is_error_baseline_failed_transport_error() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg = burst_config(
+        &format!("http://127.0.0.1:{port}"),
+        "/windowed/login",
+        8,
+        1000,
+    );
+    let r = run_cfg(&cfg).await;
+    assert_verdict(
+        &r,
+        Verdict::Error,
+        &[ReasonCode::BaselineFailed, ReasonCode::TransportError],
+    );
+    let e = burst_evidence(&r);
+    let b = e.baseline.as_ref().unwrap();
+    assert_eq!(b.outcome, Outcome::TransportError);
+    assert!(e.attempts.is_empty());
+}
+
+/// P1-AC28: exactly 1 baseline + N probes on the wire, no retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn b28_burst_sends_exactly_one_baseline_and_n_probes_no_retry() {
+    let fx = Fixture::start(0).await.unwrap();
+    let (c, url) = (client(), fx.base_url());
+    let cfg = burst_config(&url, "/windowed/login", 8, 1000);
+    let r = run_cfg(&cfg).await;
+    assert_eq!(login_requests(&c, &url).await, 9);
+    assert_eq!(burst_evidence(&r).attempts_dispatched, 9);
+    fx.shutdown().await;
+}
+
+/// P1-AC29: the burst evidence path leaks nothing either (same sentinel pattern as the
+/// sequential tests above).
+#[tokio::test(flavor = "multi_thread")]
+async fn b29_burst_sentinel_not_in_report_or_debug_or_console() {
+    let fx = Fixture::start(0).await.unwrap();
+    let mut cfg = burst_config(&fx.base_url(), "/windowed/login", 8, 1000);
+    for k in ["baseline_request", "probe_request"] {
+        cfg["brute_force"][k]["headers"] = json!({"X-Sentinel": "${ENV:SENTINEL}"});
+    }
+    let r = run_cfg(&cfg).await;
+    assert_eq!(r.verdict, Verdict::Pass);
+    assert_no_leak(
+        &r,
+        &[
+            SENTINEL,
+            ACCESS_TOKEN,
+            LOGIN_VALID_PASSWORD,
+            LOGIN_INVALID_PASSWORD,
+            TEST_AUTHORIZATION,
+        ],
+    );
+    fx.shutdown().await;
+}
+
+/// P1-AC22: `mode: "sequential"` explicit and mode omitted must behave and serialize
+/// identically (separate fixtures so neither run's lockout state leaks into the other).
+#[tokio::test(flavor = "multi_thread")]
+async fn b30_explicit_sequential_equals_omitted_mode() {
+    let fx1 = Fixture::start(0).await.unwrap();
+    let omitted = run_cfg(&base_config(&fx1.base_url())).await;
+    fx1.shutdown().await;
+
+    let fx2 = Fixture::start(0).await.unwrap();
+    let mut cfg = base_config(&fx2.base_url());
+    cfg["brute_force"]["mode"] = json!("sequential");
+    let explicit = run_cfg(&cfg).await;
+    fx2.shutdown().await;
+
+    assert_eq!(omitted.verdict, explicit.verdict);
+    assert_eq!(omitted.reasons, explicit.reasons);
+    assert_eq!(omitted.completion, explicit.completion);
+    // `offset_ms`/`elapsed_ms` are real wall-clock timing and legitimately differ between
+    // two separate runs; strip them before comparing, everything else (shape, outcomes,
+    // statuses, counters) must be byte-identical.
+    let strip_timing = |e: &Option<Evidence>| -> Value {
+        let mut v = serde_json::to_value(e).unwrap();
+        if let Some(attempts) = v.get_mut("attempts").and_then(Value::as_array_mut) {
+            for a in attempts {
+                a.as_object_mut().unwrap().remove("offset_ms");
+                a.as_object_mut().unwrap().remove("elapsed_ms");
+            }
+        }
+        if let Some(obj) = v.get_mut("baseline").and_then(Value::as_object_mut) {
+            obj.remove("offset_ms");
+            obj.remove("elapsed_ms");
+        }
+        v
+    };
+    assert_eq!(
+        strip_timing(&omitted.evidence),
+        strip_timing(&explicit.evidence),
+        "evidence must match except real timing fields"
+    );
+}
+
+/// P1-AC19/AC31 regression: the two pre-Q3 example configs are still sequential and their
+/// locked request/fixed-wait budgets are unchanged (values confirmed against the files, not
+/// assumed: see `examples/core-checks.json` and `examples/brute-force-only.json`).
+#[test]
+fn b31_core_example_configs_still_sequential_and_validate_same() {
+    // core-checks.json has all three sections (whole-suite budget, like plain `validate`);
+    // brute-force-only.json has only `brute_force` (needs `--only brute_force`, like its
+    // own doc example).
+    for (path, selection, want_requests, want_wait_ms) in [
+        (
+            concat!(env!("CARGO_MANIFEST_DIR"), "/examples/core-checks.json"),
+            Selection::All,
+            117u64,
+            950u64,
+        ),
+        (
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/examples/brute-force-only.json"
+            ),
+            Selection::Only(CheckName::BruteForce),
+            9u64,
+            700u64,
+        ),
+    ] {
+        let text = std::fs::read_to_string(path).unwrap();
+        let cfg = config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.brute_force.as_ref().unwrap().mode,
+            config::BruteForceMode::Sequential,
+            "{path}"
+        );
+        let budget = validate(&cfg, selection).unwrap();
+        assert_eq!(budget.requests, want_requests, "{path}");
+        assert_eq!(budget.fixed_wait_ms, want_wait_ms, "{path}");
+    }
 }

@@ -132,6 +132,17 @@ pub struct MatcherSpec {
     pub json_exists: Option<Vec<String>>,
 }
 
+/// `brute_force.mode` (Q3): `Sequential` keeps the original one-probe-at-a-time
+/// algorithm; `Burst` dispatches all probes at once (see `BruteForce`). Unknown
+/// strings are rejected by serde itself, before `validate` ever runs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BruteForceMode {
+    #[default]
+    Sequential,
+    Burst,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BruteForce {
@@ -141,9 +152,21 @@ pub struct BruteForce {
     pub rejection_match: MatcherSpec,
     pub protection_match: MatcherSpec,
     pub attempts: u32,
-    pub interval_ms: u64,
-    pub protect_by_attempt: u32,
-    pub protected_tail_count: u32,
+    #[serde(default)]
+    pub mode: BruteForceMode,
+    /// Sequential only; `validate` requires it there and rejects it in burst.
+    #[serde(default)]
+    pub interval_ms: Option<u64>,
+    /// Sequential only; `validate` requires it there and rejects it in burst.
+    #[serde(default)]
+    pub protect_by_attempt: Option<u32>,
+    /// Sequential only; `validate` requires it there and rejects it in burst.
+    #[serde(default)]
+    pub protected_tail_count: Option<u32>,
+    /// Burst only (Q3): max dispatch skew budget between the first and last probe.
+    /// `validate` requires it in burst and rejects it in sequential.
+    #[serde(default)]
+    pub window_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

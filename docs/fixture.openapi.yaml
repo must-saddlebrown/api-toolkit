@@ -10,14 +10,14 @@ info:
     Method yang salah pada rute yang ada (mis. `GET /login`) dijawab `405` tanpa body oleh axum; rute yang tidak ada `404 {"error":"not_found"}`. Keduanya tidak ditulis ulang per path di bawah.
 
     **Semua state ada di memori dan global untuk satu proses fixture** (bukan per pengguna, bukan per sesi):
-    hitungan login gagal, counter tiap action id, state gerbang racy, counter load, dan counter request (login, action, verify).
+    hitungan login gagal, daftar timestamp kegagalan `/windowed/login`, counter tiap action id, state gerbang racy, counter load, dan counter request (login, action, verify).
     Satu-satunya cara mengosongkannya selain restart adalah `POST /__admin/reset`.
 
     Tiga kelompok endpoint:
 
     | Kelompok | Endpoint | Dipakai check |
     | --- | --- | --- |
-    | Login | `/login` (sehat), `/broken/login/*` (sengaja rusak) | brute force |
+    | Login | `/login` (sehat), `/broken/login/*` (sengaja rusak), `/windowed/login` (limiter waktu, mode burst) | brute force |
     | Aksi write-once | `/actions/{id}/apply` (sehat), `/broken/actions/{id}/apply-racy` (sengaja rusak), `/idempotent/actions/{id}/apply` (sehat, idempotent), `/actions/{id}` (verifier) | race (P2) |
     | Beban | `/critical` (sehat), `/broken/critical/{slow,flaky,hang}` (sengaja rusak) | load (P3) |
     | Alat dev | `/__admin/reset`, `/__admin/stats` | dipakai test dan pengguna, tidak oleh check |
@@ -113,6 +113,64 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/InvalidCredentials'
+  /windowed/login:
+    post:
+      tags: [broken-login]
+      operationId: windowedLogin
+      summary: Login dengan limiter berbasis waktu sungguhan (Q3, mode burst)
+      description: |
+        Limiter jendela waktu nyata: konstanta `WINDOW` = 300 ms, `WINDOW_LIMIT` = 5.
+
+        - Setiap login salah mencatat timestamp. Pada tiap request, timestamp yang lebih tua dari
+          300 ms dibuang, lalu dihitung berapa yang tersisa (`failures_in_window`).
+        - Login salah: `failures_in_window >= 5` -> `429 too_many_attempts` (timestamp baru **tidak**
+          dicatat); selain itu `401 invalid_credentials` dan timestamp dicatat.
+        - Login benar: `failures_in_window < 5` -> `200` dengan token; selain itu `429` (tidak mereset
+          hitungan, sama seperti `/login`).
+        - Body rusak: `400 bad_request`, dihitung di `login_requests`, tidak menambah timestamp.
+
+        Desain disengaja untuk membedakan pacing sequential dari burst (lihat `docs/PLAN.md` §5/§8):
+
+        - Sequential dengan `interval_ms >= 150`: jarak antar dispatch >= 150 ms adalah batas bawah,
+          jauh di atas yang dibutuhkan untuk mengumpulkan 5 kegagalan dalam jendela 300 ms. Limiter
+          **tidak pernah** terpicu: delapan probe salah semuanya `401`. Check brute force (mode
+          sequential) harus `fail` / `protection_policy_not_met`, deterministik, bukan ketidakpastian
+          mesin lambat.
+        - Burst (delapan probe dikirim serentak, beberapa ms): probe ke-1 sampai ke-5 masih `401`
+          (membentuk jendela); probe ke-6 sampai ke-8 melihat 5 kegagalan tercatat dan `429`. Check
+          brute force (mode burst) harus `pass` / `protection_observed` (P=3, N=8).
+        - Mesin yang sangat lambat hanya bisa membuat spread dispatch burst melampaui `window_ms`
+          (check menghasilkan `inconclusive` / `dispatch_skew_exceeded`), tidak pernah `pass` palsu.
+      requestBody:
+        $ref: '#/components/requestBodies/Login'
+      responses:
+        '200':
+          $ref: '#/components/responses/Token'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/InvalidCredentials'
+        '429':
+          $ref: '#/components/responses/TooManyAttempts'
+  /broken/login/always-protected:
+    post:
+      tags: [broken-login]
+      operationId: loginAlwaysProtected
+      summary: Login rusak, selalu terproteksi (Q3, baris burst P == N)
+      description: |
+        Tanpa state dan tanpa hitungan: kredensial benar `200` dengan token; kredensial salah **selalu**
+        `429`, sejak probe pertama. Membuktikan baris verdict burst `P == N` ->
+        `inconclusive` / `account_already_locked` (tidak bisa dibedakan dari akun yang sudah terkunci
+        atau limiter yang sudah penuh sebelum check mulai; tidak pernah `pass`).
+      requestBody:
+        $ref: '#/components/requestBodies/Login'
+      responses:
+        '200':
+          $ref: '#/components/responses/Token'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyAttempts'
   /actions/{id}/apply:
     post:
       tags: [action]
@@ -428,7 +486,7 @@ paths:
       operationId: adminReset
       summary: Reset seluruh state
       description: |
-        Mengosongkan hitungan login gagal, semua counter action, state gerbang racy, `load_requests`, `login_requests`, `action_requests`, dan `verify_requests`.
+        Mengosongkan hitungan login gagal, daftar timestamp kegagalan `/windowed/login`, semua counter action, state gerbang racy, `load_requests`, `login_requests`, `action_requests`, dan `verify_requests`.
         Alat pengembangan: `api-toolkit` tidak pernah memanggilnya. Jalankan sebelum mengulang check
         (baseline login butuh hitungan gagal 0; race butuh counter awal 0).
       responses:
@@ -451,7 +509,7 @@ paths:
         Test memakainya untuk membuktikan check mengirim tepat sekian request tanpa retry
         (brute force sehat: 9 = 1 baseline + 8 probe).
 
-        - `login_requests` menghitung setiap `POST` yang sampai ke handler salah satu dari tiga rute login,
+        - `login_requests` menghitung setiap `POST` yang sampai ke handler salah satu dari kelima rute login,
           termasuk body rusak (400). Method selain POST (405) dan body di atas batas default axum (2 MB)
           ditolak sebelum handler dan **tidak** dihitung.
         - `load_requests` menghitung setiap `GET` ke empat rute load (`/critical`, `/broken/critical/*`), termasuk `401`.

@@ -9,12 +9,15 @@ use std::collections::BTreeSet;
 use reqwest::Url;
 
 use super::{
-    BruteForce, Config, ConfigError, Limits, Load, MatcherSpec, Race, RequestSpec, Selection,
+    BruteForce, BruteForceMode, Config, ConfigError, Limits, Load, MatcherSpec, Race, RequestSpec,
+    Selection,
 };
 use crate::report::CheckName;
 
 /// Max probe count, race concurrency, load count and load concurrency (PLAN §8).
 const MAX_PROBES: u32 = 100;
+/// Burst probe count (Q3, PLAN §8): same ceiling as race/load concurrency.
+const MAX_BURST: u32 = 32;
 const MAX_RACE_CONCURRENCY: u32 = 32;
 const MAX_LOAD_REQUESTS: u32 = 1000;
 const MAX_LOAD_CONCURRENCY: u32 = 32;
@@ -83,7 +86,13 @@ pub fn validate(cfg: &Config, sel: Selection) -> Result<RequestBudget, ConfigErr
         let bf = required(&cfg.brute_force, "brute_force", sel)?;
         check_brute_force(bf)?;
         requests += 1 + u64::from(bf.attempts);
-        fixed_wait += u128::from(bf.attempts - 1) * u128::from(bf.interval_ms);
+        // Burst has no fixed wait between probes (all dispatched at once); sequential
+        // sleeps `interval_ms` after each probe but the last (PLAN §5).
+        if bf.mode == BruteForceMode::Sequential {
+            // `check_brute_force` already proved `interval_ms` is `Some` here.
+            let interval_ms = bf.interval_ms.unwrap_or_default();
+            fixed_wait += u128::from(bf.attempts - 1) * u128::from(interval_ms);
+        }
     }
     // Race: verify before + verify after + N actions.
     if sel.includes(CheckName::Race) {
@@ -161,21 +170,9 @@ fn check_brute_force(bf: &BruteForce) -> Result<(), ConfigError> {
     check_matcher("brute_force.rejection_match", &bf.rejection_match)?;
     check_matcher("brute_force.protection_match", &bf.protection_match)?;
 
-    check_range("brute_force.attempts", bf.attempts, MAX_PROBES)?;
-    check_positive("brute_force.interval_ms", bf.interval_ms)?;
-    // Attempt 1 must be a normal rejection, so protection can start at 2 at the earliest.
-    if !(2..=bf.attempts).contains(&bf.protect_by_attempt) {
-        return Err(invalid(
-            "brute_force.protect_by_attempt",
-            "must be in 2..=attempts",
-        ));
-    }
-    // The tail cannot cover attempt 1. `attempts >= 2` here (protect_by_attempt passed).
-    if !(1..bf.attempts).contains(&bf.protected_tail_count) {
-        return Err(invalid(
-            "brute_force.protected_tail_count",
-            "must be in 1..=attempts-1",
-        ));
+    match bf.mode {
+        BruteForceMode::Sequential => check_brute_force_sequential(bf)?,
+        BruteForceMode::Burst => check_brute_force_burst(bf)?,
     }
 
     // Conservative: the three outcomes must be told apart by status alone.
@@ -197,6 +194,80 @@ fn check_brute_force(bf: &BruteForce) -> Result<(), ConfigError> {
             }
         }
     }
+    Ok(())
+}
+
+/// `field` must be `Some`; names only `field`, never a value (the message is read by
+/// users whose values may be secret placeholders).
+fn require_some<T>(path: &str, value: Option<T>, mode: &str) -> Result<T, ConfigError> {
+    value.ok_or_else(|| invalid(path, &format!("is required when mode is {mode}")))
+}
+
+/// `field` must be `None` (not silently ignored).
+fn require_none<T>(path: &str, value: Option<T>, mode: &str) -> Result<(), ConfigError> {
+    if value.is_some() {
+        return Err(invalid(
+            path,
+            &format!("is not allowed when mode is {mode}"),
+        ));
+    }
+    Ok(())
+}
+
+fn check_brute_force_sequential(bf: &BruteForce) -> Result<(), ConfigError> {
+    check_range("brute_force.attempts", bf.attempts, MAX_PROBES)?;
+    let interval_ms = require_some("brute_force.interval_ms", bf.interval_ms, "sequential")?;
+    check_positive("brute_force.interval_ms", interval_ms)?;
+    let protect_by_attempt = require_some(
+        "brute_force.protect_by_attempt",
+        bf.protect_by_attempt,
+        "sequential",
+    )?;
+    let protected_tail_count = require_some(
+        "brute_force.protected_tail_count",
+        bf.protected_tail_count,
+        "sequential",
+    )?;
+    require_none("brute_force.window_ms", bf.window_ms, "sequential")?;
+    // Attempt 1 must be a normal rejection, so protection can start at 2 at the earliest.
+    if !(2..=bf.attempts).contains(&protect_by_attempt) {
+        return Err(invalid(
+            "brute_force.protect_by_attempt",
+            "must be in 2..=attempts",
+        ));
+    }
+    // The tail cannot cover attempt 1. `attempts >= 2` here (protect_by_attempt passed).
+    if !(1..bf.attempts).contains(&protected_tail_count) {
+        return Err(invalid(
+            "brute_force.protected_tail_count",
+            "must be in 1..=attempts-1",
+        ));
+    }
+    Ok(())
+}
+
+/// Q3: burst has no attempt order, so `protect_by_attempt`/`protected_tail_count` do
+/// not apply; `window_ms` replaces `interval_ms` as the one burst-only threshold.
+fn check_brute_force_burst(bf: &BruteForce) -> Result<(), ConfigError> {
+    // Lower bound checked before the generic 1..=max range, so the error message
+    // states the real burst bound (2..=32) instead of check_range's 1..=32.
+    if bf.attempts < 2 {
+        return Err(invalid("brute_force.attempts", "must be in 2..=32"));
+    }
+    check_range("brute_force.attempts", bf.attempts, MAX_BURST)?;
+    let window_ms = require_some("brute_force.window_ms", bf.window_ms, "burst")?;
+    check_positive("brute_force.window_ms", window_ms)?;
+    require_none("brute_force.interval_ms", bf.interval_ms, "burst")?;
+    require_none(
+        "brute_force.protect_by_attempt",
+        bf.protect_by_attempt,
+        "burst",
+    )?;
+    require_none(
+        "brute_force.protected_tail_count",
+        bf.protected_tail_count,
+        "burst",
+    )?;
     Ok(())
 }
 
@@ -515,7 +586,7 @@ mod tests {
             ),
             (
                 "interval 0",
-                |c| bf(c).interval_ms = 0,
+                |c| bf(c).interval_ms = Some(0),
                 "brute_force.interval_ms",
             ),
             ("settle 0", |c| race(c).settle_ms = 0, "race.settle_ms"),
@@ -526,42 +597,42 @@ mod tests {
             ),
             (
                 "protect_by 1",
-                |c| bf(c).protect_by_attempt = 1,
+                |c| bf(c).protect_by_attempt = Some(1),
                 "brute_force.protect_by_attempt",
             ),
             (
                 "protect_by > attempts",
-                |c| bf(c).protect_by_attempt = 9,
+                |c| bf(c).protect_by_attempt = Some(9),
                 "brute_force.protect_by_attempt",
             ),
             (
                 "tail 0",
-                |c| bf(c).protected_tail_count = 0,
+                |c| bf(c).protected_tail_count = Some(0),
                 "brute_force.protected_tail_count",
             ),
             (
                 "tail > attempts",
-                |c| bf(c).protected_tail_count = 9,
+                |c| bf(c).protected_tail_count = Some(9),
                 "brute_force.protected_tail_count",
             ),
             (
                 "tail == attempts",
-                |c| bf(c).protected_tail_count = 8,
+                |c| bf(c).protected_tail_count = Some(8),
                 "brute_force.protected_tail_count",
             ),
             (
                 "attempts 1",
                 |c| {
                     bf(c).attempts = 1;
-                    bf(c).protect_by_attempt = 1;
-                    bf(c).protected_tail_count = 1;
+                    bf(c).protect_by_attempt = Some(1);
+                    bf(c).protected_tail_count = Some(1);
                 },
                 "brute_force.protect_by_attempt",
             ),
             (
                 "fixed waits overflow",
                 |c| {
-                    bf(c).interval_ms = u64::MAX;
+                    bf(c).interval_ms = Some(u64::MAX);
                     race(c).settle_ms = u64::MAX;
                     c.limits.suite_deadline_ms = u64::MAX;
                 },
@@ -571,13 +642,109 @@ mod tests {
                 "fixed waits just over u64",
                 |c| {
                     bf(c).attempts = 2;
-                    bf(c).protect_by_attempt = 2;
-                    bf(c).protected_tail_count = 1;
-                    bf(c).interval_ms = u64::MAX;
+                    bf(c).protect_by_attempt = Some(2);
+                    bf(c).protected_tail_count = Some(1);
+                    bf(c).interval_ms = Some(u64::MAX);
                     race(c).settle_ms = 1;
                     c.limits.suite_deadline_ms = u64::MAX;
                 },
                 "limits.suite_deadline_ms",
+            ),
+            (
+                "burst with sequential field interval_ms set",
+                |c| {
+                    bf(c).mode = BruteForceMode::Burst;
+                    bf(c).window_ms = Some(1000);
+                    bf(c).interval_ms = Some(10);
+                    bf(c).protect_by_attempt = None;
+                    bf(c).protected_tail_count = None;
+                },
+                "brute_force.interval_ms",
+            ),
+            (
+                "burst with sequential field protect_by_attempt set",
+                |c| {
+                    bf(c).mode = BruteForceMode::Burst;
+                    bf(c).window_ms = Some(1000);
+                    bf(c).interval_ms = None;
+                    bf(c).protected_tail_count = None;
+                },
+                "brute_force.protect_by_attempt",
+            ),
+            (
+                "burst with sequential field protected_tail_count set",
+                |c| {
+                    bf(c).mode = BruteForceMode::Burst;
+                    bf(c).window_ms = Some(1000);
+                    bf(c).interval_ms = None;
+                    bf(c).protect_by_attempt = None;
+                },
+                "brute_force.protected_tail_count",
+            ),
+            (
+                "burst without window_ms",
+                |c| {
+                    bf(c).mode = BruteForceMode::Burst;
+                    bf(c).interval_ms = None;
+                    bf(c).protect_by_attempt = None;
+                    bf(c).protected_tail_count = None;
+                },
+                "brute_force.window_ms",
+            ),
+            (
+                "burst window_ms 0",
+                |c| {
+                    bf(c).mode = BruteForceMode::Burst;
+                    bf(c).window_ms = Some(0);
+                    bf(c).interval_ms = None;
+                    bf(c).protect_by_attempt = None;
+                    bf(c).protected_tail_count = None;
+                },
+                "brute_force.window_ms",
+            ),
+            (
+                "burst attempts 1 is below the burst minimum",
+                |c| {
+                    bf(c).mode = BruteForceMode::Burst;
+                    bf(c).attempts = 1;
+                    bf(c).window_ms = Some(1000);
+                    bf(c).interval_ms = None;
+                    bf(c).protect_by_attempt = None;
+                    bf(c).protected_tail_count = None;
+                },
+                "brute_force.attempts",
+            ),
+            (
+                "burst attempts 33 is above the burst maximum",
+                |c| {
+                    bf(c).mode = BruteForceMode::Burst;
+                    bf(c).attempts = 33;
+                    bf(c).window_ms = Some(1000);
+                    bf(c).interval_ms = None;
+                    bf(c).protect_by_attempt = None;
+                    bf(c).protected_tail_count = None;
+                },
+                "brute_force.attempts",
+            ),
+            (
+                "sequential without interval_ms",
+                |c| bf(c).interval_ms = None,
+                "brute_force.interval_ms",
+            ),
+            (
+                "sequential without protect_by_attempt",
+                |c| bf(c).protect_by_attempt = None,
+                "brute_force.protect_by_attempt",
+            ),
+            (
+                "sequential without protected_tail_count",
+                |c| bf(c).protected_tail_count = None,
+                "brute_force.protected_tail_count",
+            ),
+            (
+                "sequential with window_ms set",
+                |c| bf(c).window_ms = Some(1000),
+                "brute_force.window_ms",
             ),
             (
                 "path backslash",
@@ -882,13 +1049,13 @@ mod tests {
         let cases: Vec<(&str, Mutate)> = vec![
             ("probe 100", |c| {
                 bf(c).attempts = 100;
-                bf(c).protect_by_attempt = 100;
+                bf(c).protect_by_attempt = Some(100);
                 c.limits.suite_deadline_ms = 1_000_000;
             }),
             ("probe 2 minimal", |c| {
                 bf(c).attempts = 2;
-                bf(c).protect_by_attempt = 2;
-                bf(c).protected_tail_count = 1;
+                bf(c).protect_by_attempt = Some(2);
+                bf(c).protected_tail_count = Some(1);
             }),
             ("race 32", |c| race(c).concurrency = 32),
             ("race 2", |c| race(c).concurrency = 2),
@@ -899,23 +1066,46 @@ mod tests {
             ("error rate 0", |c| load(c).max_error_rate = 0.0),
             ("error rate 1", |c| load(c).max_error_rate = 1.0),
             ("p95 1", |c| load(c).max_p95_ms = 1),
-            ("interval 1", |c| bf(c).interval_ms = 1),
+            ("interval 1", |c| bf(c).interval_ms = Some(1)),
             ("settle 1", |c| race(c).settle_ms = 1),
             ("skew 1", |c| race(c).max_dispatch_skew_ms = 1),
-            ("protect_by 2", |c| bf(c).protect_by_attempt = 2),
-            ("protect_by == attempts", |c| bf(c).protect_by_attempt = 8),
-            ("tail 1", |c| bf(c).protected_tail_count = 1),
-            ("tail == attempts-1", |c| bf(c).protected_tail_count = 7),
+            ("protect_by 2", |c| bf(c).protect_by_attempt = Some(2)),
+            ("protect_by == attempts", |c| {
+                bf(c).protect_by_attempt = Some(8)
+            }),
+            ("tail 1", |c| bf(c).protected_tail_count = Some(1)),
+            ("tail == attempts-1", |c| {
+                bf(c).protected_tail_count = Some(7)
+            }),
             ("fixed waits u64 fit", |c| {
                 bf(c).attempts = 2;
-                bf(c).protect_by_attempt = 2;
-                bf(c).protected_tail_count = 1;
-                bf(c).interval_ms = u64::MAX - 1;
+                bf(c).protect_by_attempt = Some(2);
+                bf(c).protected_tail_count = Some(1);
+                bf(c).interval_ms = Some(u64::MAX - 1);
                 race(c).settle_ms = 1;
                 c.limits.suite_deadline_ms = u64::MAX;
             }),
             ("fixed waits == deadline", |c| {
                 c.limits.suite_deadline_ms = 950
+            }),
+            ("mode explicit sequential", |c| {
+                bf(c).mode = BruteForceMode::Sequential;
+            }),
+            ("burst minimal", |c| {
+                bf(c).mode = BruteForceMode::Burst;
+                bf(c).attempts = 2;
+                bf(c).window_ms = Some(1);
+                bf(c).interval_ms = None;
+                bf(c).protect_by_attempt = None;
+                bf(c).protected_tail_count = None;
+            }),
+            ("burst attempts 32", |c| {
+                bf(c).mode = BruteForceMode::Burst;
+                bf(c).attempts = 32;
+                bf(c).window_ms = Some(1000);
+                bf(c).interval_ms = None;
+                bf(c).protect_by_attempt = None;
+                bf(c).protected_tail_count = None;
             }),
             ("status 100 and 599", |c| {
                 load(c).response_match.status_in = vec![100, 599]

@@ -74,7 +74,7 @@ Exit 0. Angka ini sama dengan jumlah kedua kelompok di atas (224 + 83 caught, 20
 
 ## Cakupan AC
 
-`docs/ac-trace.md`: 123 baris AC (P0–P4 ditambah 9 baris Q2 yang memakai id P2-AC26–34). Hasil mutasi Q2 (`verify.sh mutants --file src/checks/race.rs --file src/report.rs`, 2026-10-14): 110 mutan, 101 tertangkap, 9 unviable, 0 lolos.
+`docs/ac-trace.md`: 137 baris AC (P0–P4 ditambah 9 baris Q2 yang memakai id P2-AC26–34, ditambah 14 baris Q3 yang memakai id P1-AC19–32; `scripts/ac-trace.sh` melaporkan "137 AC rows, all evidence resolved"). Hasil mutasi Q2 (`verify.sh mutants --file src/checks/race.rs --file src/report.rs`, 2026-10-14): 110 mutan, 101 tertangkap, 9 unviable, 0 lolos. Hasil mutasi Q3 (`verify.sh mutants --file src/checks/brute_force.rs --file src/checks/mod.rs --file src/checks/race.rs --file src/config/validate.rs --file src/report.rs`, 2026-10-14): 277 mutan, 253 tertangkap, 24 unviable, 0 lolos.
 
 - Bukti test: 114 baris.
 - Bukti `manual:`: 9 baris (P0-AC18, P0-AC20, P1-AC18, P2-AC25, P2-AC34, P3-AC26, P4-AC6a, P4-AC6b, P4-AC10). Ini AC tentang dokumen dan gate; bukti `manual:` hanya diperiksa keberadaan berkasnya, bukan isinya. Isi `docs/evidence/quality-gate.md` ditulis sekarang, bukan rekaman saat fase ditutup.

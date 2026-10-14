@@ -1,7 +1,9 @@
 //! race check (PLAN §6). This file holds the pure parts: `read_verifier` (one verifier
-//! response -> counter or problem), `action_allowed`, `skew_ms` and `evaluate` (all facts ->
-//! verdict). The async parts are `run_with` (before -> N actions together -> settle -> after,
-//! with a closure as sender so tests need no network), `run` (real transport) and `console_line`.
+//! response -> counter or problem), `action_allowed` and `evaluate` (all facts -> verdict).
+//! Dispatch spread (`dispatch_spread_ms`) lives in `checks::mod` and is shared with
+//! `brute_force` burst. The async parts are `run_with` (before -> N actions together ->
+//! settle -> after, with a closure as sender so tests need no network), `run` (real
+//! transport) and `console_line`.
 
 use std::time::Duration;
 
@@ -9,7 +11,7 @@ use futures_util::future::join_all;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep};
 
-use crate::checks::{Stop, current_stop, wait_stop};
+use crate::checks::{Stop, current_stop, dispatch_spread_ms, wait_stop};
 use crate::config::{MatcherSpec, Race};
 use crate::http::request::ResolvedRequest;
 use crate::http::{Transport, TransportError, TransportResponse, send};
@@ -67,14 +69,6 @@ pub fn action_allowed(
     expected: &[u16],
 ) -> bool {
     matches!(result, Ok(r) if expected.contains(&r.status))
-}
-
-/// Spread between the first and the last dispatch (offsets from one common start),
-/// in whole ms rounded UP, so 100.4 ms is never shown or judged as 100. `None` if empty.
-pub fn skew_ms(dispatch_offsets: &[Duration]) -> Option<u64> {
-    let min = dispatch_offsets.iter().min()?;
-    let max = dispatch_offsets.iter().max()?;
-    Some((*max - *min).as_micros().div_ceil(1000) as u64)
 }
 
 /// The part of one finished action that the verdict needs.
@@ -415,7 +409,7 @@ where
         }
     }
 
-    let dispatch_skew_ms = skew_ms(&dispatch_offsets);
+    let dispatch_skew_ms = dispatch_spread_ms(&dispatch_offsets);
     let evaluation = evaluate(
         before.as_ref().map(|(r, _)| *r),
         after.as_ref().map(|(r, _)| *r),
@@ -582,17 +576,6 @@ mod tests {
             &err(TransportErrorCode::Timeout),
             &expected
         ));
-    }
-
-    #[test]
-    fn skew_ms_rounds_up() {
-        let ms = Duration::from_millis;
-        assert_eq!(skew_ms(&[]), None);
-        assert_eq!(skew_ms(&[ms(40)]), Some(0));
-        assert_eq!(skew_ms(&[ms(0), ms(150)]), Some(150));
-        assert_eq!(skew_ms(&[ms(150), ms(0), ms(20)]), Some(150));
-        assert_eq!(skew_ms(&[ms(0), Duration::from_micros(100_400)]), Some(101));
-        assert_eq!(skew_ms(&[ms(0), Duration::from_micros(100_000)]), Some(100));
     }
 
     // ---- evaluate ----

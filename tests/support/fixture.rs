@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
@@ -48,6 +48,10 @@ pub const HANG_DELAY: Duration = Duration::from_secs(3);
 const RACY_GATE: u32 = 2;
 /// Racy apply: longest wait for the gate. A sequential client times out here and the delta stays 1.
 const RACY_GATE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Windowed login (Q3, burst): sliding window length for the time-based limiter.
+pub const WINDOW: Duration = Duration::from_millis(300);
+/// Windowed login: >= this many failed logins inside `WINDOW` trips 429.
+pub const WINDOW_LIMIT: usize = 5;
 
 #[derive(Default)]
 struct FixtureState {
@@ -64,6 +68,8 @@ struct FixtureState {
     /// action id -> number of racy requests that have read counter 0 (the explicit sync point).
     /// Reset drops the senders, which opens every gate.
     racy_seen_zero: HashMap<String, watch::Sender<u32>>,
+    /// Windowed login (Q3, burst): timestamp of every failed login, oldest first.
+    windowed_failed_logins: Vec<Instant>,
 }
 
 type Shared = Arc<Mutex<FixtureState>>;
@@ -121,6 +127,11 @@ fn router(state: Shared) -> Router {
         .route("/login", post(login))
         .route("/broken/login/unprotected", post(login_unprotected))
         .route("/broken/login/accepts-invalid", post(login_accepts_invalid))
+        .route("/windowed/login", post(windowed_login))
+        .route(
+            "/broken/login/always-protected",
+            post(login_always_protected),
+        )
         .route("/actions/{id}/apply", post(apply))
         .route("/broken/actions/{id}/apply-racy", post(apply_racy))
         .route("/idempotent/actions/{id}/apply", post(apply_idempotent))
@@ -238,6 +249,61 @@ async fn login(State(state): State<Shared>, raw: Bytes) -> Reply {
     } else {
         invalid_credentials()
     }
+}
+
+/// Broken variant: wrong credentials are always 429, regardless of count (proves the burst
+/// `protected == attempts` line, `account_already_locked`).
+async fn login_always_protected(State(state): State<Shared>, raw: Bytes) -> Reply {
+    let body = match count_and_parse_login(&state, &raw) {
+        Ok(body) => body,
+        Err(rejection) => return rejection,
+    };
+    if body.username == LOGIN_USER && body.password == LOGIN_VALID_PASSWORD {
+        token_reply()
+    } else {
+        reply(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error": "too_many_attempts"}),
+        )
+    }
+}
+
+/// Count of failed logins recorded within the last `WINDOW`, pruning older entries in place.
+/// `now` is passed in so a single instant is shared by the prune and the decision it feeds.
+fn windowed_failures_within(times: &mut Vec<Instant>, now: Instant) -> usize {
+    times.retain(|t| now.duration_since(*t) <= WINDOW);
+    times.len()
+}
+
+/// Real, deterministic time-based limiter: >= `WINDOW_LIMIT` failed logins within `WINDOW`
+/// trips 429. Sequential pacing (`interval_ms >= 150`) can never reach the limit inside a
+/// 300 ms window; a burst of probes arriving within a few ms can. See docs/fixture.md.
+async fn windowed_login(State(state): State<Shared>, raw: Bytes) -> Reply {
+    let body = match count_and_parse_login(&state, &raw) {
+        Ok(body) => body,
+        Err(rejection) => return rejection,
+    };
+    let valid = body.username == LOGIN_USER && body.password == LOGIN_VALID_PASSWORD;
+    let now = Instant::now();
+    let mut s = lock(&state);
+    let failures_in_window = windowed_failures_within(&mut s.windowed_failed_logins, now);
+    if valid {
+        if failures_in_window >= WINDOW_LIMIT {
+            return reply(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"error": "too_many_attempts"}),
+            );
+        }
+        return token_reply();
+    }
+    if failures_in_window >= WINDOW_LIMIT {
+        return reply(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error": "too_many_attempts"}),
+        );
+    }
+    s.windowed_failed_logins.push(now);
+    invalid_credentials()
 }
 
 async fn apply(State(state): State<Shared>, Path(id): Path<String>, headers: HeaderMap) -> Reply {

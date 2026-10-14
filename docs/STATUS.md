@@ -10,12 +10,15 @@ Rencana aktif: `docs/PLAN.md` (Small Core Proof, 9 Oktober 2026). Keputusan sete
 | P3 | Parallel load check | selesai (10 Oktober 2026) | Phase gate PASS; 26 dari 26 AC terpenuhi; 393 test hijau |
 | P4 | Single-command proof + satu API nyata | menunggu review pengguna (10 Oktober 2026) | Phase gate PASS; fixture proof selesai (suite lengkap `check` tanpa `--only`, 416 test hijau); P4-AC7 validasi target nyata belum dilakukan |
 | Q2 | Batas ERROR/INCONCLUSIVE race (verifier before) | selesai (S1–S5, gate reviewer PASS, mutasi 0 lolos) | AC P2-AC26–34 (9 baris) di `docs/ac-trace.md`; mutasi race.rs + report.rs: 110 mutan, 101 tertangkap, 9 unviable, 0 lolos |
+| Q3 | Mode burst brute_force (`window_ms`, `evaluate_burst`, `run_burst_with`) | selesai (S1–S6, gate reviewer PASS, mutasi 0 lolos) | AC P1-AC19–32 (14 baris) di `docs/ac-trace.md`; `verify.sh fast` exit 0; mutasi 277 mutan/253 tertangkap/24 unviable/0 lolos |
 
 ## Fase aktif
 
 P4: **menunggu review pengguna** (checkpoint). P0–P3 selesai. Fixture proof end to end selesai; validasi target nyata belum dilakukan dan menunggu config dari pengguna (lihat "Validasi API nyata").
 
 Q2: perubahan klasifikasi verifier before di race (DECISIONS 2026-10-14, `docs/findings.md` F-001) sudah dikerjakan; gate reviewer PASS dan mutasi 0 lolos. Tidak mengubah status checkpoint P4.
+
+Q3: mode burst brute_force (DECISIONS 2026-10-14, `docs/findings.md` F-002) S1–S6 sudah dikerjakan (config/validate mode-aware, `evaluate_burst`, `run_burst_with`, `Evidence::BruteForceBurst`, console burst, fixture `/windowed/login` dan `/broken/login/always-protected`, 16 test integrasi/CLI baru). Gate reviewer PASS (2026-10-14); mutasi `scripts/verify.sh mutants` (brute_force.rs, checks/mod.rs, race.rs, validate.rs, report.rs): 277 mutan, 253 tertangkap, 24 unviable, 0 lolos. Tidak mengubah status checkpoint P4.
 
 ## Ringkasan AC P0
 
@@ -233,6 +236,8 @@ Verifier tetap `GET /actions/{id}`. Detail rute dan titik sinkronisasi ada di `d
 - P2: test `r18` memakai pola bind-lalu-drop port; bila port dipakai ulang test lain, hasilnya merah, bukan PASS palsu. Header `X-Sentinel` tidak dipantulkan fixture, jadi buktinya lewat listener TCP mentah.
 - P2: `evaluate` memberi `dispatch_incomplete` bila ada action tercatat tapi skew kosong (pengaman dari review S3/S4), supaya salah sambung di `run_with` tidak pernah jadi PASS.
 
+- Q3 (mode burst brute_force): `window_ms` mengukur selisih waktu dispatch di sisi client dalam satu task (`join_all`), bukan waktu kedatangan di server; limiter tidak dijamin melihat probe dalam jendela yang sama. FAIL burst (`P == 0`) bukan bukti tanpa proteksi: limiter dengan ambang di atas N (maks 32) atau limiter per-menit tidak akan terpicu. `P == N` selalu INCONCLUSIVE `account_already_locked`, yang bisa menutupi limiter yang sangat ketat (mis. 1 request/detik di mana baseline sudah memakai jatah); tidak ada field `min_protected` (YAGNI, lihat DECISIONS C2).
+
 - P3: `throughput_rps` hanya di report (informatif, `null` bila elapsed 0), tidak di console.
 - P3: preflight memakai `load.request` yang sama dengan load, jadi target nyata menerima 1+N request; endpoint non-idempoten ikut terkena efeknya.
 - P3: Ctrl-C dan deadline sama-sama NOT_RUN `[stop, workload_incomplete]` (bedanya reason dan exit 130/2). Request in-flight yang di-drop saat stop mungkin sudah sampai server; dihitung di `dispatched`, bukan `attempted`.
@@ -273,3 +278,4 @@ Belum ada. Menunggu review checkpoint P4 (fixture proof) dan satu run target nya
 ## Riwayat pekerjaan
 
 - 2026-10-14: Q2 (race, batas ERROR/INCONCLUSIVE) S1–S5 dikerjakan: ReasonCode +2 (32), `read_verifier` dan pemetaan before/after dipisah, 4 rute fixture verifier rusak, test integrasi, 9 baris AC baru. Gate reviewer PASS; mutasi 0 lolos.
+- 2026-10-14: Q3 (brute_force, mode burst) S1–S6 dikerjakan: `BruteForceMode`/`Option` tiga field sequential di `config.rs`, aturan per mode dan budget di `validate.rs`, `dispatch_spread_ms` dipindah ke `checks::mod`, `evaluate_burst` + `run_burst_with` + `Evidence::BruteForceBurst` + console burst di `brute_force.rs`/`report.rs`, fixture `/windowed/login` dan `/broken/login/always-protected`, contoh `examples/brute-force-burst.json`, 16 test integrasi/CLI baru (b20–b31, `validate_burst_*`, `burst_only_brute_force_is_pass_with_partial_scope`). 14 baris AC baru (`P1-AC19`–`P1-AC32`). Gate reviewer PASS; mutasi 277 mutan/253 tertangkap/24 unviable/0 lolos; satu perbaikan non-blocking dari review (pesan error `attempts` burst di `validate.rs` kini menyatakan batas 2..=32, bukan 1..=32).

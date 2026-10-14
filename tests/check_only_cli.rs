@@ -468,6 +468,46 @@ async fn unselected_sections_with_bad_semantics_and_no_test_env_do_not_block_the
     fx.shutdown().await;
 }
 
+// ---------- Q3-S5: --only brute_force, mode burst ----------
+
+/// Turns the healthy sequential `brute_force` section of `BF_EXAMPLE` into a burst one:
+/// drop the three sequential-only fields, add `mode`/`window_ms`, point both requests at
+/// `path`. Mirrors `burst_config` in `tests/brute_force_fixture.rs`.
+fn to_burst(v: &mut Value, path: &str, attempts: u32, window_ms: u64) {
+    let bf = v["brute_force"].as_object_mut().unwrap();
+    bf.remove("interval_ms");
+    bf.remove("protect_by_attempt");
+    bf.remove("protected_tail_count");
+    bf.insert("mode".into(), json!("burst"));
+    bf.insert("window_ms".into(), json!(window_ms));
+    bf.insert("attempts".into(), json!(attempts));
+    v["brute_force"]["baseline_request"]["path"] = json!(path);
+    v["brute_force"]["probe_request"]["path"] = json!(path);
+}
+
+/// P1-AC30: `--only brute_force` burst against the real fixture: PASS on both the console
+/// line and the report, exit 2 (partial scope never exits 0), `scope == "partial"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn burst_only_brute_force_is_pass_with_partial_scope() {
+    let fx = Fixture::start(0).await.unwrap();
+    let w = Work::new(&cfg_text(&fx.base_url(), |v| {
+        to_burst(v, "/windowed/login", 8, 1000);
+    }));
+    let run = exec(&w.job(healthy_env())).await;
+    assert_eq!(run.code, 2, "stderr: {}", run.stderr);
+    assert!(
+        one_line(&run).starts_with("brute_force PASS mode=burst"),
+        "{}",
+        run.stdout
+    );
+    let rep = w.report();
+    assert_bf(&rep, "pass", json!(["protection_observed"]), "complete");
+    assert_eq!(rep["scope"], "partial");
+    assert!(bf(&rep).get("evidence").is_some());
+    assert_eq!(login_requests(&fx).await, 9);
+    fx.shutdown().await;
+}
+
 // ---------- rejected before any request ----------
 
 struct Case {

@@ -325,6 +325,24 @@ pub struct BruteForceEvidence {
     pub attempts: Vec<AttemptEvidence>,
 }
 
+/// Evidence of the brute-force check in burst mode (DECISIONS 2026-10-14 Q3). `mode` is
+/// always `"burst"`: it lets a consumer tell the two brute_force evidence shapes apart
+/// without a serde tag on the untagged `Evidence` enum. Numbers, enums and null only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BurstEvidence {
+    pub mode: &'static str,
+    pub attempts_planned: u32,
+    pub attempts_dispatched: u32,
+    pub window_ms: u64,
+    /// Observed dispatch spread (`dispatch_spread_ms` over the probes' offsets).
+    pub dispatch_window_ms: Option<u64>,
+    pub protected_count: u32,
+    pub rejected_count: u32,
+    pub baseline: Option<AttemptEvidence>,
+    /// Numbered 1..=N by dispatch index, not by finish order.
+    pub attempts: Vec<AttemptEvidence>,
+}
+
 /// Verifier read (before/after). Numbers, enums and nulls only: no body or header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerifyEvidence {
@@ -395,6 +413,7 @@ pub struct LoadEvidence {
 #[serde(untagged)]
 pub enum Evidence {
     BruteForce(BruteForceEvidence),
+    BruteForceBurst(BurstEvidence),
     Race(RaceEvidence),
     Load(LoadEvidence),
 }
@@ -951,6 +970,91 @@ mod tests {
             serde_json::to_string_pretty(&evidence_check()).unwrap(),
             golden
         );
+    }
+
+    #[test]
+    fn burst_evidence_json_matches_golden() {
+        let attempt = |n, outcome, status, offset_ms| AttemptEvidence {
+            attempt: n,
+            outcome,
+            status,
+            error: None,
+            offset_ms,
+            elapsed_ms: 5,
+        };
+        let check = CheckResult {
+            check: CheckName::BruteForce,
+            verdict: Verdict::Pass,
+            reasons: vec![ReasonCode::ProtectionObserved],
+            completion: Completion::Complete,
+            evidence: Some(Evidence::BruteForceBurst(BurstEvidence {
+                mode: "burst",
+                attempts_planned: 8,
+                attempts_dispatched: 9,
+                window_ms: 100,
+                dispatch_window_ms: Some(1),
+                protected_count: 3,
+                rejected_count: 5,
+                baseline: Some(attempt(0, Outcome::Success, Some(200), 0)),
+                attempts: vec![
+                    attempt(1, Outcome::NormalRejection, Some(401), 0),
+                    attempt(2, Outcome::Protection, Some(429), 1),
+                ],
+            })),
+        };
+        let golden = r#"{
+  "check": "brute_force",
+  "verdict": "pass",
+  "reasons": [
+    "protection_observed"
+  ],
+  "completion": "complete",
+  "evidence": {
+    "mode": "burst",
+    "attempts_planned": 8,
+    "attempts_dispatched": 9,
+    "window_ms": 100,
+    "dispatch_window_ms": 1,
+    "protected_count": 3,
+    "rejected_count": 5,
+    "baseline": {
+      "attempt": 0,
+      "outcome": "success",
+      "status": 200,
+      "error": null,
+      "offset_ms": 0,
+      "elapsed_ms": 5
+    },
+    "attempts": [
+      {
+        "attempt": 1,
+        "outcome": "normal_rejection",
+        "status": 401,
+        "error": null,
+        "offset_ms": 0,
+        "elapsed_ms": 5
+      },
+      {
+        "attempt": 2,
+        "outcome": "protection",
+        "status": 429,
+        "error": null,
+        "offset_ms": 1,
+        "elapsed_ms": 5
+      }
+    ]
+  }
+}"#;
+        assert_eq!(serde_json::to_string_pretty(&check).unwrap(), golden);
+        // evidence never changes the exit code
+        let mut with = sample_report();
+        let mut without = sample_report();
+        with.checks[0] = check.clone();
+        without.checks[0] = CheckResult {
+            evidence: None,
+            ..check
+        };
+        assert_eq!(exit_code(&with), exit_code(&without));
     }
 
     #[test]

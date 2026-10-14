@@ -925,6 +925,39 @@ mod tests {
     }
 
     #[test]
+    fn check_only_brute_force_burst_mode_also_runs_and_reports_burst_evidence() {
+        // Same shape as the sequential test above, but `mode: "burst"` with `window_ms`
+        // instead of the three sequential-only fields: `run` must dispatch to
+        // `run_burst_with` and the console/report must carry burst evidence.
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("r.json");
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(PARTIAL).unwrap()).unwrap();
+        v["base_url"] = Value::from(closed_port_url());
+        let bf = v["brute_force"].as_object_mut().unwrap();
+        bf.remove("interval_ms");
+        bf.remove("protect_by_attempt");
+        bf.remove("protected_tail_count");
+        bf.insert("mode".to_string(), Value::from("burst"));
+        bf.insert("window_ms".to_string(), Value::from(1000));
+        let (_d, cfg) = temp_config(&v.to_string());
+        let (code, out, err) = check_only(&[
+            "--config",
+            &cfg,
+            "--out",
+            report.to_str().unwrap(),
+            "--only",
+            "brute_force",
+        ]);
+        assert_eq!(code, 2, "{err}");
+        assert!(out.starts_with("brute_force ERROR mode=burst"), "{out}");
+        let text = std::fs::read_to_string(&report).unwrap();
+        assert!(text.contains("\"mode\": \"burst\""), "{text}");
+        assert!(text.contains("\"scope\": \"partial\""), "{text}");
+        assert_no_sentinel(&out, &err);
+    }
+
+    #[test]
     fn check_only_config_errors_are_2_without_sentinel() {
         let dir = tempfile::tempdir().unwrap();
         let report = dir.path().join("r.json");

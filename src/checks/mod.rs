@@ -1,5 +1,7 @@
 //! Check implementations (filled in P1-P3).
 
+use std::time::Duration;
+
 use tokio::sync::watch;
 
 use crate::report::ReasonCode;
@@ -7,6 +9,16 @@ use crate::report::ReasonCode;
 pub mod brute_force;
 pub mod load;
 pub mod race;
+
+/// Spread between the first and the last dispatch (offsets from one common start),
+/// in whole ms rounded UP, so 100.4 ms is never shown or judged as 100. `None` if empty.
+/// Shared by `race` (actions) and `brute_force` (burst probes): both dispatch a batch of
+/// futures from one task and need the same "how tight was it" measurement.
+pub(crate) fn dispatch_spread_ms(dispatch_offsets: &[Duration]) -> Option<u64> {
+    let min = dispatch_offsets.iter().min()?;
+    let max = dispatch_offsets.iter().max()?;
+    Some((*max - *min).as_micros().div_ceil(1000) as u64)
+}
 
 /// Why a check was told to stop early. P4 triggers it (Ctrl-C or global deadline).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +58,23 @@ pub(crate) async fn wait_stop(rx: &mut watch::Receiver<Option<Stop>>) -> Stop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+
+    #[test]
+    fn dispatch_spread_ms_rounds_up() {
+        let ms = Duration::from_millis;
+        assert_eq!(dispatch_spread_ms(&[]), None);
+        assert_eq!(dispatch_spread_ms(&[ms(40)]), Some(0));
+        assert_eq!(dispatch_spread_ms(&[ms(0), ms(150)]), Some(150));
+        assert_eq!(dispatch_spread_ms(&[ms(150), ms(0), ms(20)]), Some(150));
+        assert_eq!(
+            dispatch_spread_ms(&[ms(0), Duration::from_micros(100_400)]),
+            Some(101)
+        );
+        assert_eq!(
+            dispatch_spread_ms(&[ms(0), Duration::from_micros(100_000)]),
+            Some(100)
+        );
+    }
 
     /// A mutant that hides the stop makes other tests spin forever, so end the test process.
     fn expect_stop(got: Result<Stop, tokio::time::error::Elapsed>, want: Stop) {

@@ -289,6 +289,134 @@ fn config_size_limit_is_one_mib() {
     assert!(r.stderr.contains("larger than"), "{}", r.stderr);
 }
 
+// ---------- Q3-S5: burst mode (`brute_force.mode`) ----------
+
+const BF_BURST: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/examples/brute-force-burst.json"
+);
+const BF_SEQ: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/examples/brute-force-only.json"
+);
+
+/// The two brute_force-only examples only resolve these three placeholders.
+const BF_ENV: [(&str, &str); 3] = [
+    ("LOGIN_USER", "demo"),
+    ("LOGIN_VALID_PASSWORD", "demo-pass"),
+    ("LOGIN_INVALID_PASSWORD", "wrong-pass"),
+];
+
+/// Both brute_force-only example configs have no `race`/`load` section, so `validate`
+/// needs `--only brute_force` (see `docs/fixture.md`), unlike `EXAMPLE` (`core-checks.json`).
+fn validate_bf_only(path: &str, env: &[(&str, &str)]) -> Run {
+    run_bin(
+        &["validate", "--config", path, "--only", "brute_force"],
+        env,
+    )
+}
+
+/// P1-AC19/21, AC31: `examples/brute-force-burst.json` is locked at 9 requests, 0 ms fixed
+/// wait (burst has no interval).
+#[test]
+fn validate_burst_example_ok() {
+    let r = validate_bf_only(BF_BURST, &BF_ENV);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(r.stdout.contains("planned requests: 9"), "{}", r.stdout);
+    assert!(r.stdout.contains("fixed waits: 0 ms"), "{}", r.stdout);
+}
+
+/// P1-AC19/AC31 regression: the sequential-only example is unchanged by Q3.
+#[test]
+fn validate_sequential_only_example_unchanged() {
+    let r = validate_bf_only(BF_SEQ, &BF_ENV);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(r.stdout.contains("planned requests: 9"), "{}", r.stdout);
+    assert!(r.stdout.contains("fixed waits: 700 ms"), "{}", r.stdout);
+}
+
+/// P1-AC20/AC21: every per-mode violation is rejected before any request, with an error
+/// that names only the field, never a value.
+#[test]
+fn validate_burst_mode_violations_are_exit_2_with_zero_requests() {
+    let listener = CountingListener::start();
+    let base = with_base_url(
+        &std::fs::read_to_string(BF_SEQ).unwrap(),
+        &listener.base_url(),
+    );
+    let burst_base = with_base_url(
+        &std::fs::read_to_string(BF_BURST).unwrap(),
+        &listener.base_url(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "window_ms in sequential",
+            base.replacen(
+                "\"interval_ms\": 100,",
+                "\"interval_ms\": 100, \"window_ms\": 1000,",
+                1,
+            ),
+            "brute_force.window_ms",
+        ),
+        (
+            "interval_ms in burst",
+            burst_base.replacen(
+                "\"attempts\": 8,",
+                "\"attempts\": 8, \"interval_ms\": 100,",
+                1,
+            ),
+            "brute_force.interval_ms",
+        ),
+        (
+            "burst attempts 1",
+            burst_base.replace("\"attempts\": 8,", "\"attempts\": 1,"),
+            "brute_force.attempts",
+        ),
+        (
+            "burst attempts 33",
+            burst_base.replace("\"attempts\": 8,", "\"attempts\": 33,"),
+            "brute_force.attempts",
+        ),
+        (
+            "unknown mode value",
+            burst_base.replace("\"mode\": \"burst\"", "\"mode\": \"parallel\""),
+            "expected `sequential` or `burst`",
+        ),
+    ];
+    assert_ne!(cases[0].1, base, "window_ms case: pattern not replaced");
+    assert_ne!(
+        cases[1].1, burst_base,
+        "interval_ms case: pattern not replaced"
+    );
+
+    for (name, text, needle) in cases {
+        let r = validate(&write_cfg(&dir, &text), &BF_ENV);
+        assert_eq!(r.code, 2, "case {name}: stderr {}", r.stderr);
+        assert!(
+            r.stderr.contains(needle),
+            "case {name}: stderr {} (want {needle})",
+            r.stderr
+        );
+        assert!(r.stdout.is_empty(), "case {name}: stdout {}", r.stdout);
+        for (_, v) in BF_ENV {
+            if v.contains('-') {
+                assert!(
+                    !r.stderr.contains(v),
+                    "case {name}: value leaked: {}",
+                    r.stderr
+                );
+            }
+        }
+    }
+    assert_eq!(
+        listener.finish(),
+        0,
+        "a rejected burst config opened a connection"
+    );
+}
+
 // S9 carry-over (c): known limitation, see S9 carry-over. A placeholder in a `query` key or
 // a json body object key is silently kept as a literal. This pins CURRENT behavior only;
 // it is not the desired behavior.
