@@ -287,3 +287,11 @@ Detail dan slice: `.claude/work/Q4-plan.md`. AC `P1-AC33`–`AC46` (seri P1 dipa
 - `peer_ip` adalah field pertama yang mengungkap identitas jaringan target di report (sampai kini sengaja tanpa URL/host, PLAN §10); disengaja per keputusan ini, dibatasi ke evidence brute_force, wajib ada redaction test.
 - Fixture: satu rute baru `POST /per-ip/login` (limiter per-IP berbasis hitungan, deterministik untuk sequential dan burst) membuktikan baris PASS; FAIL dan INCONCLUSIVE dibuktikan dengan rute yang sudah ada (`/broken/login/unprotected`, pola port tertutup `r18`) — bukan tiga rute baru.
 - Catatan operasional: `localhost` pada config bisa diterjemahkan jaringan sebagai IPv6 (`::1`); test fixture memakai `127.0.0.1` eksplisit agar famili deterministik `v4`.
+
+## 2026-10-14 — Penutupan checkpoint P4 (P4-AC7)
+
+Terdampak: PLAN §11 (P4 butir 7), §14.
+
+- Pengguna mengonfirmasi P4-AC7 selesai dan bekerja dengan baik. Checkpoint P4 ditutup. Bukti: `docs/real-api/2026-10-14.md`; baris `P4-AC7` ditambahkan di `docs/ac-trace.md`.
+- Tidak ada perubahan kontrak, reason code, atau `report_version`.
+- Report run nyata (`examples/results/`) dan config-nya (`examples/{api,fail,ninja}-checks.json`, `examples/mustex-*.json`) masih untracked. Config bisa berisi detail target; keputusan commit atau `.gitignore` menunggu pengguna.

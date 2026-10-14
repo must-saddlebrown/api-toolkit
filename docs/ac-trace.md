@@ -154,8 +154,7 @@ Satu baris per acceptance criterion. Kolom Bukti berisi nama test persis seperti
 | P4-AC5d | cli::tests::run_check_full_report_write_failure_is_2_with_marker_and_old_file, cli::tests::run_check_full_cancel_and_report_write_failure_is_130_with_marker | Gagal tulis: exit 2 (130 bila cancel) dan penanda `report NOT WRITTEN`. |
 | P4-AC8 | cli::tests::check_help_has_required_phrases, report::tests::exit_code_partial_table, healthy_run_is_exit_2_with_pass_line_and_partial_report, race_healthy_is_pass_line_exit_2_partial_report, load_healthy_is_pass_line_exit_2_partial_report_and_101_requests | `--only` tetap parsial dan tidak pernah exit 0. |
 | P4-AC9 | healthy_suite_is_exit_0_three_pass_in_order, broken_example_suite_is_exit_1_three_fail | `cargo test --test fixture_proof`: healthy exit 0, varian rusak exit 1. Pencantuman perintah di README dan CLAUDE.md tidak diuji. |
-| P4-AC6a | manual:README.md | README: setup state/akun, secret env, threshold, command, verdict/exit code, `--only` (bagian "Setup state dan akun", "Satu command", "Verdict, reason, dan exit code", "`--only`") |
-| P4-AC6b | manual:README.md | README bagian "Menjalankan terhadap API nyata" dan "Setup state dan akun": input pengguna dan peringatan efek samping |
+| P4-AC6a | manual:README.md | README: setup state/akun, secret env, threshold, command, verdict/exit code, `--only` (bagian "State and accounts the target needs", "One command", "Verdicts, reasons, and exit codes", "`--only`"; README kini berbahasa Inggris atas permintaan pengguna) |
+| P4-AC6b | manual:README.md | README bagian "Running against a real API" dan "State and accounts the target needs": input pengguna dan peringatan efek samping |
 | P4-AC10 | manual:docs/evidence/quality-gate.md | Gate kualitas, tanpa dependency baru, tanpa request ke 8080/eksternal dari test |
-
-**P4-AC7 terbuka.** Run terhadap API nyata, dengan report dan baseline yang sah, belum dilakukan karena pengguna belum memberikan target dan config. Belum ada laporan di `docs/real-api/`, jadi AC ini sengaja tidak dimasukkan ke tabel. Barisnya ditambahkan dengan bukti `manual:docs/real-api/<tanggal>.md` setelah run nyata selesai dan ditinjau pengguna.
+| P4-AC7 | manual:docs/real-api/2026-10-14.md | Run terhadap API nyata; pengguna mengonfirmasi selesai dan bekerja baik (2026-10-14). Report di `examples/results/`. |

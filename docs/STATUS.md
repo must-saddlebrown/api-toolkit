@@ -8,14 +8,14 @@ Rencana aktif: `docs/PLAN.md` (Small Core Proof, 9 Oktober 2026). Keputusan sete
 | P1 | Login brute-force protection check | selesai (10 Oktober 2026) | Phase gate PASS; 18 dari 18 AC terpenuhi; 185 test hijau |
 | P2 | Write-once race check | selesai (10 Oktober 2026) | Phase gate PASS; 25 dari 25 AC terpenuhi; 303 test hijau |
 | P3 | Parallel load check | selesai (10 Oktober 2026) | Phase gate PASS; 26 dari 26 AC terpenuhi; 393 test hijau |
-| P4 | Single-command proof + satu API nyata | menunggu review pengguna (10 Oktober 2026) | Phase gate PASS; fixture proof selesai (suite lengkap `check` tanpa `--only`, 416 test hijau); P4-AC7 validasi target nyata belum dilakukan |
+| P4 | Single-command proof + satu API nyata | selesai (14 Oktober 2026) | Phase gate PASS (10 Oktober); fixture proof selesai (416 test hijau); P4-AC7 dikonfirmasi pengguna 14 Oktober 2026, bukti `docs/real-api/2026-10-14.md` |
 | Q2 | Batas ERROR/INCONCLUSIVE race (verifier before) | selesai (S1–S5, gate reviewer PASS, mutasi 0 lolos) | AC P2-AC26–34 (9 baris) di `docs/ac-trace.md`; mutasi race.rs + report.rs: 110 mutan, 101 tertangkap, 9 unviable, 0 lolos |
 | Q3 | Mode burst brute_force (`window_ms`, `evaluate_burst`, `run_burst_with`) | selesai (S1–S6, gate reviewer PASS, mutasi 0 lolos) | AC P1-AC19–32 (14 baris) di `docs/ac-trace.md`; `verify.sh fast` exit 0; mutasi 277 mutan/253 tertangkap/24 unviable/0 lolos |
 | Q4 | Mode baseline brute_force (`baseline = "require_success"\|"none"`, `evaluate_none`, peer IP) | S1–S8 dikerjakan (implementer S1–S6, tester S7, dokumen S8); **gate reviewer PASS 2026-10-14** | AC P1-AC33–46 (14 baris) di `docs/ac-trace.md`; `verify.sh fast` exit 0; mutasi 288 (265 caught, 2 missed non-blocking di `config.rs` plumbing pra-Q4, 21 unviable) |
 
 ## Fase aktif
 
-P4: **menunggu review pengguna** (checkpoint). P0–P3 selesai. Fixture proof end to end selesai; validasi target nyata belum dilakukan dan menunggu config dari pengguna (lihat "Validasi API nyata").
+P0–P4 selesai. Checkpoint P4 ditutup pengguna pada 14 Oktober 2026 (P4-AC7 terkonfirmasi, lihat "Validasi API nyata"). Tidak ada pekerjaan fase yang tersisa; yang terbuka hanya keputusan pengguna (lihat DECISIONS 2026-10-14 "Penutupan checkpoint P4").
 
 Q2: perubahan klasifikasi verifier before di race (DECISIONS 2026-10-14, `docs/findings.md` F-001) sudah dikerjakan; gate reviewer PASS dan mutasi 0 lolos. Tidak mengubah status checkpoint P4.
 
@@ -264,7 +264,7 @@ Verifier tetap `GET /actions/{id}`. Detail rute dan titik sinkronisasi ada di `d
 
 ## Validasi API nyata
 
-**P4-AC7: fixture proof selesai, validasi target nyata belum dilakukan.** Belum ada report dari target nyata; jangan dianggap selesai sebelum pengguna menjalankan satu run nyata dan melaporkan hasilnya.
+**P4-AC7: selesai, dikonfirmasi pengguna 14 Oktober 2026.** Bukti: `docs/real-api/2026-10-14.md` (daftar run dan verdict dari `examples/results/`). Kebutuhan yang muncul dari run nyata sudah ditangani di Q2–Q4. Catatan di bawah dipertahankan sebagai panduan run nyata berikutnya.
 
 Yang harus pengguna sediakan (PLAN §14; detail dan peringatan efek samping di `README.md`, bagian "Menjalankan terhadap API nyata"):
 
@@ -278,7 +278,7 @@ Jangan mengarang target atau kredensial. Brute-force bisa mengunci akun, race me
 
 ## Riwayat review pengguna
 
-Belum ada. Menunggu review checkpoint P4 (fixture proof) dan satu run target nyata.
+- 2026-10-14, P4: P4-AC7 (validasi API nyata) dikonfirmasi selesai dan bekerja dengan baik oleh pengguna. Checkpoint P4 ditutup. Bukti: `docs/real-api/2026-10-14.md`.
 
 ## Riwayat pekerjaan
 
