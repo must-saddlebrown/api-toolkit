@@ -493,6 +493,7 @@ mod tests {
             status,
             elapsed: ms(1),
             body,
+            remote_addr: None,
         })
     }
 

@@ -170,6 +170,8 @@ pub enum ReasonCode {
     AccountAlreadyLocked,
     BaselineFailed,
     ProbeUnclassifiable,
+    EndpointNotConfirmed,
+    ProtectionNotTriggered,
     // race
     SingleSideEffect,
     DuplicateSideEffect,
@@ -195,7 +197,7 @@ pub enum ReasonCode {
 }
 
 impl ReasonCode {
-    pub const ALL: [ReasonCode; 32] = [
+    pub const ALL: [ReasonCode; 34] = [
         ReasonCode::ConfigInvalid,
         ReasonCode::DeadlineExceeded,
         ReasonCode::Cancelled,
@@ -209,6 +211,8 @@ impl ReasonCode {
         ReasonCode::AccountAlreadyLocked,
         ReasonCode::BaselineFailed,
         ReasonCode::ProbeUnclassifiable,
+        ReasonCode::EndpointNotConfirmed,
+        ReasonCode::ProtectionNotTriggered,
         ReasonCode::SingleSideEffect,
         ReasonCode::DuplicateSideEffect,
         ReasonCode::ActionNotExecuted,
@@ -245,6 +249,8 @@ impl ReasonCode {
             ReasonCode::AccountAlreadyLocked => "account_already_locked",
             ReasonCode::BaselineFailed => "baseline_failed",
             ReasonCode::ProbeUnclassifiable => "probe_unclassifiable",
+            ReasonCode::EndpointNotConfirmed => "endpoint_not_confirmed",
+            ReasonCode::ProtectionNotTriggered => "protection_not_triggered",
             ReasonCode::SingleSideEffect => "single_side_effect",
             ReasonCode::DuplicateSideEffect => "duplicate_side_effect",
             ReasonCode::ActionNotExecuted => "action_not_executed",
@@ -321,6 +327,13 @@ pub struct BruteForceEvidence {
     pub protected_tail_count: u32,
     pub first_protected_attempt: Option<u32>,
     pub protected_tail_observed: u32,
+    /// `"require_success"` or `"none"` (DECISIONS 2026-10-14 Q4). Always present; distinct
+    /// from `baseline` below (the baseline attempt's evidence, absent in `none` mode).
+    pub baseline_mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_family: Option<&'static str>,
     pub baseline: Option<AttemptEvidence>,
     pub attempts: Vec<AttemptEvidence>,
 }
@@ -338,6 +351,13 @@ pub struct BurstEvidence {
     pub dispatch_window_ms: Option<u64>,
     pub protected_count: u32,
     pub rejected_count: u32,
+    /// `"require_success"` or `"none"` (DECISIONS 2026-10-14 Q4). Always present; distinct
+    /// from `baseline` below (the baseline attempt's evidence, absent in `none` mode).
+    pub baseline_mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_family: Option<&'static str>,
     pub baseline: Option<AttemptEvidence>,
     /// Numbered 1..=N by dispatch index, not by finish order.
     pub attempts: Vec<AttemptEvidence>,
@@ -721,6 +741,8 @@ mod tests {
             ReasonCode::AccountAlreadyLocked => "account_already_locked",
             ReasonCode::BaselineFailed => "baseline_failed",
             ReasonCode::ProbeUnclassifiable => "probe_unclassifiable",
+            ReasonCode::EndpointNotConfirmed => "endpoint_not_confirmed",
+            ReasonCode::ProtectionNotTriggered => "protection_not_triggered",
             ReasonCode::SingleSideEffect => "single_side_effect",
             ReasonCode::DuplicateSideEffect => "duplicate_side_effect",
             ReasonCode::ActionNotExecuted => "action_not_executed",
@@ -787,7 +809,7 @@ mod tests {
             assert_eq!(v.as_str(), scope_literal(v));
             assert_eq!(json_of(&v), format!("\"{}\"", scope_literal(v)));
         }
-        assert_eq!(ReasonCode::ALL.len(), 32);
+        assert_eq!(ReasonCode::ALL.len(), 34);
         for v in ReasonCode::ALL {
             assert_eq!(v.as_str(), reason_literal(v));
             assert_eq!(json_of(&v), format!("\"{}\"", reason_literal(v)));
@@ -904,6 +926,9 @@ mod tests {
                 protected_tail_count: 2,
                 first_protected_attempt: None,
                 protected_tail_observed: 0,
+                baseline_mode: "require_success",
+                peer_ip: None,
+                peer_family: None,
                 baseline: Some(attempt(0, Outcome::Success, Some(200), None, 0, 12)),
                 attempts: vec![
                     attempt(1, Outcome::NormalRejection, Some(401), None, 12, 8),
@@ -938,6 +963,7 @@ mod tests {
     "protected_tail_count": 2,
     "first_protected_attempt": null,
     "protected_tail_observed": 0,
+    "baseline_mode": "require_success",
     "baseline": {
       "attempt": 0,
       "outcome": "success",
@@ -995,6 +1021,9 @@ mod tests {
                 dispatch_window_ms: Some(1),
                 protected_count: 3,
                 rejected_count: 5,
+                baseline_mode: "require_success",
+                peer_ip: None,
+                peer_family: None,
                 baseline: Some(attempt(0, Outcome::Success, Some(200), 0)),
                 attempts: vec![
                     attempt(1, Outcome::NormalRejection, Some(401), 0),
@@ -1017,6 +1046,7 @@ mod tests {
     "dispatch_window_ms": 1,
     "protected_count": 3,
     "rejected_count": 5,
+    "baseline_mode": "require_success",
     "baseline": {
       "attempt": 0,
       "outcome": "success",
@@ -1055,6 +1085,72 @@ mod tests {
             ..check
         };
         assert_eq!(exit_code(&with), exit_code(&without));
+    }
+
+    /// `baseline = none` (DECISIONS 2026-10-14 Q4): no baseline attempt, `baseline_mode`
+    /// `"none"`, peer IP/family present.
+    #[test]
+    fn evidence_baseline_none_json_matches_golden() {
+        let attempt = |n, outcome, status, offset_ms| AttemptEvidence {
+            attempt: n,
+            outcome,
+            status,
+            error: None,
+            offset_ms,
+            elapsed_ms: 5,
+        };
+        let check = CheckResult {
+            check: CheckName::BruteForce,
+            verdict: Verdict::Fail,
+            reasons: vec![ReasonCode::ProtectionNotTriggered],
+            completion: Completion::Complete,
+            evidence: Some(Evidence::BruteForce(BruteForceEvidence {
+                attempts_planned: 8,
+                attempts_dispatched: 8,
+                interval_ms: 100,
+                protect_by_attempt: 6,
+                protected_tail_count: 2,
+                first_protected_attempt: None,
+                protected_tail_observed: 0,
+                baseline_mode: "none",
+                peer_ip: Some("127.0.0.1".to_string()),
+                peer_family: Some("v4"),
+                baseline: None,
+                attempts: vec![attempt(1, Outcome::NormalRejection, Some(401), 0)],
+            })),
+        };
+        let golden = r#"{
+  "check": "brute_force",
+  "verdict": "fail",
+  "reasons": [
+    "protection_not_triggered"
+  ],
+  "completion": "complete",
+  "evidence": {
+    "attempts_planned": 8,
+    "attempts_dispatched": 8,
+    "interval_ms": 100,
+    "protect_by_attempt": 6,
+    "protected_tail_count": 2,
+    "first_protected_attempt": null,
+    "protected_tail_observed": 0,
+    "baseline_mode": "none",
+    "peer_ip": "127.0.0.1",
+    "peer_family": "v4",
+    "baseline": null,
+    "attempts": [
+      {
+        "attempt": 1,
+        "outcome": "normal_rejection",
+        "status": 401,
+        "error": null,
+        "offset_ms": 0,
+        "elapsed_ms": 5
+      }
+    ]
+  }
+}"#;
+        assert_eq!(serde_json::to_string_pretty(&check).unwrap(), golden);
     }
 
     #[test]
@@ -1477,6 +1573,50 @@ mod tests {
             only.scope = Scope::Partial;
             assert_eq!(exit_code(&only), 2, "{reason:?}");
         }
+    }
+
+    /// Q4 reasons: `endpoint_not_confirmed` (inconclusive) is always 2; `protection_not_triggered`
+    /// (fail) follows the normal fail precedence (1 full, 1 with a conclusive sibling partial).
+    #[test]
+    fn exit_code_q4_baseline_none_reasons() {
+        use CheckName::*;
+        use Completion::{Complete, Incomplete};
+        use Verdict::*;
+        let excl: &[ReasonCode] = &[ReasonCode::ExcludedByOnly];
+        let endpoint: &[ReasonCode] = &[ReasonCode::EndpointNotConfirmed];
+        let not_triggered: &[ReasonCode] = &[ReasonCode::ProtectionNotTriggered];
+
+        // endpoint_not_confirmed: full -> 2
+        let full_inconclusive = report_with(&[
+            (BruteForce, Inconclusive, Complete, endpoint),
+            (Race, Pass, Complete, &[ReasonCode::SingleSideEffect]),
+            (Load, Pass, Complete, &[ReasonCode::ThresholdsMet]),
+        ]);
+        assert_eq!(exit_code(&full_inconclusive), 2);
+        // endpoint_not_confirmed: partial -> 2
+        let mut partial_inconclusive = report_with(&[
+            (BruteForce, Inconclusive, Complete, endpoint),
+            (Race, NotRun, Incomplete, excl),
+            (Load, NotRun, Incomplete, excl),
+        ]);
+        partial_inconclusive.scope = Scope::Partial;
+        assert_eq!(exit_code(&partial_inconclusive), 2);
+
+        // protection_not_triggered: full, complete fail -> 1
+        let full_fail = report_with(&[
+            (BruteForce, Fail, Complete, not_triggered),
+            (Race, Pass, Complete, &[ReasonCode::SingleSideEffect]),
+            (Load, Pass, Complete, &[ReasonCode::ThresholdsMet]),
+        ]);
+        assert_eq!(exit_code(&full_fail), 1);
+        // protection_not_triggered: partial, complete fail -> 1
+        let mut partial_fail = report_with(&[
+            (BruteForce, Fail, Complete, not_triggered),
+            (Race, NotRun, Incomplete, excl),
+            (Load, NotRun, Incomplete, excl),
+        ]);
+        partial_fail.scope = Scope::Partial;
+        assert_eq!(exit_code(&partial_fail), 1);
     }
 
     #[test]

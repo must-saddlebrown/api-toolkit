@@ -17,7 +17,7 @@ info:
 
     | Kelompok | Endpoint | Dipakai check |
     | --- | --- | --- |
-    | Login | `/login` (sehat), `/broken/login/*` (sengaja rusak), `/windowed/login` (limiter waktu, mode burst) | brute force |
+    | Login | `/login` (sehat), `/broken/login/*` (sengaja rusak), `/windowed/login` (limiter waktu, mode burst), `/per-ip/login` (limiter hitungan per-IP, baseline = "none") | brute force |
     | Aksi write-once | `/actions/{id}/apply` (sehat), `/broken/actions/{id}/apply-racy` (sengaja rusak), `/idempotent/actions/{id}/apply` (sehat, idempotent), `/actions/{id}` (verifier) | race (P2) |
     | Beban | `/critical` (sehat), `/broken/critical/{slow,flaky,hang}` (sengaja rusak) | load (P3) |
     | Alat dev | `/__admin/reset`, `/__admin/stats` | dipakai test dan pengguna, tidak oleh check |
@@ -169,6 +169,35 @@ paths:
           $ref: '#/components/responses/Token'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyAttempts'
+  /per-ip/login:
+    post:
+      tags: [broken-login]
+      operationId: perIpLogin
+      summary: Login dengan limiter berbasis hitungan per IP peer (Q4, baseline = "none")
+      description: |
+        Limiter berbasis HITUNGAN per IP peer (konstanta `PER_IP_LIMIT` = 5), deterministik untuk
+        sequential MAUPUN burst (beda dari `/windowed/login` yang berbasis waktu dan hanya terpicu
+        burst). Dipakai untuk membuktikan baris PASS `brute_force.baseline = "none"`.
+
+        - Kredensial benar: selalu `200` dengan token, **tidak** memengaruhi hitungan per-IP (jalur
+          ini ada untuk kelengkapan; config `baseline = "none"` tidak pernah mengirimnya).
+        - Kredensial salah: lock dipegang selama baca + tambah (atomik di bawah konkurensi). Bila
+          hitungan IP itu sudah `>= 5`: `429 too_many_attempts`; selain itu hitungan ditambah lalu
+          dicek lagi, `>= 5` jadi `429`, kalau tidak `401 invalid_credentials`.
+        - Delapan probe dari IP yang sama: probe ke-1 sampai ke-4 `401`, probe ke-5 sampai ke-8 `429`
+          (P=4, N=8) — sama hasilnya untuk sequential maupun burst.
+        - Body rusak: `400 bad_request`, dihitung di `login_requests`, tidak menambah hitungan.
+      requestBody:
+        $ref: '#/components/requestBodies/Login'
+      responses:
+        '200':
+          $ref: '#/components/responses/Token'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/InvalidCredentials'
         '429':
           $ref: '#/components/responses/TooManyAttempts'
   /actions/{id}/apply:

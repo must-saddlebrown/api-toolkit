@@ -8,14 +8,14 @@
 #![allow(dead_code)] // each user (tests, example) only uses part of this module
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
     routing::{get, post},
@@ -52,6 +52,9 @@ const RACY_GATE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const WINDOW: Duration = Duration::from_millis(300);
 /// Windowed login: >= this many failed logins inside `WINDOW` trips 429.
 pub const WINDOW_LIMIT: usize = 5;
+/// Per-IP login (Q4, `baseline = "none"`): >= this many failed logins from the same peer
+/// IP trips 429. Count-based (not timing), so it is deterministic for sequential AND burst.
+pub const PER_IP_LIMIT: u32 = 5;
 
 #[derive(Default)]
 struct FixtureState {
@@ -70,6 +73,8 @@ struct FixtureState {
     racy_seen_zero: HashMap<String, watch::Sender<u32>>,
     /// Windowed login (Q3, burst): timestamp of every failed login, oldest first.
     windowed_failed_logins: Vec<Instant>,
+    /// Per-IP login (Q4): failed-login count per peer IP.
+    per_ip_failures: HashMap<IpAddr, u32>,
 }
 
 type Shared = Arc<Mutex<FixtureState>>;
@@ -95,12 +100,15 @@ impl Fixture {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let app = router(Arc::new(Mutex::new(FixtureState::default())));
         let task = tokio::spawn(async move {
-            // Server errors after bind have nowhere useful to go in a dev tool.
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await;
+            // `with_connect_info`: `/per-ip/login` (Q4) needs the real peer IP.
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
         });
         Ok(RunningFixture {
             addr,
@@ -128,6 +136,7 @@ fn router(state: Shared) -> Router {
         .route("/broken/login/unprotected", post(login_unprotected))
         .route("/broken/login/accepts-invalid", post(login_accepts_invalid))
         .route("/windowed/login", post(windowed_login))
+        .route("/per-ip/login", post(per_ip_login))
         .route(
             "/broken/login/always-protected",
             post(login_always_protected),
@@ -304,6 +313,44 @@ async fn windowed_login(State(state): State<Shared>, raw: Bytes) -> Reply {
     }
     s.windowed_failed_logins.push(now);
     invalid_credentials()
+}
+
+/// Per-IP login (Q4, `baseline = "none"`): count-based limiter keyed by peer IP, so it
+/// is deterministic for both sequential and burst probing (unlike `/windowed/login`,
+/// which is time-based and only reachable by a burst). Valid credentials always succeed
+/// and never affect the per-IP counter (that path exists for completeness; `baseline =
+/// "none"` configs never send it). The lock is held across read + increment, so a burst
+/// of concurrent probes from the same IP is atomic: exactly `PER_IP_LIMIT` failures ->
+/// 429 from then on, never off-by-one under concurrency.
+async fn per_ip_login(
+    State(state): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    raw: Bytes,
+) -> Reply {
+    let body = match count_and_parse_login(&state, &raw) {
+        Ok(body) => body,
+        Err(rejection) => return rejection,
+    };
+    if body.username == LOGIN_USER && body.password == LOGIN_VALID_PASSWORD {
+        return token_reply();
+    }
+    let mut s = lock(&state);
+    let n = s.per_ip_failures.entry(addr.ip()).or_insert(0);
+    if *n >= PER_IP_LIMIT {
+        return reply(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error": "too_many_attempts"}),
+        );
+    }
+    *n += 1;
+    if *n >= PER_IP_LIMIT {
+        reply(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error": "too_many_attempts"}),
+        )
+    } else {
+        invalid_credentials()
+    }
 }
 
 async fn apply(State(state): State<Shared>, Path(id): Path<String>, headers: HeaderMap) -> Reply {

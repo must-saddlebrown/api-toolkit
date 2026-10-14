@@ -87,7 +87,7 @@ async fn run_cfg(cfg: &Value) -> CheckResult {
     run(
         &transport,
         parsed.brute_force.as_ref().unwrap(),
-        &bf_reqs.baseline,
+        bf_reqs.baseline.as_ref(),
         &bf_reqs.probe,
         rx,
     )
@@ -823,4 +823,193 @@ fn b31_core_example_configs_still_sequential_and_validate_same() {
         assert_eq!(budget.requests, want_requests, "{path}");
         assert_eq!(budget.fixed_wait_ms, want_wait_ms, "{path}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Q4-S7: `baseline = "none"` against the real fixture. `/per-ip/login` is the
+// count-based per-IP route (docs/fixture.md); `interval_ms: 10` keeps the sequential
+// cases fast (counts, not timing, decide the per-IP limiter outcome).
+// ---------------------------------------------------------------------------
+
+/// `base_config` with `brute_force` replaced by a `baseline: "none"` section (no
+/// `baseline_request` at all, mirrors `examples/brute-force-baseline-none.json`,
+/// parameterised by `path`). Keeps `race`/`load` so `Selection::All` validate/resolve
+/// still accept it, same as every other test in this file.
+fn none_config(url: &str, path: &str) -> Value {
+    let mut cfg = base_config(url);
+    cfg["brute_force"] = json!({
+        "baseline": "none",
+        "probe_request": {"method": "POST", "path": path,
+            "json": {"username": "${ENV:LOGIN_USER}", "password": "${ENV:LOGIN_INVALID_PASSWORD}"}},
+        "success_match": {"status_in": [200], "json_exists": ["/access_token"]},
+        "rejection_match": {"status_in": [401]},
+        "protection_match": {"status_in": [429]},
+        "attempts": 8, "interval_ms": 10, "protect_by_attempt": 6, "protected_tail_count": 2
+    });
+    cfg
+}
+
+/// `none_config` turned into burst (same shape as `burst_config`, minus `baseline_request`).
+fn none_burst_config(url: &str, path: &str, attempts: u32, window_ms: u64) -> Value {
+    let mut cfg = none_config(url, path);
+    let bf = cfg["brute_force"].as_object_mut().unwrap();
+    bf.remove("interval_ms");
+    bf.remove("protect_by_attempt");
+    bf.remove("protected_tail_count");
+    bf.insert("mode".into(), json!("burst"));
+    bf.insert("window_ms".into(), json!(window_ms));
+    bf.insert("attempts".into(), json!(attempts));
+    cfg
+}
+
+/// P1-AC36, AC42, AC44, AC45: `/per-ip/login` (count-based, `PER_IP_LIMIT = 5`, see
+/// `docs/fixture.md`): 8 probes from one peer give 401,401,401,401,429,429,429,429 ->
+/// first_protected=5, tail=4, both within protect_by=6/tail_count=2 -> PASS. No baseline
+/// request is ever sent (`login_requests == attempts`, not `1 + attempts`); `peer_ip`/
+/// `peer_family` are populated for `127.0.0.1` (`"v4"`, docs/fixture.md operational note).
+#[tokio::test(flavor = "multi_thread")]
+async fn q1_none_seq_per_ip_pass_with_peer_ip() {
+    let fx = Fixture::start(0).await.unwrap();
+    let (c, url) = (client(), fx.base_url());
+    let cfg = none_config(&url, "/per-ip/login");
+    let r = run_cfg(&cfg).await;
+    assert_verdict(&r, Verdict::Pass, &[ReasonCode::ProtectionObserved]);
+    let e = evidence(&r);
+    assert_eq!(e.baseline_mode, "none");
+    assert!(e.baseline.is_none());
+    assert_eq!(e.first_protected_attempt, Some(5));
+    assert_eq!(e.protected_tail_observed, 4);
+    assert_eq!(e.peer_ip.as_deref(), Some("127.0.0.1"));
+    assert_eq!(e.peer_family, Some("v4"));
+    assert_eq!(login_requests(&c, &url).await, 8, "no baseline request");
+    fx.shutdown().await;
+}
+
+/// P1-AC36/AC40, AC44: same route, burst mode. The per-IP limiter is count-based, so the
+/// concurrent dispatch still gives exactly 4 rejected + 4 protected (order-independent) ->
+/// `1 <= P <= N-1` -> PASS.
+#[tokio::test(flavor = "multi_thread")]
+async fn q2_none_burst_per_ip_pass_with_peer_ip() {
+    let fx = Fixture::start(0).await.unwrap();
+    let (c, url) = (client(), fx.base_url());
+    let cfg = none_burst_config(&url, "/per-ip/login", 8, 1000);
+    let r = run_cfg(&cfg).await;
+    assert_verdict(&r, Verdict::Pass, &[ReasonCode::ProtectionObserved]);
+    let e = burst_evidence(&r);
+    assert_eq!(e.baseline_mode, "none");
+    assert!(e.baseline.is_none());
+    assert_eq!(e.protected_count, 4);
+    assert_eq!(e.rejected_count, 4);
+    assert_eq!(e.peer_ip.as_deref(), Some("127.0.0.1"));
+    assert_eq!(e.peer_family, Some("v4"));
+    assert_eq!(login_requests(&c, &url).await, 8, "no baseline request");
+    fx.shutdown().await;
+}
+
+/// P1-AC37: `/broken/login/unprotected` always answers 401 -> the sequential oracle (step
+/// 6/7) is never satisfied -> FAIL `protection_not_triggered`, not `protection_policy_not_met`
+/// (that reason is require_success-only). The caveat text ("not triggered at the configured
+/// volume/window", docs/fixture.md) lives in documentation, not in the report, so it is not
+/// asserted here (nothing to assert against: see handoff for the orchestrator).
+#[tokio::test(flavor = "multi_thread")]
+async fn q3_none_seq_unprotected_is_fail_protection_not_triggered() {
+    let fx = Fixture::start(0).await.unwrap();
+    let (c, url) = (client(), fx.base_url());
+    let cfg = none_config(&url, "/broken/login/unprotected");
+    let r = run_cfg(&cfg).await;
+    assert_verdict(&r, Verdict::Fail, &[ReasonCode::ProtectionNotTriggered]);
+    assert_eq!(evidence(&r).first_protected_attempt, None);
+    assert_eq!(login_requests(&c, &url).await, 8, "no baseline request");
+    fx.shutdown().await;
+}
+
+/// P1-AC37/AC40: the same unprotected route in burst mode: `P == 0` -> FAIL
+/// `protection_not_triggered`.
+#[tokio::test(flavor = "multi_thread")]
+async fn q4_none_burst_unprotected_is_fail_protection_not_triggered() {
+    let fx = Fixture::start(0).await.unwrap();
+    let url = fx.base_url();
+    let cfg = none_burst_config(&url, "/broken/login/unprotected", 8, 1000);
+    let r = run_cfg(&cfg).await;
+    assert_verdict(&r, Verdict::Fail, &[ReasonCode::ProtectionNotTriggered]);
+    let e = burst_evidence(&r);
+    assert_eq!(e.protected_count, 0);
+    fx.shutdown().await;
+}
+
+/// P1-AC38, AC45: closed port (bind-then-drop, same pattern as `m7`/race `r18`/V1): every
+/// probe is a transport error, none classifiable, no overlap -> INCONCLUSIVE
+/// `endpoint_not_confirmed`, never ERROR/FAIL/PASS. With `baseline = "none"` there is no
+/// baseline step to fail first, so all 8 probes are attempted and recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn q5_none_seq_closed_port_is_inconclusive_endpoint_not_confirmed() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg = none_config(&format!("http://127.0.0.1:{port}"), "/per-ip/login");
+    let r = run_cfg(&cfg).await;
+    assert_verdict(
+        &r,
+        Verdict::Inconclusive,
+        &[ReasonCode::EndpointNotConfirmed],
+    );
+    let e = evidence(&r);
+    assert!(e.baseline.is_none());
+    assert_eq!(e.attempts.len(), 8);
+    assert!(
+        e.attempts
+            .iter()
+            .all(|a| a.outcome == Outcome::TransportError),
+        "{:?}",
+        e.attempts
+    );
+}
+
+/// P1-AC44: redaction risk flagged by the plan (`peer_ip` is the first field that
+/// deliberately reveals target network identity). Positive control: the bare IP really is
+/// in the report. Negative control: nothing else new leaks through this path -- no header
+/// name/value, no bearer token, no password, no full URL/scheme (a URL is more than an IP).
+#[tokio::test(flavor = "multi_thread")]
+async fn q6_none_peer_ip_reveals_only_the_ip_not_headers_tokens_or_urls() {
+    let fx = Fixture::start(0).await.unwrap();
+    let mut cfg = none_config(&fx.base_url(), "/per-ip/login");
+    cfg["brute_force"]["probe_request"]["headers"] = json!({"X-Sentinel": "${ENV:SENTINEL}"});
+    let r = run_cfg(&cfg).await;
+    assert_eq!(r.verdict, Verdict::Pass, "{}", console_line(&r));
+    let e = evidence(&r);
+    assert_eq!(e.peer_ip.as_deref(), Some("127.0.0.1"));
+    assert_eq!(e.peer_family, Some("v4"));
+    assert_no_leak(
+        &r,
+        &[
+            SENTINEL,
+            ACCESS_TOKEN,
+            LOGIN_VALID_PASSWORD,
+            LOGIN_INVALID_PASSWORD,
+            TEST_AUTHORIZATION,
+            "http://", // no URL/scheme anywhere: only the bare IP is meant to appear
+            "X-Sentinel",
+            "x-sentinel",
+        ],
+    );
+    // Positive control for the field this test is actually about: the bare IP is present.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("report.json");
+    let t = OffsetDateTime::UNIX_EPOCH;
+    let report = Report::new(
+        "run-1".into(),
+        "hash".into(),
+        t,
+        t,
+        r.completion,
+        Scope::Full,
+        vec![r.clone()],
+    )
+    .unwrap();
+    write_report_atomic(&path, &report).unwrap();
+    let file = std::fs::read_to_string(&path).unwrap();
+    assert!(file.contains("\"peer_ip\": \"127.0.0.1\""), "{file}");
+    assert!(file.contains("\"peer_family\": \"v4\""), "{file}");
+    fx.shutdown().await;
 }

@@ -36,6 +36,7 @@ Jika memakai `--port` selain 8080, ubah `base_url` di salinan config.
 | `POST /broken/login/accepts-invalid` | Varian broken: username `demo` dengan password apa pun dijawab 200 token (kredensial salah diterima). Username lain 401. Body rusak 400. |
 | `POST /windowed/login` | Limiter berbasis waktu sungguhan (Q3, mode burst). Konstanta `WINDOW` = 300 ms, `WINDOW_LIMIT` = 5. Setiap login salah mencatat timestamp (`Instant`); dihitung ulang tiap request berapa timestamp yang masih dalam 300 ms terakhir (entri lebih tua dibuang). Login salah: jika sudah ada >= 5 kegagalan dalam jendela, 429 (timestamp baru TIDAK ditambah); selain itu 401 dan timestamp ditambah. Login benar: 200 token bila kegagalan dalam jendela < 5, selain itu 429 (tidak mereset kegagalan, sama seperti `/login`). Body rusak 400. Desain disengaja: sequential dengan `interval_ms >= 150` menjamin paling banyak 2-3 kegagalan per jendela 300 ms (jauh di bawah 5) sehingga TIDAK PERNAH 429 — mereproduksi Finding B (FAIL `protection_policy_not_met`, deterministik, bukan ketidakpastian). Burst 8 probe yang dikirim serentak (beberapa ms): probe ke-1 sampai ke-5 masih dalam jendela yang sama dan 401, probe ke-6 sampai ke-8 melihat 5 kegagalan tercatat dan 429 (PASS `protection_observed`, P=3, N=8). Mesin yang sangat lambat hanya bisa membuat burst tidak terkumpul dalam jendela (hasil check INCONCLUSIVE/FAIL di `dispatch_skew_exceeded`), tidak pernah PASS keliru. |
 | `POST /broken/login/always-protected` | Varian broken (Q3, baris burst `P == N`): kredensial benar 200 token; kredensial salah SELALU 429, sejak probe pertama, tanpa state. Membuktikan INCONCLUSIVE `account_already_locked` (tidak bisa dibedakan dari akun yang sudah terkunci). Body rusak 400. |
+| `POST /per-ip/login` | Limiter BERBASIS HITUNGAN per IP peer (Q4, `brute_force.baseline = "none"`), deterministik untuk sequential MAUPUN burst (beda dari `/windowed/login` yang berbasis waktu dan hanya terpicu oleh burst). Kredensial benar: selalu 200 token, TIDAK memengaruhi hitungan per-IP (jalur ini ada untuk kelengkapan; config `baseline = "none"` tidak pernah mengirimnya). Kredensial salah: dengan lock dipegang selama baca + tambah (atomik di bawah konkurensi) — bila hitungan IP itu sudah >= `PER_IP_LIMIT` = 5: 429; selain itu hitungan ditambah lalu dicek lagi: >= 5 jadi 429, kalau tidak 401. Dengan 8 probe dari IP yang sama: probe 1-4 → 401, probe 5-8 → 429 (P=4, N=8), deterministik untuk sequential dan burst. Body rusak 400. |
 | `GET /__admin/stats` | Alat dev. 200 `{"login_requests", "load_requests", "action_requests", "verify_requests"}` (semua angka). `login_requests` menghitung setiap POST yang sampai ke handler kelima rute login (termasuk body rusak 400; method selain POST dan body di atas batas default axum tidak dihitung); `load_requests` menghitung setiap `GET` ke empat rute load (`/critical`, `/broken/critical/slow`, `/broken/critical/flaky`, `/broken/critical/hang`), termasuk yang 401; `action_requests` menghitung setiap POST ke tiga rute apply (`/actions/{id}/apply`, `/broken/actions/{id}/apply-racy`, `/idempotent/actions/{id}/apply`), termasuk yang 401; `verify_requests` menghitung setiap `GET /actions/{id}` dan keempat rute `verify-*` di bawah `/broken/actions/{id}/`, termasuk 401. Request stats sendiri tidak dihitung. |
 | `POST /actions/{id}/apply` | Wajib `Authorization` = `Bearer fixture-token`, jika tidak 401. Apply pertama untuk id itu: 200 dan `execution_count` jadi 1. Selanjutnya 409 tanpa menambah counter. Keputusan atomik (lock dipegang selama cek + tambah), jadi N request bersamaan menghasilkan tepat satu 200. |
 | `POST /broken/actions/{id}/apply-racy` | Varian broken (check-then-act) dengan titik sinkronisasi eksplisit. Auth seperti healthy (tanpa header: 401). Bila counter id sudah > 0: 409. Bila counter 0: request mendaftar di gerbang (`tokio::sync::watch` per id) dan menunggu sampai minimal 2 request telah membaca 0 (maks 2 detik), baru menaikkan counter dan menjawab 200 `{"applied": true}`. Client yang benar-benar konkuren: minimal 2 kali 200 dan `execution_count >= 2` secara deterministik (bukan timing keberuntungan). Client sekuensial: gerbang timeout 2 detik, counter tetap 1, sehingga test duplikat MERAH (bukan PASS palsu). Check race harus FAIL `duplicate_side_effect`. |
@@ -49,7 +50,7 @@ Jika memakai `--port` selain 8080, ubah `base_url` di salinan config.
 | `GET /broken/critical/slow` | Varian broken load. Auth seperti `/critical`. Tidur `SLOW_DELAY` = 300 ms lalu 200 `{"ok": true}`. Dengan `max_p95_ms=100`, check load FAIL `latency_exceeded`. |
 | `GET /broken/critical/flaky` | Varian broken load. Auth seperti `/critical`. Bila nomor `load_requests` (setelah increment) kelipatan `FLAKY_EVERY` = 10: 500 `{"error": "flaky"}`, selain itu 200. Preflight adalah request ke-1, jadi 100 request load menghasilkan tepat 10 kegagalan. Berbasis counter, bukan timing. |
 | `GET /broken/critical/hang` | Varian broken load. Auth seperti `/critical`. Bila nomor `load_requests` kelipatan 10: tidur `HANG_DELAY` = 3 detik lalu 200; selain itu 200 cepat. Dengan `request_timeout_ms` di bawah 3 detik request tersebut timeout (dihitung failed). |
-| `POST /__admin/reset` | Alat dev. Mereset hitungan gagal login, daftar timestamp kegagalan `/windowed/login`, semua counter action, state gerbang racy, semua counter load, dan counter `login_requests`, `action_requests`, `verify_requests` ke 0. 200 `{"reset": true}`. |
+| `POST /__admin/reset` | Alat dev. Mereset hitungan gagal login, daftar timestamp kegagalan `/windowed/login`, hitungan per-IP `/per-ip/login`, semua counter action, state gerbang racy, semua counter load, dan counter `login_requests`, `action_requests`, `verify_requests` ke 0. 200 `{"reset": true}`. |
 | rute lain | 404 JSON `{"error": "not_found"}`. |
 
 Respons selalu JSON dengan body tetap (`{"error": ...}` untuk 400/401/404/409/429; stats berisi angka saja); tidak pernah memantulkan data request. Rute login (ketiganya) dengan body rusak atau bertipe salah dijawab `400 {"error":"bad_request"}`.
@@ -93,6 +94,26 @@ echo $?   # PASS parsial: 2
 ```
 
 Peringatan: `/windowed/login` sequential (tanpa `mode` atau `mode: sequential`) pada config sama TIDAK PERNAH terproteksi (FAIL `protection_policy_not_met` deterministik, bukan ketidakpastian mesin) karena `interval_ms` adalah batas bawah jarak dispatch, selalu >= 150 ms pada config contoh, jauh di atas yang dibutuhkan limiter 300 ms/5 untuk terpicu. FAIL sequential pada limiter waktu TIDAK berarti tidak ada proteksi; gunakan burst untuk membedakan.
+
+## Varian `baseline = "none"` untuk brute_force (Q4)
+
+`/per-ip/login` membuktikan baris PASS untuk `brute_force.baseline = "none"`, sequential MAUPUN burst (limiter berbasis hitungan per-IP peer, bukan waktu). Dua baris verdict lain pakai ulang rute yang sudah ada, tanpa rute baru: `/broken/login/unprotected` (selalu 401, P=0) untuk FAIL `protection_not_triggered`, dan port tertutup (bind lalu drop, pola yang sama dengan race V1) untuk INCONCLUSIVE `endpoint_not_confirmed` (tidak ada satu pun respons on-protocol).
+
+Semua request test memakai `127.0.0.1` eksplisit (bukan `localhost`), jadi famili peer deterministik `v4`; `localhost` bisa teratasi ke `::1` di beberapa mesin.
+
+Contoh config terkunci test: `examples/brute-force-baseline-none.json` (`baseline: "none"`, TANPA `baseline_request`, path `/per-ip/login`, sequential, `attempts: 8`, `protect_by_attempt: 6`, `protected_tail_count: 2`, `interval_ms: 100`). `validate --only brute_force` melaporkan 8 request (TANPA `+1` baseline) dan 700 ms fixed wait:
+
+```sh
+cargo run --example fixture -- --port 0   # port acak, alamat dicetak saat start; atau --port 8080
+export LOGIN_USER=demo LOGIN_INVALID_PASSWORD=wrong-pass
+cargo run -- validate --config examples/brute-force-baseline-none.json --only brute_force
+# config OK / planned requests: 8 / fixed waits: 700 ms
+curl -X POST http://127.0.0.1:8080/__admin/reset
+cargo run -- check --config examples/brute-force-baseline-none.json --only brute_force
+echo $?   # PASS parsial: 2
+```
+
+Peringatan (pola F-002/Q3): FAIL `protection_not_triggered` berarti "proteksi tidak terpicu pada volume/jendela yang dikonfigurasi", BUKAN "API tanpa proteksi". Limiter dengan ambang di atas `attempts` (maks 100 sequential / 32 burst), atau limiter per-menit, tidak akan terpicu dan tetap menghasilkan FAIL ini meski limiter sungguhan ada. Evidence `peer_ip`/`peer_family` mengungkap alamat IP target di report (field pertama yang melakukannya, lihat README); pakai `baseline = "none"` hanya bila kredensial valid tidak tersedia/tidak boleh dipakai.
 
 ## Varian load (P3)
 

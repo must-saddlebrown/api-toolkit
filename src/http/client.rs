@@ -5,6 +5,7 @@
 //! the URL, which may contain secrets, so it is never turned into a string.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -42,15 +43,20 @@ pub struct TransportResponse {
     /// Time from sending until the whole body was read (monotonic clock).
     pub elapsed: Duration,
     pub body: Option<Value>,
+    /// Peer address of the connection this response came from (DECISIONS 2026-10-14 Q4).
+    /// `None` only when reqwest cannot report it; never carries anything but IP + port.
+    pub remote_addr: Option<SocketAddr>,
 }
 
 // Manual `Debug`: a parsed body may hold secrets, so only say whether one exists.
+// `remote_addr` is plain IP + port (never secret) and is shown as-is.
 impl fmt::Debug for TransportResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TransportResponse")
             .field("status", &self.status)
             .field("elapsed", &self.elapsed)
             .field("body", &self.body.as_ref().map(|_| "<redacted>"))
+            .field("remote_addr", &self.remote_addr)
             .finish()
     }
 }
@@ -110,6 +116,8 @@ pub async fn send(
     let start = Instant::now();
     let mut response = builder.send().await.map_err(map_error)?;
     let status = response.status().as_u16();
+    // Captured before the body is streamed, while `response` is still the live connection.
+    let remote_addr = response.remote_addr();
 
     // Early reject: a declared length over the limit needs no body read.
     if response
@@ -136,6 +144,7 @@ pub async fn send(
         status,
         elapsed,
         body,
+        remote_addr,
     })
 }
 
@@ -326,6 +335,26 @@ mod tests {
         assert_eq!(res.status, 200);
         assert_eq!(res.body, Some(serde_json::json!({"ok": true})));
         assert!(res.elapsed < Duration::from_secs(2));
+    }
+
+    /// DECISIONS 2026-10-14 Q4: `remote_addr` is the real peer of a loopback connection,
+    /// and that peer is `127.0.0.1` (IPv4), never a secret, on both success and error.
+    #[tokio::test]
+    async fn remote_addr_is_the_real_loopback_peer() {
+        let server = spawn_server(Behavior::Respond(http_response("200 OK", "", b"{}"))).await;
+        let res = send(&transport(2000, 1024), &get(server.url("/")))
+            .await
+            .unwrap();
+        let addr = res.remote_addr.expect("remote_addr set on success");
+        assert!(addr.ip().is_loopback());
+        assert!(addr.is_ipv4());
+        assert_eq!(addr.port(), server.port);
+
+        // A transport error never returns a TransportResponse, so there is no
+        // `remote_addr` to leak: the sentinel case is `closed_port_is_connect_failed_...`.
+        let dbg = format!("{res:?}");
+        assert!(dbg.contains("remote_addr"));
+        assert!(!dbg.contains("SENTINEL"));
     }
 
     #[tokio::test]

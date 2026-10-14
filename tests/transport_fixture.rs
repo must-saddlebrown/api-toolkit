@@ -72,8 +72,9 @@ async fn pipeline_against_healthy_fixture() {
     let bfr = env.reqs.brute_force.as_ref().unwrap();
     let racer = env.reqs.race.as_ref().unwrap();
 
+    let bfr_baseline = bfr.baseline.as_ref().expect("baseline is require_success");
     // Login valid: 200 + /access_token, body parsed as JSON, elapsed set.
-    let r = go(&env, &bfr.baseline).await;
+    let r = go(&env, bfr_baseline).await;
     assert_eq!(r.status, 200);
     assert!(bf.success_match.matches(r.status, r.body.as_ref()));
     assert!(r.body.is_some());
@@ -121,11 +122,11 @@ async fn pipeline_against_healthy_fixture() {
     // Reset restores state (P0-AC19): counter 0, failed login count 0.
     assert_eq!(go(&env, &reset_request(&base)).await.status, 200);
     assert_eq!(counter(&go(&env, &racer.verify).await), 0);
-    assert_eq!(go(&env, &bfr.baseline).await.status, 200);
+    assert_eq!(go(&env, bfr_baseline).await.status, 200);
     assert_eq!(go(&env, &bfr.probe).await.status, 401); // first failure again
 
     // Debug of a response never shows body text.
-    let dbg = format!("{:?}", go(&env, &bfr.baseline).await);
+    let dbg = format!("{:?}", go(&env, bfr_baseline).await);
     assert!(!dbg.contains(ACCESS_TOKEN), "{dbg}");
     assert!(!dbg.contains("access_token"), "{dbg}");
 
@@ -180,7 +181,13 @@ async fn closed_port_is_connect_failed_without_url() {
     let env = setup(&format!("http://127.0.0.1:{port}"));
     let err = send(
         &env.transport,
-        &env.reqs.brute_force.as_ref().unwrap().baseline,
+        env.reqs
+            .brute_force
+            .as_ref()
+            .unwrap()
+            .baseline
+            .as_ref()
+            .expect("baseline is require_success"),
     )
     .await
     .unwrap_err();

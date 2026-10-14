@@ -204,3 +204,17 @@ N future probe dibuat sekaligus dan dijalankan bersama `futures_util::future::jo
 
 ### Fungsi murni berparameter array untuk tabel verdict tanpa jam
 `evaluate_burst(baseline, probes: &[Classified], spread_ms: Option<u64>, stop, thresholds)` menerima hasil klasifikasi dan offset sebagai array/opsi biasa, bukan lewat jaringan atau clock nyata, sehingga seluruh tabel verdict (`b1`-`b17`) bisa diuji sinkron tanpa `tokio::test` atau waktu virtual. Lihat `src/checks/brute_force.rs`.
+
+## Catatan Q4 (mode baseline brute_force)
+
+### `Option<T>` bergantung variant enum, bukan field bergantung mode (sama pola, tag beda)
+`baseline_request: Option<RequestSpec>` memakai persis pola Q3 (`interval_ms`/`protect_by_attempt`/`protected_tail_count` di atas): tipe tidak bisa memaksa "field ini wajib hanya bila `baseline == RequireSuccess`", jadi validasi lintas-field manual (cabang `match (bf.baseline, &bf.baseline_request)` di `src/config/validate.rs`) yang menanggung correctness, dikunci test tabel (`rejected_cases`/`accepted_boundary_cases`). Tidak diulang penjelasannya di sini selain ini; lihat Catatan Q3 di atas untuk trade-off lengkapnya.
+
+### `reqwest::Response::remote_addr()` tetap peer sebenarnya walau pooling mati
+`Response::remote_addr() -> Option<SocketAddr>` memberi alamat socket TCP yang benar-benar dipakai untuk response itu. Karena `Transport::new` memakai `pool_max_idle_per_host(0)` (P0 S6, tanpa reuse koneksi), setiap request membuka koneksi baru sendiri, sehingga `remote_addr()` selalu peer request ITU, tidak pernah sisa koneksi lama yang dipakai ulang diam-diam. Dipanggil sebelum body di-stream (`response` masih berupa handle hidup), disimpan di `TransportResponse.remote_addr`, lalu dipetakan ke `peer_ip`/`peer_family` (`SocketAddr::is_ipv4()`) di evidence. Tidak ada dependency atau custom connector baru. Lihat `src/http/client.rs` (`send`) dan `peer_of` di `src/checks/brute_force.rs`.
+
+### axum `ConnectInfo<SocketAddr>` untuk peer IP di fixture dev
+Axum butuh `app.into_make_service_with_connect_info::<SocketAddr>()` (bukan `app` polos) di `axum::serve` supaya handler bisa menerima parameter ekstraktor `ConnectInfo<SocketAddr>` dan membaca alamat peer TCP yang sesungguhnya connect. Dipakai satu-satunya di `/per-ip/login` (fixture), handler lain tidak terpengaruh karena ekstraktor itu opsional per-handler. Lihat `tests/support/fixture.rs` (`Fixture::start`, `per_ip_login`).
+
+### Dua fungsi evaluasi murni paralel berbagi helper, bukan saling memanggil
+`evaluate_none`/`evaluate_burst_none` mengikuti pola Q3 (dua fungsi verdict paralel) satu langkah lebih jauh: keduanya dan `evaluate`/`evaluate_burst` yang sudah ada berbagi helper fakta-probe (`protection_stats`) tetapi masing-masing menyusun sendiri reasons/precedence-nya, TANPA memanggil atau membungkus fungsi yang sudah ada. Alternatif yang ditolak (DECISIONS Q4, Keputusan 3): wrapper yang memanggil `evaluate` dengan baseline sintetis lalu me-remap reason — lebih sedikit kode tapi rapuh terhadap perubahan vektor reason dan sulit dipastikan nol mutan lolos. Memisahkan total membuat tiap cabang presedensi punya test pembunuh-mutan sendiri tanpa risiko regresi ke jalur `require_success` yang sudah terbukti. Lihat `src/checks/brute_force.rs`.

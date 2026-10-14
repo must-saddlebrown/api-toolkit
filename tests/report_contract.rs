@@ -104,6 +104,8 @@ fn enums_serialize_to_stable_snake_case() {
         "account_already_locked",
         "baseline_failed",
         "probe_unclassifiable",
+        "endpoint_not_confirmed",
+        "protection_not_triggered",
         "single_side_effect",
         "duplicate_side_effect",
         "action_not_executed",

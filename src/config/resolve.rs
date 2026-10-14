@@ -47,7 +47,8 @@ pub struct ResolvedRequests {
 /// `None` in `ResolvedRequests` means the section was not selected.
 #[derive(Debug)]
 pub struct BruteForceRequests {
-    pub baseline: ResolvedRequest,
+    /// `None` when `baseline = "none"` (DECISIONS 2026-10-14 Q4): no baseline request.
+    pub baseline: Option<ResolvedRequest>,
     pub probe: ResolvedRequest,
 }
 
@@ -110,12 +111,10 @@ fn reject_unresolved_placeholders(
 ) -> Result<(), ConfigError> {
     reject_placeholder("base_url", &cfg.base_url)?;
     if let Some(bf) = bf {
-        for (f, r) in [
-            ("brute_force.baseline_request", &bf.baseline_request),
-            ("brute_force.probe_request", &bf.probe_request),
-        ] {
-            reject_placeholder(&format!("{f}.path"), &r.path)?;
+        if let Some(baseline_request) = &bf.baseline_request {
+            reject_placeholder("brute_force.baseline_request.path", &baseline_request.path)?;
         }
+        reject_placeholder("brute_force.probe_request.path", &bf.probe_request.path)?;
         reject_in_matcher("brute_force.success_match", &bf.success_match)?;
         reject_in_matcher("brute_force.rejection_match", &bf.rejection_match)?;
         reject_in_matcher("brute_force.protection_match", &bf.protection_match)?;
@@ -303,7 +302,9 @@ pub fn resolve<F: Fn(&str) -> Option<String>>(
     let base = cfg.base_url.as_str();
     let bf_reqs = bf.map(|bf| {
         (
-            r.request("brute_force.baseline_request", base, &bf.baseline_request),
+            bf.baseline_request
+                .as_ref()
+                .map(|spec| r.request("brute_force.baseline_request", base, spec)),
             r.request("brute_force.probe_request", base, &bf.probe_request),
         )
     });
@@ -325,7 +326,7 @@ pub fn resolve<F: Fn(&str) -> Option<String>>(
     }
     let brute_force = match bf_reqs {
         Some((baseline, probe)) => Some(BruteForceRequests {
-            baseline: baseline?,
+            baseline: baseline.transpose()?,
             probe: probe?,
         }),
         None => None,
@@ -403,6 +404,8 @@ mod tests {
             .as_ref()
             .unwrap()
             .baseline
+            .as_ref()
+            .expect("baseline is Some for require_success")
             .body
             .as_ref()
             .expect("body")
@@ -624,6 +627,8 @@ mod tests {
             .as_ref()
             .expect("bf")
             .baseline_request
+            .as_ref()
+            .expect("baseline_request is Some for require_success")
             .json
             .as_ref()
             .expect("json");

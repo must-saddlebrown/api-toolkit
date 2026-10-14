@@ -417,6 +417,74 @@ fn validate_burst_mode_violations_are_exit_2_with_zero_requests() {
     );
 }
 
+// ---------- Q4-S7: `baseline = "none"` (budget and the cross-field rejection) ----------
+
+const BF_NONE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/examples/brute-force-baseline-none.json"
+);
+/// `examples/brute-force-baseline-none.json` only resolves these two placeholders
+/// (no `LOGIN_VALID_PASSWORD`: `baseline = "none"` never sends a baseline request).
+const BF_NONE_ENV: [(&str, &str); 2] = [
+    ("LOGIN_USER", "demo"),
+    ("LOGIN_INVALID_PASSWORD", "wrong-pass"),
+];
+
+/// P1-AC35: `baseline = "none"` budgets `attempts` requests, not `1 + attempts` -- no
+/// baseline request is planned. `attempts: 8`, `interval_ms: 100` -> 700 ms fixed wait
+/// (unchanged formula: `(attempts - 1) * interval_ms`, baseline never contributes a wait).
+#[test]
+fn validate_baseline_none_example_budgets_attempts_only() {
+    let r = run_bin(
+        &["validate", "--config", BF_NONE, "--only", "brute_force"],
+        &BF_NONE_ENV,
+    );
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert!(r.stdout.contains("planned requests: 8"), "{}", r.stdout);
+    assert!(r.stdout.contains("700 ms"), "{}", r.stdout);
+}
+
+/// P1-AC35: `baseline_request` present together with `baseline: "none"` is rejected before
+/// any request, naming only the field (pattern Q3 "nothing is silently ignored").
+#[test]
+fn validate_baseline_none_rejects_baseline_request_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::read_to_string(BF_NONE).unwrap();
+    let with_baseline_request = base.replacen(
+        "\"baseline\": \"none\",",
+        concat!(
+            "\"baseline\": \"none\",",
+            "\"baseline_request\": {\"method\": \"POST\", \"path\": \"/per-ip/login\",",
+            "\"json\": {\"username\": \"${ENV:LOGIN_USER}\", \"password\": \"${ENV:LOGIN_INVALID_PASSWORD}\"}},",
+        ),
+        1,
+    );
+    assert_ne!(with_baseline_request, base, "pattern not replaced");
+    let path = write_cfg(&dir, &with_baseline_request);
+    let r = run_bin(
+        &[
+            "validate",
+            "--config",
+            path.to_str().unwrap(),
+            "--only",
+            "brute_force",
+        ],
+        &BF_NONE_ENV,
+    );
+    assert_eq!(r.code, 2, "stdout: {}", r.stdout);
+    assert!(
+        r.stderr.contains("brute_force.baseline_request"),
+        "{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("is not allowed when baseline is none"),
+        "{}",
+        r.stderr
+    );
+    assert!(r.stdout.is_empty(), "{}", r.stdout);
+}
+
 // S9 carry-over (c): known limitation, see S9 carry-over. A placeholder in a `query` key or
 // a json body object key is silently kept as a literal. This pins CURRENT behavior only;
 // it is not the desired behavior.

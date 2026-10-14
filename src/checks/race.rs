@@ -503,6 +503,7 @@ mod tests {
             status,
             elapsed: Duration::ZERO,
             body,
+            remote_addr: None,
         })
     }
 

@@ -143,10 +143,26 @@ pub enum BruteForceMode {
     Burst,
 }
 
+/// `brute_force.baseline` (Q4): `RequireSuccess` sends one valid-credential request before
+/// probing (original algorithm); `None` skips it entirely, probe-only. Unknown strings are
+/// rejected by serde itself, before `validate` ever runs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Baseline {
+    #[default]
+    RequireSuccess,
+    None,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BruteForce {
-    pub baseline_request: RequestSpec,
+    #[serde(default)]
+    pub baseline: Baseline,
+    /// `validate` requires `Some` when `baseline` is `require_success` and `None` when it
+    /// is `none` (DECISIONS 2026-10-14 Q4).
+    #[serde(default)]
+    pub baseline_request: Option<RequestSpec>,
     pub probe_request: RequestSpec,
     pub success_match: MatcherSpec,
     pub rejection_match: MatcherSpec,
@@ -311,6 +327,11 @@ mod tests {
         assert_eq!(cfg.config_version, 1);
         assert_eq!(cfg.base_url, "http://127.0.0.1:8080");
         assert_eq!(cfg.brute_force.as_ref().unwrap().attempts, 8);
+        // `baseline` defaults to `require_success` when absent (DECISIONS 2026-10-14 Q4).
+        assert_eq!(
+            cfg.brute_force.as_ref().unwrap().baseline,
+            Baseline::RequireSuccess
+        );
         assert_eq!(
             cfg.race.as_ref().unwrap().expected_action_statuses,
             vec![200, 409]
@@ -321,12 +342,36 @@ mod tests {
             .brute_force
             .unwrap()
             .baseline_request
+            .expect("baseline_request is Some for require_success")
             .json
             .expect("json body");
         assert_eq!(json["username"], "${ENV:LOGIN_USER}");
         // Limits given in the example are used; connect timeout falls back to default.
         assert_eq!(cfg.limits.request_timeout_ms, 5000);
         assert_eq!(cfg.limits.connect_timeout_ms, 3000);
+    }
+
+    #[test]
+    fn baseline_none_parses_and_unknown_value_is_rejected() {
+        let brute_force_none = r#"{
+            "baseline": "none",
+            "probe_request": {"method": "POST", "path": "/login"},
+            "success_match": {"status_in": [200]},
+            "rejection_match": {"status_in": [401]},
+            "protection_match": {"status_in": [429]},
+            "attempts": 8,
+            "interval_ms": 100,
+            "protect_by_attempt": 6,
+            "protected_tail_count": 2
+        }"#;
+        let value: Value = serde_json::from_str(brute_force_none).unwrap();
+        let parsed: Result<BruteForce, _> = serde_json::from_value(value);
+        assert_eq!(parsed.unwrap().baseline, Baseline::None);
+
+        let bad = brute_force_none.replace("\"none\"", "\"nope\"");
+        let value: Value = serde_json::from_str(&bad).unwrap();
+        let err = serde_json::from_value::<BruteForce>(value).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "{err}");
     }
 
     #[test]

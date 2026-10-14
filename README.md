@@ -54,7 +54,7 @@ Reason code (snake_case, bagian dari kontrak report; `report_version` 1):
 
 | Check | Reason |
 | --- | --- |
-| brute_force | `protection_observed` (pass); `protection_policy_not_met`, `invalid_credentials_accepted` (fail); `account_already_locked` (inconclusive); `baseline_failed`, `probe_unclassifiable`, `overlapping_rules` (error/inconclusive); mode burst (Q3) memakai ulang reason yang sama, plus `dispatch_incomplete`/`dispatch_skew_exceeded` (inconclusive) |
+| brute_force | `protection_observed` (pass); `protection_policy_not_met`, `invalid_credentials_accepted` (fail); `account_already_locked` (inconclusive); `baseline_failed`, `probe_unclassifiable`, `overlapping_rules` (error/inconclusive); mode burst (Q3) memakai ulang reason yang sama, plus `dispatch_incomplete`/`dispatch_skew_exceeded` (inconclusive); `baseline = "none"` (Q4) memakai ulang `protection_observed`/`account_already_locked`/`probe_unclassifiable`/`invalid_credentials_accepted`, plus `endpoint_not_confirmed` (inconclusive) dan `protection_not_triggered` (fail, menggantikan `protection_policy_not_met` hanya di jalur ini) |
 | race | `single_side_effect` (pass); `duplicate_side_effect`, `action_not_executed` (fail); `initial_counter_not_zero`, `action_outcome_ambiguous`, `dispatch_incomplete`, `dispatch_skew_exceeded`, `baseline_unreadable`, `counter_not_available` (inconclusive); `verifier_failed`, `counter_invalid` (error) |
 
 Urutan pemeriksaan verifier sebelum action: respons yang tidak cocok `verify_match` (V2, INCONCLUSIVE `baseline_unreadable`) dievaluasi sebelum body (V3, ERROR `counter_invalid`), jadi respons 401 berbadan HTML atau matcher `json_*` dengan body non-JSON menjadi INCONCLUSIVE, bukan ERROR. Verifier setelah action tidak berubah (ERROR).
@@ -78,7 +78,7 @@ Bila report gagal dibangun atau ditulis, baris check tetap dicetak, lalu stdout 
 
 ### Report JSON
 
-Berisi `report_version` (1), `run_id`, `tool_version`, `config_hash` (SHA-256 file config), `started_at`/`finished_at` (RFC3339 UTC, tanpa pecahan detik), `completion`, `scope` (`full` atau `partial`), dan `checks` (urutan race, load, brute_force; masing-masing `verdict`, `reasons`, `completion`, `evidence`). Evidence hanya angka, enum, bool, dan null: tidak pernah body respons, nilai header, nilai env, atau URL ber-secret.
+Berisi `report_version` (1), `run_id`, `tool_version`, `config_hash` (SHA-256 file config), `started_at`/`finished_at` (RFC3339 UTC, tanpa pecahan detik), `completion`, `scope` (`full` atau `partial`), dan `checks` (urutan race, load, brute_force; masing-masing `verdict`, `reasons`, `completion`, `evidence`). Evidence hanya angka, enum, bool, dan null: tidak pernah body respons, nilai header, nilai env, atau URL ber-secret. Satu pengecualian sengaja (Q4): evidence brute_force `baseline = "none"` menyimpan `peer_ip`/`peer_family`, alamat IP peer koneksi TCP yang dipakai — bukan secret config, tetapi identitas jaringan target; lihat peringatan di "Threshold brute_force".
 
 ## `--only`: run parsial
 
@@ -133,6 +133,12 @@ Baseline sudah protected atau probe 1 sudah protected = INCONCLUSIVE `account_al
 Mode `"burst"` mengirim seluruh `attempts` probe **serentak** (tanpa jeda, satu baseline tetap dikirim lebih dulu) supaya limiter berbasis waktu punya kesempatan terpicu; verdict dihitung dari jumlah probe protected (P) dari N probe, bukan urutannya: `1 <= P <= N-1` PASS `protection_observed`, `P == 0` FAIL `protection_policy_not_met`, `P == N` INCONCLUSIVE `account_already_locked`. Spread dispatch di atas `window_ms` (juga bila ada protection) selalu INCONCLUSIVE `dispatch_skew_exceeded`. Contoh: [examples/brute-force-burst.json](examples/brute-force-burst.json). **FAIL burst juga belum berarti tidak ada proteksi**: limiter dengan ambang di atas `attempts` (maksimum 32) tidak akan terpicu.
 
 **Peringatan lockout: burst bisa mengunci akun uji lebih cepat.** Karena semua probe dikirim sekaligus, hingga 32 login gagal bisa diterima target dalam hitungan milidetik, jauh lebih cepat daripada mode sequential. Pakai akun uji khusus dan siapkan reset sebelum menjalankan ulang.
+
+`baseline` (Q4) = `"require_success"` (default, alur di atas) atau `"none"`: probe-only, dipakai ketika kredensial valid tidak tersedia atau tidak boleh dipakai terhadap target. Orthogonal terhadap `mode`: keempat kombinasi (sequential/burst × require_success/none) sah. Dengan `"none"`, `baseline_request` **tidak boleh ada** di config (ditolak saat validasi, bukan diabaikan) dan tidak ada request kredensial-benar yang dikirim sama sekali — budget request jadi `attempts` saja, bukan `1 + attempts`. Dua reason tambahan hanya di jalur ini: `endpoint_not_confirmed` (inconclusive, semua probe tidak terklasifikasi/transport error dan tanpa overlap — endpoint itu sendiri tidak pernah terkonfirmasi) dan `protection_not_triggered` (fail, menggantikan `protection_policy_not_met` di jalur none). Contoh: [examples/brute-force-baseline-none.json](examples/brute-force-baseline-none.json).
+
+**Peringatan (Q4): FAIL `protection_not_triggered` juga belum berarti tidak ada proteksi**, sama seperti `protection_policy_not_met` di atas: limiter dengan ambang di atas `attempts` (maksimum 100 sequential / 32 burst) atau limiter per-menit tidak akan terpicu pada volume/window yang dikonfigurasi ini.
+
+**Peringatan: evidence `baseline = "none"` mengungkap alamat IP peer target (`peer_ip`/`peer_family`).** Ini field pertama di seluruh report yang sengaja menyimpan identitas jaringan target (`peer_ip` string IP, `peer_family` `"v4"`/`"v6"`, keduanya dari koneksi TCP yang sesungguhnya dipakai). Jangan menyimpan atau membagikan report dari target nyata tanpa menyadari field ini ada. **Peringatan lockout per-IP:** bila limiter target berbasis per-IP (bukan per-akun), menjalankan `baseline = "none"` dari alamat yang sama berulang kali bisa mengunci IP itu sendiri, terlepas dari akun uji yang dipakai.
 
 ### Threshold race
 

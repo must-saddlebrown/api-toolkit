@@ -121,6 +121,23 @@ Contoh policy sequential: 8 probe, interval 100 ms, proteksi harus mulai pada at
 
 Normal 401 saja tidak membuktikan anti-brute-force. HTTP 429 atau error body tertentu hanya dianggap proteksi sesuai matcher eksplisit. Metode ini memeriksa respons proteksi pada pola terbatas, belum membuktikan lockout enforcement dengan seluruh mekanisme atau kekuatan password. Basis pengujian login gagal/lockout: [OWASP Weak Lock Out Mechanism](https://wstg.owasp.org/latest/4-Web_Application_Security_Testing/04-Authentication/03-Weak_Lock_Out_Mechanism/).
 
+### Mode baseline (keputusan 2026-10-14, fase Q4)
+
+`brute_force.baseline` = `"require_success"` (default; algoritma dan verdict di atas tidak berubah) atau `"none"`. Dipakai ketika kredensial valid tidak tersedia atau tidak boleh dipakai terhadap target (probe-only); orthogonal terhadap `mode` (sequential/burst) — keempat kombinasi sah.
+
+`baseline = "none"` melewati baseline sepenuhnya: tidak ada request kredensial-benar yang dikirim sama sekali, `baseline_request` tidak boleh ada di config (ditolak saat validasi, bukan diabaikan diam-diam), dan budget request menjadi `attempts` saja (bukan `1 + attempts`). Sequential langsung mulai dari probe 1 dengan `interval_ms` seperti biasa; burst mengirim N probe serentak seperti biasa. Aturan per-mode yang sudah ada (`interval_ms`/`protect_by_attempt`/`protected_tail_count` di sequential; `window_ms` di burst) tidak berubah dan tetap berlaku di kedua nilai `baseline`.
+
+Dua reason code baru, dipakai HANYA di jalur `baseline = "none"` (jalur `require_success` byte-identik dengan sebelumnya):
+
+- `endpoint_not_confirmed` (INCONCLUSIVE): tidak ada satu pun probe yang terklasifikasi on-protocol (semuanya `unexpected`/transport error) dan tanpa overlap — endpoint itu sendiri tidak pernah terkonfirmasi berbicara protokol yang diharapkan. Menggantikan jalur ERROR `probe_unclassifiable` HANYA pada kasus ini (tanpa satu pun probe classifiable, tanpa overlap); bila ada minimal satu probe classifiable di samping yang tak terklasifikasi, atau ada overlap, hasilnya tetap ERROR `probe_unclassifiable` seperti biasa.
+- `protection_not_triggered` (FAIL): menggantikan `protection_policy_not_met` di jalur none — sequential: oracle urutan (attempt pertama protected ≤ `protect_by_attempt` dan `protected_tail_count` attempt terakhir protected) tidak terpenuhi; burst: `P == 0`.
+
+Presedensi verdict none (sequential, langkah 1-4 sama untuk burst minus urutan 5-7): 1) ada probe success → FAIL `invalid_credentials_accepted` (mengalahkan semua, juga stop); 2) jumlah probe tercatat != `attempts` → NOT_RUN; 3) overlap, atau probe tak terklasifikasi DISERTAI probe classifiable → ERROR `probe_unclassifiable`; 4) hanya probe tak terklasifikasi tanpa classifiable dan tanpa overlap → INCONCLUSIVE `endpoint_not_confirmed`; 5) probe pertama sudah protected → INCONCLUSIVE `account_already_locked`; 6) oracle urutan terpenuhi → PASS `protection_observed`; 7) selain itu → FAIL `protection_not_triggered`. Burst menyisipkan `endpoint_not_confirmed` pada posisi yang sama (sebelum cek spread/window/`P`), lalu lanjut ke langkah burst biasa (`dispatch_incomplete`, `dispatch_skew_exceeded`, `P == N` → `account_already_locked`, `P == 0` → `protection_not_triggered`, `1 <= P <= N-1` → PASS).
+
+**FAIL `protection_not_triggered` bukan bukti "API tanpa proteksi"**, sama seperti `protection_policy_not_met`: limiter dengan ambang di atas `attempts` (maksimum 100 sequential / 32 burst) atau limiter per-menit tidak akan terpicu pada volume/window yang dikonfigurasi ini.
+
+Evidence `baseline = "none"` menambah dua field peer, selalu diisi bila respons ada (`null` hanya pada transport error): `peer_ip` (alamat IP peer dari koneksi TCP yang sesungguhnya dipakai, lewat `reqwest::Response::remote_addr()`) dan `peer_family` (`"v4"`/`"v6"`). Field ini adalah yang pertama di seluruh report yang sengaja mengungkap identitas jaringan target (lihat §10 dan README); dibatasi hanya pada evidence brute_force.
+
 ## 6. Check 2 — Race condition pada write-once action
 
 ### Tujuan dan oracle
@@ -201,6 +218,8 @@ Konfigurasi memakai satu target origin. Semua path action/verifier/load/login re
 Default: connect timeout 3 detik, total request timeout 5 detik, body limit 1 MiB, suite deadline 120 detik. Semua dapat dikonfigurasi. Hitung jumlah request dan fixed waits check yang dijalankan (ketiganya, atau check terpilih pada `--only`) sebelum run; konfigurasi yang fixed waits-nya saja melampaui deadline ditolak. Estimasi worst-case berbasis timeout dilaporkan sebagai budget, bukan jaminan API merespons tepat waktu.
 
 v0.1 menerima probe count ≤100, race concurrency ≤32, load count ≤1000, load concurrency ≤32, brute_force burst `attempts` 2..=32, dan seluruh angka harus positif dalam batas tersebut. Ini batas implementasi pertama, bukan kapasitas API. Extension limits dilakukan sengaja melalui revisi versi.
+
+`brute_force.baseline` (keputusan 2026-10-14, fase Q4) adalah enum `"require_success"` (default) | `"none"`, bukan batas numerik baru: budget request berkurang `1` (tidak ada baseline) bila `"none"`, tanpa mengubah batas `attempts` di atas.
 
 Task pool bounded; race barrier berbeda dari load worker pool. Cancel menghentikan dispatch baru dan active waits, lalu menyimpan hasil parsial. Server side effect yang sudah terjadi tetap mungkin selesai. Tidak ada generic cleanup flow: fixture reset/resource preparation dilakukan di luar runner.
 
@@ -283,6 +302,24 @@ Mode default `brute_force.mode` adalah `sequential` (contoh di atas tidak memuat
   }
 ```
 
+`brute_force.baseline` default `"require_success"` (contoh di atas tidak memuat field itu secara eksplisit tetapi berlaku sebagai `require_success`). `baseline = "none"` (keputusan 2026-10-14, fase Q4) memakai bentuk berikut, TANPA `baseline_request` sama sekali (field itu ditolak bila ada):
+
+```json
+  "brute_force": {
+    "baseline": "none",
+    "probe_request": { "...": "sama seperti contoh require_success" },
+    "success_match": { "status_in": [200], "json_exists": ["/access_token"] },
+    "rejection_match": { "status_in": [401] },
+    "protection_match": { "status_in": [429] },
+    "attempts": 8,
+    "interval_ms": 100,
+    "protect_by_attempt": 6,
+    "protected_tail_count": 2
+  }
+```
+
+`baseline = "none"` juga sah dikombinasikan dengan `mode: "burst"` (tanpa `interval_ms`/`protect_by_attempt`/`protected_tail_count`, dengan `window_ms`), sama seperti kombinasi `require_success` + `burst` di atas.
+
 `TEST_AUTHORIZATION` berisi header lengkap, misalnya `Bearer <token>`. Substitusi hanya whole-string `${ENV:NAME}`, tanpa string interpolation/expression. Env values menjadi strings; angka/boolean tetap literal JSON. Missing env, unknown fields, invalid selector/threshold/version memblokir run sebelum dispatch.
 
 Suite lengkap (`check` tanpa `--only`, `validate` tanpa `--only`) mewajibkan ketiga bagian check. Mode `--only <check>` hanya mewajibkan `config_version`, `base_url`, `limits` (opsional), dan bagian check terpilih. Bagian lain yang ada tetap harus berbentuk benar (field tak dikenal dan tipe salah ditolak) tetapi tidak divalidasi semantik, tidak di-resolve (env-nya tidak wajib), dan tidak dihitung dalam budget. Tidak ada skip flag yang membuat command tampil sukses: run parsial tidak pernah exit 0 dan report-nya ditandai `scope: partial`. Template fixture dapat diganti method/path/body/matchers untuk target pengguna; resource state dan policy target tetap eksplisit.
@@ -292,6 +329,10 @@ Suite lengkap (`check` tanpa `--only`, `validate` tanpa `--only`) mewajibkan ket
 Console menampilkan satu baris per check: verdict, evidence utama, threshold, dan reason. Contoh healthy fixture: race PASS delta=1; load PASS error_rate=0/p95=120ms; brute_force PASS first_protected=6 tail=3/2 attempts=8/8 (tail = jumlah protected berurutan yang teramati / `protected_tail_count`; attempts = probe yang selesai dan tercatat / direncanakan). Angka latency merupakan ilustrasi.
 
 Contoh console mode burst (keputusan 2026-10-14, fase Q3): `brute_force PASS mode=burst protected=3/8 rejected=5 window=1/100ms attempts=8/8 reasons=protection_observed` (window = spread dispatch client teramati / anggaran `window_ms`).
+
+Contoh console `baseline = "none"` (keputusan 2026-10-14, fase Q4): token `baseline=none` disisipkan setelah head (dan setelah `mode=burst` di burst), jalur `require_success` tidak berubah satu byte pun: `brute_force FAIL baseline=none first_protected=none tail=0/2 attempts=8/8 reasons=protection_not_triggered`.
+
+Evidence brute_force (kedua mode) menambah dua field aditif sejak Q4: `baseline_mode` (`"require_success"`/`"none"`, selalu ada) dan `peer_ip`/`peer_family` (string IP dan `"v4"`/`"v6"`, ada bila ada respons, `null`/tidak ada pada transport error). `peer_ip` adalah field pertama di seluruh report yang sengaja menyimpan identitas jaringan target (lihat README untuk peringatannya); `report_version` tetap 1 karena perubahan ini murni aditif (field evidence `baseline` yang sudah ada, berisi evidence attempt baseline, tidak diganti nama).
 
 JSON report memuat report_version=1, run ID, tool version, config hash nonsecret, timestamps UTC, configured workloads/thresholds, counts/timings/status distribution, before/after counter, per-check verdict/reasons, dan completion status. Request body/header values, raw response bodies, token/password, serta resolved secret path/query tidak dipersist.
 

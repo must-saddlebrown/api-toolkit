@@ -2,6 +2,7 @@
 //! `evaluate` (all outcomes -> verdict). Async parts: `run_with` (the sequential loop, with a
 //! closure as sender so tests need no network), `run` (real transport) and `console_line`.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures_util::future::join_all;
@@ -9,7 +10,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, sleep};
 
 use crate::checks::{Stop, current_stop, dispatch_spread_ms, wait_stop};
-use crate::config::{BruteForce, BruteForceMode, MatcherSpec};
+use crate::config::{Baseline, BruteForce, BruteForceMode, MatcherSpec};
 use crate::http::request::ResolvedRequest;
 use crate::http::{Transport, TransportError, TransportResponse, send};
 use crate::report::{
@@ -384,6 +385,255 @@ pub fn evaluate_burst(
     )
 }
 
+/// PLAN §5 Verdict for `baseline = "none"` (DECISIONS 2026-10-14 Q4), sequential mode:
+/// no baseline attempt is ever sent, so there is no step 1/2 of `evaluate` and no
+/// `baseline_result`. `probes` holds only the finished probes, in order; `stop` and `t`
+/// have the same meaning as in `evaluate`. `classifiable` below means a probe outcome of
+/// `NormalRejection` or `Protection` (an on-protocol response), as opposed to `has_bad`
+/// (`Unexpected`/`TransportError`): see the verdict table in `.claude/work/Q4-plan.md`.
+pub fn evaluate_none(probes: &[Classified], stop: Option<Stop>, t: Thresholds) -> Evaluation {
+    let (first_protected_attempt, protected_tail_observed) = protection_stats(probes);
+    let make = |verdict, reasons, completion| Evaluation {
+        verdict,
+        reasons,
+        completion,
+        first_protected_attempt,
+        protected_tail_observed,
+    };
+
+    let has_success = probes.iter().any(|p| p.outcome == Outcome::Success);
+    let has_unexpected = probes.iter().any(|p| p.outcome == Outcome::Unexpected);
+    let has_transport = probes.iter().any(|p| p.outcome == Outcome::TransportError);
+    let has_bad = has_unexpected || has_transport;
+    let has_overlap = probes.iter().any(|p| p.overlap);
+    let has_classifiable = probes
+        .iter()
+        .any(|p| matches!(p.outcome, Outcome::NormalRejection | Outcome::Protection));
+    let first_is_protected = probes
+        .first()
+        .is_some_and(|p| p.outcome == Outcome::Protection);
+
+    // 1. An accepted invalid credential is definite evidence: it beats everything,
+    //    including a stop and an incomplete probe count.
+    if has_success {
+        let mut reasons = vec![ReasonCode::InvalidCredentialsAccepted];
+        if has_bad {
+            reasons.push(ReasonCode::ProbeUnclassifiable);
+        }
+        if has_transport {
+            reasons.push(ReasonCode::TransportError);
+        }
+        if has_overlap {
+            reasons.push(ReasonCode::OverlappingRules);
+        }
+        if first_is_protected {
+            reasons.push(ReasonCode::AccountAlreadyLocked);
+        }
+        let mut completion = Completion::Complete;
+        if let Some(s) = stop {
+            reasons.push(s.reason());
+            completion = Completion::Incomplete;
+        }
+        return make(Verdict::Fail, reasons, completion);
+    }
+
+    // 2. The probe list is not exactly `attempts` long: no other verdict is trusted.
+    if probes.len() as u32 != t.attempts {
+        let reason = match stop {
+            Some(s) => s.reason(),
+            None => ReasonCode::NotStarted,
+        };
+        return make(Verdict::NotRun, vec![reason], Completion::Incomplete);
+    }
+
+    // 3. Overlap, or an unclassifiable/transport probe alongside a classifiable one: the
+    //    endpoint answered inconsistently, which is worse than simply unconfirmed.
+    if has_overlap || (has_bad && has_classifiable) {
+        let mut reasons = Vec::new();
+        if has_bad {
+            reasons.push(ReasonCode::ProbeUnclassifiable);
+        }
+        if has_transport {
+            reasons.push(ReasonCode::TransportError);
+        }
+        if has_overlap {
+            reasons.push(ReasonCode::OverlappingRules);
+        }
+        return make(Verdict::Error, reasons, Completion::Complete);
+    }
+
+    // 4. Every probe was unclassifiable/transport-error and none were on-protocol: the
+    //    endpoint itself was never confirmed to speak the expected protocol.
+    if has_bad {
+        return make(
+            Verdict::Inconclusive,
+            vec![ReasonCode::EndpointNotConfirmed],
+            Completion::Complete,
+        );
+    }
+
+    // 5. Probe 1 already protected: without a baseline there is no "before probing" signal
+    //    other than this, same meaning as `evaluate`'s already-locked case.
+    if first_is_protected {
+        return make(
+            Verdict::Inconclusive,
+            vec![ReasonCode::AccountAlreadyLocked],
+            Completion::Complete,
+        );
+    }
+
+    // 6/7. Everything classified, no success: check timing and persistence of protection.
+    let in_time = first_protected_attempt.is_some_and(|n| n <= t.protect_by_attempt);
+    let persistent = protected_tail_observed >= t.protected_tail_count;
+    if in_time && persistent {
+        make(
+            Verdict::Pass,
+            vec![ReasonCode::ProtectionObserved],
+            Completion::Complete,
+        )
+    } else {
+        make(
+            Verdict::Fail,
+            vec![ReasonCode::ProtectionNotTriggered],
+            Completion::Complete,
+        )
+    }
+}
+
+/// PLAN §5 "Mode burst" verdict for `baseline = "none"` (DECISIONS 2026-10-14 Q4): same
+/// shape as `evaluate_burst`, minus the baseline step, with `protection_not_triggered`
+/// taking the place of `protection_policy_not_met` and an `endpoint_not_confirmed` step
+/// inserted before the window/`P` checks. P = `protected_count`, N = `t.attempts`.
+pub fn evaluate_burst_none(
+    probes: &[Classified],
+    spread_ms: Option<u64>,
+    stop: Option<Stop>,
+    t: BurstThresholds,
+) -> BurstEvaluation {
+    let protected_count = probes
+        .iter()
+        .filter(|p| p.outcome == Outcome::Protection)
+        .count() as u32;
+    let rejected_count = probes
+        .iter()
+        .filter(|p| p.outcome == Outcome::NormalRejection)
+        .count() as u32;
+    let make = |verdict, reasons, completion| BurstEvaluation {
+        verdict,
+        reasons,
+        completion,
+        protected_count,
+        rejected_count,
+    };
+    let stop_reason = match stop {
+        Some(s) => s.reason(),
+        None => ReasonCode::NotStarted,
+    };
+
+    let has_success = probes.iter().any(|p| p.outcome == Outcome::Success);
+    let has_unexpected = probes.iter().any(|p| p.outcome == Outcome::Unexpected);
+    let has_transport = probes.iter().any(|p| p.outcome == Outcome::TransportError);
+    let has_bad = has_unexpected || has_transport;
+    let has_overlap = probes.iter().any(|p| p.overlap);
+    let has_classifiable = probes
+        .iter()
+        .any(|p| matches!(p.outcome, Outcome::NormalRejection | Outcome::Protection));
+
+    // 1. An accepted invalid credential beats everything, even a stop and an incomplete
+    //    probe count.
+    if has_success {
+        let mut reasons = vec![ReasonCode::InvalidCredentialsAccepted];
+        if has_bad {
+            reasons.push(ReasonCode::ProbeUnclassifiable);
+        }
+        if has_transport {
+            reasons.push(ReasonCode::TransportError);
+        }
+        if has_overlap {
+            reasons.push(ReasonCode::OverlappingRules);
+        }
+        let mut completion = Completion::Complete;
+        if let Some(s) = stop {
+            reasons.push(s.reason());
+            completion = Completion::Incomplete;
+        }
+        return make(Verdict::Fail, reasons, completion);
+    }
+
+    // 2. The probe list is not exactly `attempts` long: no other verdict is trusted.
+    if probes.len() as u32 != t.attempts {
+        return make(Verdict::NotRun, vec![stop_reason], Completion::Incomplete);
+    }
+
+    // 3. Overlap, or an unclassifiable/transport probe alongside a classifiable one.
+    if has_overlap || (has_bad && has_classifiable) {
+        let mut reasons = Vec::new();
+        if has_bad {
+            reasons.push(ReasonCode::ProbeUnclassifiable);
+        }
+        if has_transport {
+            reasons.push(ReasonCode::TransportError);
+        }
+        if has_overlap {
+            reasons.push(ReasonCode::OverlappingRules);
+        }
+        return make(Verdict::Error, reasons, Completion::Complete);
+    }
+
+    // 4. Every probe was unclassifiable/transport-error: endpoint never confirmed. Spread
+    //    and window are meaningless without a single on-protocol response.
+    if has_bad {
+        return make(
+            Verdict::Inconclusive,
+            vec![ReasonCode::EndpointNotConfirmed],
+            Completion::Complete,
+        );
+    }
+
+    // 5. Dispatch spread unknown (defensive safeguard, same as `evaluate_burst`).
+    let Some(spread) = spread_ms else {
+        return make(
+            Verdict::Inconclusive,
+            vec![ReasonCode::DispatchIncomplete],
+            Completion::Complete,
+        );
+    };
+
+    // 6. Dispatch was not tight enough to call it a burst.
+    if spread > t.window_ms {
+        return make(
+            Verdict::Inconclusive,
+            vec![ReasonCode::DispatchSkewExceeded],
+            Completion::Complete,
+        );
+    }
+
+    // 7. Every probe protected: indistinguishable from an already-full limiter window.
+    if protected_count == t.attempts {
+        return make(
+            Verdict::Inconclusive,
+            vec![ReasonCode::AccountAlreadyLocked],
+            Completion::Complete,
+        );
+    }
+
+    // 8. No probe protected: the policy did not react at this attempt count/window.
+    if protected_count == 0 {
+        return make(
+            Verdict::Fail,
+            vec![ReasonCode::ProtectionNotTriggered],
+            Completion::Complete,
+        );
+    }
+
+    // 9. 1 <= P <= N-1: the policy reacted to some, not all, probes.
+    make(
+        Verdict::Pass,
+        vec![ReasonCode::ProtectionObserved],
+        Completion::Complete,
+    )
+}
+
 /// Which request the sender closure must send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -393,6 +643,16 @@ pub enum Kind {
 
 fn millis(d: Duration) -> u64 {
     d.as_millis() as u64
+}
+
+/// `peer_ip`/`peer_family` evidence (DECISIONS 2026-10-14 Q4): IP and `"v4"`/`"v6"`, from
+/// one request's `remote_addr`. Only IP + port ever flow through this, never a header,
+/// body or URL.
+fn peer_of(addr: SocketAddr) -> (String, &'static str) {
+    (
+        addr.ip().to_string(),
+        if addr.is_ipv4() { "v4" } else { "v6" },
+    )
 }
 
 /// PLAN §5 steps 1-3: one baseline, then `attempts` probes, one at a time, `interval_ms`
@@ -417,9 +677,15 @@ where
     let mut stopped: Option<Stop> = None;
     let mut baseline: Option<(Classified, AttemptEvidence)> = None;
     let mut probes: Vec<(Classified, AttemptEvidence)> = Vec::new();
+    let mut peer_addr: Option<SocketAddr> = None;
+    // `baseline = "none"` (Q4): skip attempt 0 entirely, start at probe 1.
+    let start_number = match cfg.baseline {
+        Baseline::RequireSuccess => 0,
+        Baseline::None => 1,
+    };
 
-    // Attempt 0 is the baseline, 1..=attempts are probes.
-    for number in 0..=cfg.attempts {
+    // Attempt 0 is the baseline (when sent), 1..=attempts are probes.
+    for number in start_number..=cfg.attempts {
         // Interval only between probes (not before probe 1, not after the last).
         if number >= 2 {
             tokio::select! {
@@ -448,6 +714,9 @@ where
             r = send_one(kind) => r,
         };
         let elapsed = sent_at.elapsed();
+        if peer_addr.is_none() {
+            peer_addr = result.as_ref().ok().and_then(|r| r.remote_addr);
+        }
 
         let classified = classify(
             &result,
@@ -478,17 +747,22 @@ where
 
     let baseline_classified = baseline.as_ref().map(|(c, _)| *c);
     let probe_classified: Vec<Classified> = probes.iter().map(|(c, _)| *c).collect();
-    let evaluation = evaluate(
-        baseline_classified,
-        &probe_classified,
-        stopped,
-        Thresholds {
-            attempts: cfg.attempts,
-            // ponytail: `Option` since Q3 (burst), never `None` on this sequential-only path.
-            protect_by_attempt: cfg.protect_by_attempt.unwrap_or_default(),
-            protected_tail_count: cfg.protected_tail_count.unwrap_or_default(),
-        },
-    );
+    let thresholds = Thresholds {
+        attempts: cfg.attempts,
+        // ponytail: `Option` since Q3 (burst), never `None` on this sequential-only path.
+        protect_by_attempt: cfg.protect_by_attempt.unwrap_or_default(),
+        protected_tail_count: cfg.protected_tail_count.unwrap_or_default(),
+    };
+    let evaluation = match cfg.baseline {
+        Baseline::RequireSuccess => {
+            evaluate(baseline_classified, &probe_classified, stopped, thresholds)
+        }
+        Baseline::None => evaluate_none(&probe_classified, stopped, thresholds),
+    };
+    let (peer_ip, peer_family) = match peer_addr.map(peer_of) {
+        Some((ip, family)) => (Some(ip), Some(family)),
+        None => (None, None),
+    };
 
     CheckResult {
         check: CheckName::BruteForce,
@@ -504,6 +778,12 @@ where
             protected_tail_count: cfg.protected_tail_count.unwrap_or_default(),
             first_protected_attempt: evaluation.first_protected_attempt,
             protected_tail_observed: evaluation.protected_tail_observed,
+            baseline_mode: match cfg.baseline {
+                Baseline::RequireSuccess => "require_success",
+                Baseline::None => "none",
+            },
+            peer_ip,
+            peer_family,
             baseline: baseline.map(|(_, e)| e),
             attempts: probes.into_iter().map(|(_, e)| e).collect(),
         })),
@@ -531,6 +811,7 @@ where
     let mut probe_classified: Vec<Classified> = Vec::new();
     let mut probe_evidence: Vec<AttemptEvidence> = Vec::new();
     let mut dispatch_offsets: Vec<Duration> = Vec::new();
+    let mut peer_addr: Option<SocketAddr> = None;
 
     'run: {
         // Never dispatch once a stop is signalled (also covers "stop before start").
@@ -538,36 +819,41 @@ where
             stopped = Some(s);
             break 'run;
         }
-        let offset = start.elapsed();
-        baseline_dispatched = 1;
-        let sent_at = Instant::now();
-        let result = tokio::select! {
-            biased;
-            s = wait_stop(&mut stop_rx) => { stopped = Some(s); break 'run; }
-            r = send_one(Kind::Baseline) => r,
-        };
-        let classified = classify(
-            &result,
-            &cfg.success_match,
-            &cfg.rejection_match,
-            &cfg.protection_match,
-        );
-        let evidence = AttemptEvidence {
-            attempt: 0,
-            outcome: classified.outcome,
-            status: result.as_ref().ok().map(|r| r.status),
-            error: classified.error,
-            offset_ms: millis(offset),
-            elapsed_ms: millis(sent_at.elapsed()),
-        };
-        let baseline_ok = classified.outcome == Outcome::Success;
-        baseline = Some((classified, evidence));
-        if !baseline_ok {
-            break 'run; // like sequential: no probes after a failed baseline
-        }
-        if let Some(s) = current_stop(&stop_rx) {
-            stopped = Some(s);
-            break 'run;
+        // `baseline = "none"` (Q4): skip the baseline attempt entirely, go straight to
+        // the probe barrier below.
+        if cfg.baseline == Baseline::RequireSuccess {
+            let offset = start.elapsed();
+            baseline_dispatched = 1;
+            let sent_at = Instant::now();
+            let result = tokio::select! {
+                biased;
+                s = wait_stop(&mut stop_rx) => { stopped = Some(s); break 'run; }
+                r = send_one(Kind::Baseline) => r,
+            };
+            peer_addr = result.as_ref().ok().and_then(|r| r.remote_addr);
+            let classified = classify(
+                &result,
+                &cfg.success_match,
+                &cfg.rejection_match,
+                &cfg.protection_match,
+            );
+            let evidence = AttemptEvidence {
+                attempt: 0,
+                outcome: classified.outcome,
+                status: result.as_ref().ok().map(|r| r.status),
+                error: classified.error,
+                offset_ms: millis(offset),
+                elapsed_ms: millis(sent_at.elapsed()),
+            };
+            let baseline_ok = classified.outcome == Outcome::Success;
+            baseline = Some((classified, evidence));
+            if !baseline_ok {
+                break 'run; // like sequential: no probes after a failed baseline
+            }
+            if let Some(s) = current_stop(&stop_rx) {
+                stopped = Some(s);
+                break 'run;
+            }
         }
 
         // Barrier: all N probe futures are lazy, so nothing is sent until `join_all` polls
@@ -584,6 +870,7 @@ where
                     _ = wait_stop(&mut rx) => return (offset, None),
                     r = send_ref(Kind::Probe) => r,
                 };
+                let peer = result.as_ref().ok().and_then(|r| r.remote_addr);
                 let classified = classify(
                     &result,
                     &cfg.success_match,
@@ -598,7 +885,7 @@ where
                     offset_ms: millis(offset),
                     elapsed_ms: millis(sent_at.elapsed()),
                 };
-                (offset, Some((classified, evidence)))
+                (offset, Some((classified, evidence, peer)))
             }
         }))
         .await;
@@ -606,9 +893,12 @@ where
         for (offset, done) in runs {
             dispatch_offsets.push(offset);
             match done {
-                Some((classified, evidence)) => {
+                Some((classified, evidence, peer)) => {
                     probe_classified.push(classified);
                     probe_evidence.push(evidence);
+                    if peer_addr.is_none() {
+                        peer_addr = peer;
+                    }
                 }
                 None => any_dropped = true,
             }
@@ -620,17 +910,27 @@ where
 
     let spread_ms = dispatch_spread_ms(&dispatch_offsets);
     let baseline_classified = baseline.as_ref().map(|(c, _)| *c);
-    let evaluation = evaluate_burst(
-        baseline_classified,
-        &probe_classified,
-        spread_ms,
-        stopped,
-        BurstThresholds {
-            attempts: cfg.attempts,
-            // ponytail: `Option` since Q3, never `None` on this burst-only path.
-            window_ms: cfg.window_ms.unwrap_or_default(),
-        },
-    );
+    let burst_thresholds = BurstThresholds {
+        attempts: cfg.attempts,
+        // ponytail: `Option` since Q3, never `None` on this burst-only path.
+        window_ms: cfg.window_ms.unwrap_or_default(),
+    };
+    let evaluation = match cfg.baseline {
+        Baseline::RequireSuccess => evaluate_burst(
+            baseline_classified,
+            &probe_classified,
+            spread_ms,
+            stopped,
+            burst_thresholds,
+        ),
+        Baseline::None => {
+            evaluate_burst_none(&probe_classified, spread_ms, stopped, burst_thresholds)
+        }
+    };
+    let (peer_ip, peer_family) = match peer_addr.map(peer_of) {
+        Some((ip, family)) => (Some(ip), Some(family)),
+        None => (None, None),
+    };
 
     CheckResult {
         check: CheckName::BruteForce,
@@ -645,6 +945,12 @@ where
             dispatch_window_ms: spread_ms,
             protected_count: evaluation.protected_count,
             rejected_count: evaluation.rejected_count,
+            baseline_mode: match cfg.baseline {
+                Baseline::RequireSuccess => "require_success",
+                Baseline::None => "none",
+            },
+            peer_ip,
+            peer_family,
             baseline: baseline.map(|(_, e)| e),
             attempts: probe_evidence,
         })),
@@ -656,13 +962,17 @@ where
 pub async fn run(
     transport: &Transport,
     cfg: &BruteForce,
-    baseline: &ResolvedRequest,
+    baseline: Option<&ResolvedRequest>,
     probe: &ResolvedRequest,
     stop: watch::Receiver<Option<Stop>>,
 ) -> CheckResult {
     let sender = |kind: Kind| {
         let request = match kind {
-            Kind::Baseline => baseline,
+            // `run_with`/`run_burst_with` only ever request `Kind::Baseline` when
+            // `cfg.baseline == RequireSuccess`, and `validate` guarantees `Some` there.
+            Kind::Baseline => {
+                baseline.expect("baseline present when cfg.baseline is require_success")
+            }
             Kind::Probe => probe,
         };
         send(transport, request)
@@ -696,8 +1006,14 @@ pub fn console_line(result: &CheckResult) -> String {
             };
             // Finished probes only: a request dropped by a stop is not counted.
             let probes_done = e.attempts.len();
+            // `baseline=none` token only on the none path; require_success stays byte-identical.
+            let baseline_tok = if e.baseline_mode == "none" {
+                " baseline=none"
+            } else {
+                ""
+            };
             format!(
-                "{head} first_protected={first} tail={}/{} attempts={probes_done}/{} reasons={reasons}",
+                "{head}{baseline_tok} first_protected={first} tail={}/{} attempts={probes_done}/{} reasons={reasons}",
                 e.protected_tail_observed, e.protected_tail_count, e.attempts_planned
             )
         }
@@ -707,8 +1023,13 @@ pub fn console_line(result: &CheckResult) -> String {
                 .map_or("none".to_string(), |w| w.to_string());
             // Finished probes only: a probe dropped by a stop is not counted.
             let probes_done = e.attempts.len();
+            let baseline_tok = if e.baseline_mode == "none" {
+                " baseline=none"
+            } else {
+                ""
+            };
             format!(
-                "{head} mode=burst protected={}/{} rejected={} window={window}/{}ms attempts={probes_done}/{} reasons={reasons}",
+                "{head} mode=burst{baseline_tok} protected={}/{} rejected={} window={window}/{}ms attempts={probes_done}/{} reasons={reasons}",
                 e.protected_count,
                 e.attempts_planned,
                 e.rejected_count,
@@ -740,6 +1061,7 @@ mod tests {
             status,
             elapsed: Duration::ZERO,
             body,
+            remote_addr: None,
         })
     }
 
@@ -1384,6 +1706,363 @@ mod tests {
         assert!(passes > 0);
     }
 
+    // ---- evaluate_none / evaluate_burst_none (DECISIONS 2026-10-14 Q4) ----
+
+    fn eval_none(probes: &str, stop: Option<Stop>, t: Thresholds) -> Evaluation {
+        evaluate_none(&seq(probes), stop, t)
+    }
+
+    #[test]
+    fn none_seq_pass_healthy() {
+        let e = eval_none("RRRRRPPP", None, DEFAULT);
+        assert_eval(&e, Verdict::Pass, &[R::ProtectionObserved], Complete);
+        assert_eq!(e.first_protected_attempt, Some(6));
+        assert_eq!(e.protected_tail_observed, 3);
+    }
+
+    #[test]
+    fn none_seq_pass_boundary_p1_and_gap() {
+        let t = Thresholds {
+            protect_by_attempt: 7,
+            ..DEFAULT
+        };
+        let e = eval_none("RRRRRRPP", None, t);
+        assert_eval(&e, Verdict::Pass, &[R::ProtectionObserved], Complete);
+        let e = eval_none("RRPRPPPP", None, DEFAULT);
+        assert_eval(&e, Verdict::Pass, &[R::ProtectionObserved], Complete);
+    }
+
+    #[test]
+    fn none_seq_fail_protection_not_triggered() {
+        let e = eval_none("RRRRRRRR", None, DEFAULT);
+        assert_eval(&e, Verdict::Fail, &[R::ProtectionNotTriggered], Complete);
+        assert_eq!(e.first_protected_attempt, None);
+    }
+
+    #[test]
+    fn none_seq_fail_late_or_short_protection() {
+        let t = Thresholds {
+            protect_by_attempt: 5,
+            ..DEFAULT
+        };
+        let e = eval_none("RRRRRPPP", None, t);
+        assert_eval(&e, Verdict::Fail, &[R::ProtectionNotTriggered], Complete);
+        let e = eval_none("RRRPPPPR", None, DEFAULT);
+        assert_eval(&e, Verdict::Fail, &[R::ProtectionNotTriggered], Complete);
+    }
+
+    #[test]
+    fn none_seq_success_fails_even_with_problems_and_stop() {
+        let e = eval_none("SSSSSSSS", None, DEFAULT);
+        assert_eval(
+            &e,
+            Verdict::Fail,
+            &[R::InvalidCredentialsAccepted],
+            Complete,
+        );
+        // Probe 1 protected, a transport error elsewhere, stop: success still wins,
+        // reasons in the documented order, stop last.
+        let e = eval_none("PSTR", Some(Stop::DeadlineExceeded), DEFAULT);
+        assert_eval(
+            &e,
+            Verdict::Fail,
+            &[
+                R::InvalidCredentialsAccepted,
+                R::ProbeUnclassifiable,
+                R::TransportError,
+                R::AccountAlreadyLocked,
+                R::DeadlineExceeded,
+            ],
+            Incomplete,
+        );
+    }
+
+    #[test]
+    fn none_seq_probe_one_protected_is_already_locked() {
+        let e = eval_none("PPPPPPPP", None, DEFAULT);
+        assert_eval(
+            &e,
+            Verdict::Inconclusive,
+            &[R::AccountAlreadyLocked],
+            Complete,
+        );
+        assert_eq!(e.first_protected_attempt, Some(1));
+    }
+
+    #[test]
+    fn none_seq_all_unclassifiable_or_transport_is_endpoint_not_confirmed() {
+        for probes in ["UUUUUUUU", "TTTTTTTT", "UUUUTTTT"] {
+            let e = eval_none(probes, None, DEFAULT);
+            assert_eval(
+                &e,
+                Verdict::Inconclusive,
+                &[R::EndpointNotConfirmed],
+                Complete,
+            );
+        }
+    }
+
+    #[test]
+    fn none_seq_bad_mixed_with_classifiable_is_error() {
+        let e = eval_none("RRRRRRRU", None, DEFAULT);
+        assert_eval(&e, Verdict::Error, &[R::ProbeUnclassifiable], Complete);
+        let e = eval_none("RRRTRRPP", None, DEFAULT);
+        assert_eval(
+            &e,
+            Verdict::Error,
+            &[R::ProbeUnclassifiable, R::TransportError],
+            Complete,
+        );
+    }
+
+    #[test]
+    fn none_seq_overlap_is_error() {
+        let mut probes = seq("RRRRRRRR");
+        probes[2] = overlap();
+        let e = evaluate_none(&probes, None, DEFAULT);
+        assert_eval(
+            &e,
+            Verdict::Error,
+            &[R::ProbeUnclassifiable, R::OverlappingRules],
+            Complete,
+        );
+    }
+
+    #[test]
+    fn none_seq_wrong_probe_count_without_stop_is_never_pass() {
+        for probes in ["RRPP", "", "RRRRRPPPPP"] {
+            let e = eval_none(probes, None, DEFAULT);
+            assert_eval(&e, Verdict::NotRun, &[R::NotStarted], Incomplete);
+        }
+    }
+
+    #[test]
+    fn none_seq_stop_during_probes_is_not_run() {
+        let e = eval_none("RRR", Some(Stop::Cancelled), DEFAULT);
+        assert_eval(&e, Verdict::NotRun, &[R::Cancelled], Incomplete);
+    }
+
+    #[test]
+    fn none_seq_stop_after_all_probes_keeps_verdict() {
+        let e = eval_none("RRRRRPPP", Some(Stop::Cancelled), DEFAULT);
+        assert_eval(&e, Verdict::Pass, &[R::ProtectionObserved], Complete);
+    }
+
+    /// Oracle independent of the implementation (pattern: `b17`/`wrong_probe_count...`):
+    /// PASS only for the exact table row 6 (in-time, persistent protection; no success,
+    /// no unclassifiable/transport probe, exactly `attempts` probes classified).
+    #[test]
+    fn none_seq_never_pass_exhaustive() {
+        let stops = [None, Some(Stop::Cancelled), Some(Stop::DeadlineExceeded)];
+        let probe_lists: Vec<Vec<Classified>> = {
+            let mut lists = vec![seq("RRRRRRRR"), seq("PPPPPPPP")];
+            for p in 1..8 {
+                lists.push(seq(&("P".repeat(p) + &"R".repeat(8 - p))));
+                lists.push(seq(&("R".repeat(8 - p) + &"P".repeat(p))));
+            }
+            lists.push(seq("SRRRRRRR"));
+            lists.push(seq("RRRRRRRU"));
+            lists.push(seq("RRRRRRRT"));
+            lists.push(seq("RRRPPP")); // wrong count
+            lists
+        };
+        let mut passes = 0;
+        for probes in &probe_lists {
+            for stop in stops {
+                let e = evaluate_none(probes, stop, DEFAULT);
+                let has_success = probes.iter().any(|p| p.outcome == Outcome::Success);
+                let has_bad = probes
+                    .iter()
+                    .any(|p| matches!(p.outcome, Outcome::Unexpected | Outcome::TransportError));
+                let first_is_protected = probes
+                    .first()
+                    .is_some_and(|p| p.outcome == Outcome::Protection);
+                let (first_protected, tail) = protection_stats(probes);
+                let in_time = first_protected.is_some_and(|n| n <= DEFAULT.protect_by_attempt);
+                let persistent = tail >= DEFAULT.protected_tail_count;
+                let expect_pass = !has_success
+                    && probes.len() as u32 == DEFAULT.attempts
+                    && !has_bad
+                    && !first_is_protected
+                    && in_time
+                    && persistent;
+                assert_eq!(
+                    e.verdict == Verdict::Pass,
+                    expect_pass,
+                    "{probes:?} {stop:?}"
+                );
+                passes += expect_pass as u32;
+            }
+        }
+        assert!(passes > 0);
+    }
+
+    fn eval_burst_none(
+        probes: &str,
+        spread_ms: Option<u64>,
+        stop: Option<Stop>,
+        t: BurstThresholds,
+    ) -> BurstEvaluation {
+        evaluate_burst_none(&seq(probes), spread_ms, stop, t)
+    }
+
+    #[test]
+    fn none_burst_pass_partial_and_boundaries() {
+        let e = eval_burst_none("RRRRRPPP", Some(50), None, BURST);
+        assert_burst(&e, Verdict::Pass, &[R::ProtectionObserved], Complete);
+        assert_eq!(e.protected_count, 3);
+        let e = eval_burst_none("RRRRRRRP", Some(50), None, BURST);
+        assert_burst(&e, Verdict::Pass, &[R::ProtectionObserved], Complete);
+        let e = eval_burst_none("RPPPPPPP", Some(50), None, BURST);
+        assert_burst(&e, Verdict::Pass, &[R::ProtectionObserved], Complete);
+    }
+
+    #[test]
+    fn none_burst_fail_protection_not_triggered() {
+        let e = eval_burst_none("RRRRRRRR", Some(50), None, BURST);
+        assert_burst(&e, Verdict::Fail, &[R::ProtectionNotTriggered], Complete);
+        assert_eq!(e.protected_count, 0);
+    }
+
+    #[test]
+    fn none_burst_all_protected_is_account_already_locked() {
+        let e = eval_burst_none("PPPPPPPP", Some(50), None, BURST);
+        assert_burst(
+            &e,
+            Verdict::Inconclusive,
+            &[R::AccountAlreadyLocked],
+            Complete,
+        );
+    }
+
+    #[test]
+    fn none_burst_success_fails_even_with_stop() {
+        let e = eval_burst_none("RRSRRRR", Some(50), Some(Stop::Cancelled), BURST);
+        assert_burst(
+            &e,
+            Verdict::Fail,
+            &[R::InvalidCredentialsAccepted, R::Cancelled],
+            Incomplete,
+        );
+    }
+
+    #[test]
+    fn none_burst_all_unclassifiable_is_endpoint_not_confirmed() {
+        for probes in ["UUUUUUUU", "TTTTTTTT"] {
+            let e = eval_burst_none(probes, Some(50), None, BURST);
+            assert_burst(
+                &e,
+                Verdict::Inconclusive,
+                &[R::EndpointNotConfirmed],
+                Complete,
+            );
+        }
+        // Endpoint unconfirmed beats a bad window/spread.
+        let e = eval_burst_none("UUUUUUUU", Some(500), None, BURST);
+        assert_burst(
+            &e,
+            Verdict::Inconclusive,
+            &[R::EndpointNotConfirmed],
+            Complete,
+        );
+    }
+
+    #[test]
+    fn none_burst_bad_mixed_with_classifiable_is_error() {
+        let e = eval_burst_none("RRRRRRPU", Some(200), None, BURST);
+        assert_burst(&e, Verdict::Error, &[R::ProbeUnclassifiable], Complete);
+        let e = eval_burst_none("RRRRRRPT", Some(50), None, BURST);
+        assert_burst(
+            &e,
+            Verdict::Error,
+            &[R::ProbeUnclassifiable, R::TransportError],
+            Complete,
+        );
+    }
+
+    #[test]
+    fn none_burst_overlap_is_error() {
+        let mut probes = seq("RRRRRRRP");
+        probes[0] = overlap();
+        let e = evaluate_burst_none(&probes, Some(50), None, BURST);
+        assert_burst(
+            &e,
+            Verdict::Error,
+            &[R::ProbeUnclassifiable, R::OverlappingRules],
+            Complete,
+        );
+    }
+
+    #[test]
+    fn none_burst_dispatch_incomplete_and_skew_exceeded() {
+        let e = eval_burst_none("RRRRRPPP", None, None, BURST);
+        assert_burst(
+            &e,
+            Verdict::Inconclusive,
+            &[R::DispatchIncomplete],
+            Complete,
+        );
+        let e = eval_burst_none("RRRRRPPP", Some(101), None, BURST);
+        assert_burst(
+            &e,
+            Verdict::Inconclusive,
+            &[R::DispatchSkewExceeded],
+            Complete,
+        );
+    }
+
+    #[test]
+    fn none_burst_wrong_probe_count_is_not_run() {
+        for probes in ["RRPP", "", "RRRRRPPPPP"] {
+            let e = eval_burst_none(probes, Some(50), None, BURST);
+            assert_burst(&e, Verdict::NotRun, &[R::NotStarted], Incomplete);
+        }
+    }
+
+    /// Oracle independent of the implementation, same shape as `b17` minus the baseline.
+    #[test]
+    fn none_burst_never_pass_exhaustive() {
+        let spreads = [None, Some(50), Some(100), Some(101)];
+        let probe_lists: Vec<Vec<Classified>> = {
+            let mut lists = vec![seq("RRRRRRRR"), seq("PPPPPPPP")];
+            for p in 1..8 {
+                lists.push(seq(&("P".repeat(p) + &"R".repeat(8 - p))));
+            }
+            lists.push(seq("RRRRRRRS"));
+            lists.push(seq("RRRRRRRU"));
+            lists.push(seq("RRRRRRRT"));
+            lists.push(seq("RRRPPP")); // wrong count
+            lists
+        };
+        let mut passes = 0;
+        for probes in &probe_lists {
+            for spread in spreads {
+                let e = evaluate_burst_none(probes, spread, None, BURST);
+                let has_success = probes.iter().any(|p| p.outcome == Outcome::Success);
+                let has_bad = probes
+                    .iter()
+                    .any(|p| matches!(p.outcome, Outcome::Unexpected | Outcome::TransportError));
+                let protected = probes
+                    .iter()
+                    .filter(|p| p.outcome == Outcome::Protection)
+                    .count() as u32;
+                let expect_pass = !has_success
+                    && probes.len() as u32 == BURST.attempts
+                    && !has_bad
+                    && spread.is_some_and(|s| s <= BURST.window_ms)
+                    && protected > 0
+                    && protected < BURST.attempts;
+                assert_eq!(
+                    e.verdict == Verdict::Pass,
+                    expect_pass,
+                    "{probes:?} {spread:?}"
+                );
+                passes += expect_pass as u32;
+            }
+        }
+        assert!(passes > 0);
+    }
+
     // ---- run_with (paused clock, scripted sender, no network) ----
 
     use std::cell::{Cell, RefCell};
@@ -1618,6 +2297,125 @@ mod tests {
         assert_eq!(a.error, Some(TransportErrorCode::Timeout));
         assert_eq!(ev(&r).attempts.len(), 8);
         assert_invariants(&r, &log);
+    }
+
+    // ---- run_with baseline = none (DECISIONS 2026-10-14 Q4) ----
+
+    fn cfg_none() -> BruteForce {
+        serde_json::from_value(json!({
+            "baseline": "none",
+            "probe_request": {"method": "POST", "path": "/login"},
+            "success_match": {"status_in": [200], "json_exists": ["/access_token"]},
+            "rejection_match": {"status_in": [401]},
+            "protection_match": {"status_in": [429]},
+            "attempts": 8,
+            "interval_ms": 100,
+            "protect_by_attempt": 6,
+            "protected_tail_count": 2
+        }))
+        .expect("test config must parse")
+    }
+
+    /// Like `script` minus the leading baseline step: `baseline = "none"` never sends one.
+    fn script_none(probes: &str) -> Vec<Step> {
+        probes
+            .chars()
+            .map(|c| match c {
+                'R' => Step::Reply(401, Some(json!({"error": SENTINEL}))),
+                'P' => reply(429),
+                'S' => Step::Reply(200, token()),
+                'T' => Step::Fail(TransportErrorCode::Timeout),
+                _ => panic!("unknown letter"),
+            })
+            .collect()
+    }
+
+    async fn run_script_none(
+        steps: Vec<Step>,
+        stop: Option<(u64, Stop)>,
+    ) -> (CheckResult, Rc<RefCell<Log>>) {
+        let log = Rc::new(RefCell::new(Log::default()));
+        let (tx, rx) = no_stop();
+        if let Some((ms, s)) = stop {
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(ms)).await;
+                let _ = tx.send(Some(s));
+            });
+        } else {
+            std::mem::forget(tx);
+        }
+        let result = run_with(scripted(steps, log.clone()), &cfg_none(), rx).await;
+        (result, log)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_none_seq_sends_only_probes_no_baseline() {
+        let (r, log) = run_script_none(script_none(HEALTHY), None).await;
+        assert_eq!(r.verdict, Verdict::Pass);
+        assert_eq!(r.reasons, [R::ProtectionObserved]);
+        let kinds = log.borrow().kinds.clone();
+        assert_eq!(kinds.len(), 8);
+        assert!(kinds.iter().all(|k| *k == Kind::Probe));
+        let e = ev(&r);
+        assert!(e.baseline.is_none());
+        assert_eq!(e.baseline_mode, "none");
+        // No `+1` baseline request: dispatched == attempts.
+        assert_eq!(e.attempts_dispatched, 8);
+        assert_eq!(e.attempts.len(), 8);
+        assert_eq!(e.attempts[0].attempt, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_none_seq_offsets_follow_interval_from_probe_1() {
+        let (r, _) = run_script_none(script_none(HEALTHY), None).await;
+        let e = ev(&r);
+        // Probe 1 starts immediately; probe k at (k-1)*interval, same spacing as require_success.
+        for (i, a) in e.attempts.iter().enumerate() {
+            assert_eq!(a.offset_ms, i as u64 * 100, "probe {}", i + 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_none_seq_success_probe_fails() {
+        let (r, log) = run_script_none(script_none("RRSRRRRR"), None).await;
+        assert_eq!(r.verdict, Verdict::Fail);
+        assert_eq!(r.reasons, [R::InvalidCredentialsAccepted]);
+        assert_eq!(log.borrow().kinds.len(), 8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_none_seq_console_line_shows_baseline_none_token() {
+        let (r, _) = run_script_none(script_none(HEALTHY), None).await;
+        let line = console_line(&r);
+        assert!(line.contains(" baseline=none "), "{line}");
+        let (r2, _) = run_script(script(HEALTHY), None).await;
+        let line2 = console_line(&r2);
+        assert!(!line2.contains("baseline=none"), "{line2}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_none_seq_captures_peer_ip_and_family() {
+        let addr: std::net::SocketAddr = "203.0.113.5:443".parse().unwrap();
+        let calls = Rc::new(Cell::new(0u32));
+        let calls2 = calls.clone();
+        let send_one = move |_: Kind| {
+            let n = calls2.get();
+            calls2.set(n + 1);
+            async move {
+                Ok(TransportResponse {
+                    status: 401,
+                    elapsed: Duration::ZERO,
+                    body: None,
+                    // Only the third response reports a peer; the evidence keeps the
+                    // first one seen, same as every other request from the same host.
+                    remote_addr: if n == 2 { Some(addr) } else { None },
+                })
+            }
+        };
+        let r = run_with(send_one, &cfg_none(), no_stop().1).await;
+        let e = ev(&r);
+        assert_eq!(e.peer_ip.as_deref(), Some("203.0.113.5"));
+        assert_eq!(e.peer_family, Some("v4"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1979,5 +2777,107 @@ mod tests {
             console_line(&r),
             "brute_force PASS mode=burst protected=3/8 rejected=5 window=0/100ms attempts=8/8 reasons=protection_observed"
         );
+    }
+
+    // ---- run_burst_with baseline = none (DECISIONS 2026-10-14 Q4) ----
+
+    fn burst_cfg_none(attempts: u32, window_ms: u64) -> BruteForce {
+        serde_json::from_value(json!({
+            "baseline": "none",
+            "probe_request": {"method": "POST", "path": "/login"},
+            "success_match": {"status_in": [200], "json_exists": ["/access_token"]},
+            "rejection_match": {"status_in": [401]},
+            "protection_match": {"status_in": [429]},
+            "attempts": attempts,
+            "mode": "burst",
+            "window_ms": window_ms
+        }))
+        .expect("test burst config must parse")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_burst_none_sends_only_probes_no_baseline() {
+        let log: Rc<RefCell<Vec<Kind>>> = Rc::new(RefCell::new(Vec::new()));
+        let log2 = log.clone();
+        let sender = move |kind: Kind| {
+            log2.borrow_mut().push(kind);
+            Box::pin(async move {
+                match kind {
+                    Kind::Baseline => panic!("baseline = none must never send a baseline"),
+                    Kind::Probe => resp(401, None),
+                }
+            })
+                as Pin<Box<dyn Future<Output = Result<TransportResponse, TransportError>>>>
+        };
+        let cfg = burst_cfg_none(8, 100);
+        let (_tx, rx) = no_stop();
+        let r = run_burst_with(sender, &cfg, rx).await;
+
+        let kinds = log.borrow().clone();
+        assert_eq!(kinds.len(), 8);
+        assert!(kinds.iter().all(|k| *k == Kind::Probe));
+        let e = burst_evidence(&r);
+        assert!(e.baseline.is_none());
+        assert_eq!(e.baseline_mode, "none");
+        // No `+1` baseline request: dispatched == attempts.
+        assert_eq!(e.attempts_dispatched, 8);
+        assert_eq!(e.attempts.len(), 8);
+        assert_eq!(r.verdict, Verdict::Fail); // all 8 rejected: protected_count == 0
+        assert_eq!(r.reasons, [R::ProtectionNotTriggered]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn console_line_burst_none_format() {
+        let arrived = Rc::new(Cell::new(0u32));
+        let sender = move |kind: Kind| {
+            let arrived = arrived.clone();
+            Box::pin(async move {
+                match kind {
+                    Kind::Baseline => panic!("baseline = none must never send a baseline"),
+                    Kind::Probe => {
+                        let n = arrived.get();
+                        arrived.set(n + 1);
+                        if n < 5 {
+                            resp(401, None)
+                        } else {
+                            resp(429, None)
+                        }
+                    }
+                }
+            })
+                as Pin<Box<dyn Future<Output = Result<TransportResponse, TransportError>>>>
+        };
+        let cfg = burst_cfg_none(8, 100);
+        let (_tx, rx) = no_stop();
+        let r = run_burst_with(sender, &cfg, rx).await;
+        assert_eq!(
+            console_line(&r),
+            "brute_force PASS mode=burst baseline=none protected=3/8 rejected=5 window=0/100ms attempts=8/8 reasons=protection_observed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_burst_none_captures_peer_ip_and_family() {
+        let addr: std::net::SocketAddr = "203.0.113.5:443".parse().unwrap();
+        let calls = Rc::new(Cell::new(0u32));
+        let sender = move |_: Kind| {
+            let n = calls.get();
+            calls.set(n + 1);
+            Box::pin(async move {
+                Ok(TransportResponse {
+                    status: 401,
+                    elapsed: Duration::ZERO,
+                    body: None,
+                    remote_addr: if n == 2 { Some(addr) } else { None },
+                })
+            })
+                as Pin<Box<dyn Future<Output = Result<TransportResponse, TransportError>>>>
+        };
+        let cfg = burst_cfg_none(8, 100);
+        let (_tx, rx) = no_stop();
+        let r = run_burst_with(sender, &cfg, rx).await;
+        let e = burst_evidence(&r);
+        assert_eq!(e.peer_ip.as_deref(), Some("203.0.113.5"));
+        assert_eq!(e.peer_family, Some("v4"));
     }
 }

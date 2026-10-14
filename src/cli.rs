@@ -279,8 +279,14 @@ async fn run_check(
             let stop = stop_rx.clone();
             results.push(match selected {
                 Selected::BruteForce { cfg, requests } => {
-                    brute_force::run(&transport, cfg, &requests.baseline, &requests.probe, stop)
-                        .await
+                    brute_force::run(
+                        &transport,
+                        cfg,
+                        requests.baseline.as_ref(),
+                        &requests.probe,
+                        stop,
+                    )
+                    .await
                 }
                 Selected::Race { cfg, requests } => {
                     race::run(&transport, cfg, &requests.action, &requests.verify, stop).await
@@ -556,6 +562,23 @@ mod tests {
         for name in ENV_NAMES {
             assert!(out.contains(name), "missing {name} in {out}");
         }
+        assert_no_sentinel(&out, &err);
+    }
+
+    /// `baseline = "none"` (DECISIONS 2026-10-14 Q4): `validate` shows `attempts`
+    /// requests, not `1 + attempts` (no baseline request planned).
+    #[test]
+    fn validate_baseline_none_shows_attempts_only_budget() {
+        let mut v: Value = serde_json::from_str(&example_text()).unwrap();
+        let bf = v["brute_force"].as_object_mut().unwrap();
+        bf.remove("baseline_request");
+        bf.insert("baseline".to_string(), Value::String("none".to_string()));
+        let (_dir, path) = temp_config(&v.to_string());
+        let (code, out, err) = validate(&path, &full_env);
+        assert_eq!(code, 0, "stderr: {err}");
+        // 8 brute force (no +1), 2+5 race, 1+100 load = 116; same fixed waits.
+        assert!(out.contains("planned requests: 116"), "{out}");
+        assert!(out.contains("fixed waits: 950 ms"), "{out}");
         assert_no_sentinel(&out, &err);
     }
 

@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 use reqwest::Url;
 
 use super::{
-    BruteForce, BruteForceMode, Config, ConfigError, Limits, Load, MatcherSpec, Race, RequestSpec,
-    Selection,
+    Baseline, BruteForce, BruteForceMode, Config, ConfigError, Limits, Load, MatcherSpec, Race,
+    RequestSpec, Selection,
 };
 use crate::report::CheckName;
 
@@ -85,7 +85,11 @@ pub fn validate(cfg: &Config, sel: Selection) -> Result<RequestBudget, ConfigErr
     if sel.includes(CheckName::BruteForce) {
         let bf = required(&cfg.brute_force, "brute_force", sel)?;
         check_brute_force(bf)?;
-        requests += 1 + u64::from(bf.attempts);
+        requests += u64::from(bf.attempts)
+            + match bf.baseline {
+                Baseline::RequireSuccess => 1,
+                Baseline::None => 0,
+            };
         // Burst has no fixed wait between probes (all dispatched at once); sequential
         // sleeps `interval_ms` after each probe but the last (PLAN §5).
         if bf.mode == BruteForceMode::Sequential {
@@ -164,7 +168,24 @@ fn check_limits(l: &Limits) -> Result<(), ConfigError> {
 }
 
 fn check_brute_force(bf: &BruteForce) -> Result<(), ConfigError> {
-    check_request("brute_force.baseline_request", &bf.baseline_request)?;
+    match (bf.baseline, &bf.baseline_request) {
+        (Baseline::RequireSuccess, Some(baseline_request)) => {
+            check_request("brute_force.baseline_request", baseline_request)?;
+        }
+        (Baseline::RequireSuccess, None) => {
+            return Err(invalid(
+                "brute_force.baseline_request",
+                "is required when baseline is require_success",
+            ));
+        }
+        (Baseline::None, Some(_)) => {
+            return Err(invalid(
+                "brute_force.baseline_request",
+                "is not allowed when baseline is none",
+            ));
+        }
+        (Baseline::None, None) => {}
+    }
     check_request("brute_force.probe_request", &bf.probe_request)?;
     check_matcher("brute_force.success_match", &bf.success_match)?;
     check_matcher("brute_force.rejection_match", &bf.rejection_match)?;
@@ -523,6 +544,24 @@ mod tests {
         );
     }
 
+    /// `baseline = none` budget is `attempts` (no `+1` baseline request); env password
+    /// validity is not required (DECISIONS 2026-10-14 Q4, P1-AC35).
+    #[test]
+    fn baseline_none_budget_has_no_plus_one() {
+        let mut cfg = base();
+        bf(&mut cfg).baseline = Baseline::None;
+        bf(&mut cfg).baseline_request = None;
+        let budget = validate(&cfg, Selection::All).expect("none sequential valid");
+        // 8 brute force (no +1), 2+5 race, 1+100 load; same fixed waits.
+        assert_eq!(
+            budget,
+            RequestBudget {
+                requests: 116,
+                fixed_wait_ms: 950
+            }
+        );
+    }
+
     #[test]
     fn rejected_cases() {
         // (name, mutation, expected field path in the error)
@@ -744,6 +783,46 @@ mod tests {
             (
                 "sequential with window_ms set",
                 |c| bf(c).window_ms = Some(1000),
+                "brute_force.window_ms",
+            ),
+            (
+                "baseline require_success without baseline_request",
+                |c| bf(c).baseline_request = None,
+                "brute_force.baseline_request",
+            ),
+            (
+                "baseline none with baseline_request present",
+                |c| bf(c).baseline = Baseline::None,
+                "brute_force.baseline_request",
+            ),
+            (
+                "baseline none sequential still needs interval_ms",
+                |c| {
+                    bf(c).baseline = Baseline::None;
+                    bf(c).baseline_request = None;
+                    bf(c).interval_ms = None;
+                },
+                "brute_force.interval_ms",
+            ),
+            (
+                "baseline none sequential still needs protect_by_attempt",
+                |c| {
+                    bf(c).baseline = Baseline::None;
+                    bf(c).baseline_request = None;
+                    bf(c).protect_by_attempt = None;
+                },
+                "brute_force.protect_by_attempt",
+            ),
+            (
+                "baseline none burst still needs window_ms",
+                |c| {
+                    bf(c).baseline = Baseline::None;
+                    bf(c).baseline_request = None;
+                    bf(c).mode = BruteForceMode::Burst;
+                    bf(c).interval_ms = None;
+                    bf(c).protect_by_attempt = None;
+                    bf(c).protected_tail_count = None;
+                },
                 "brute_force.window_ms",
             ),
             (
@@ -1107,6 +1186,19 @@ mod tests {
                 bf(c).protect_by_attempt = None;
                 bf(c).protected_tail_count = None;
             }),
+            ("baseline none sequential", |c| {
+                bf(c).baseline = Baseline::None;
+                bf(c).baseline_request = None;
+            }),
+            ("baseline none burst", |c| {
+                bf(c).baseline = Baseline::None;
+                bf(c).baseline_request = None;
+                bf(c).mode = BruteForceMode::Burst;
+                bf(c).window_ms = Some(1000);
+                bf(c).interval_ms = None;
+                bf(c).protect_by_attempt = None;
+                bf(c).protected_tail_count = None;
+            }),
             ("status 100 and 599", |c| {
                 load(c).response_match.status_in = vec![100, 599]
             }),
@@ -1302,5 +1394,23 @@ mod tests {
         );
         // As a full suite it must still be refused.
         assert_eq!(invalid_path(validate(&cfg, Selection::All)), "race");
+    }
+
+    /// `baseline = "none"` example (DECISIONS 2026-10-14 Q4, P1-AC45): budget is
+    /// `attempts` only, no `+1` baseline request.
+    #[test]
+    fn brute_force_baseline_none_example_is_valid() {
+        const BASELINE_NONE: &str = include_str!("../../examples/brute-force-baseline-none.json");
+        let cfg = crate::config::parse(BASELINE_NONE).expect("parses");
+        assert_eq!(cfg.brute_force.as_ref().unwrap().baseline, Baseline::None);
+        assert!(cfg.brute_force.as_ref().unwrap().baseline_request.is_none());
+        let budget = validate(&cfg, BF).expect("valid");
+        assert_eq!(
+            budget,
+            RequestBudget {
+                requests: 8,
+                fixed_wait_ms: 700
+            }
+        );
     }
 }
